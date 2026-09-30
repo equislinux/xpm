@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
 use xpm_core::config::Repository;
+use xpm_core::install_reason::{retain_by_reason, InstallReason};
 use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db};
@@ -280,6 +281,15 @@ fn confirm_action(prompt: &str, no_confirm: bool) -> Result<()> {
 }
 
 fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) -> Result<()> {
+    if args.as_deps && args.as_explicit {
+        anyhow::bail!("xpm install: --as-deps and --as-explicit are mutually exclusive");
+    }
+    let reason = if args.as_deps {
+        InstallReason::Dep
+    } else {
+        InstallReason::Explicit
+    };
+
     println!(
         ":: Resolving dependencies for: {}",
         args.packages.join(", ")
@@ -297,7 +307,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         .with_context(|| format!("failed to create cache dir {}", cache_dir.display()))?;
 
     // Create transaction
-    let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir)
+    let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
         .context("failed to create transaction")?;
 
     // Setup hooks chain
@@ -387,6 +397,12 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
     // Phase 2/3: prepare, commit, hooks and journal.
     commit_transaction(config, "install", journal_pkgs, &mut tx)?;
+
+    for pkg_name in &args.packages {
+        reason
+            .write(&local_db_dir, pkg_name)
+            .with_context(|| format!("failed to record install reason for '{pkg_name}'"))?;
+    }
 
     println!(
         ":: {} package(s) installed successfully.",
@@ -509,7 +525,15 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
 
     confirm_action(":: Proceed with upgrade? [y/N] ", no_confirm)?;
 
-    let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir)
+    let preserved_reasons: Vec<(String, InstallReason)> = planned
+        .iter()
+        .filter_map(|(_, entry, _)| {
+            InstallReason::read_optional(&local_db_dir, &entry.name)
+                .map(|reason| (entry.name.clone(), reason))
+        })
+        .collect();
+
+    let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
         .context("failed to create transaction")?;
     let hooks = HookChain::default();
     tx.set_hooks(hooks);
@@ -563,6 +587,12 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
     }
 
     commit_transaction(config, "upgrade", journal_pkgs, &mut tx)?;
+
+    for (name, reason) in &preserved_reasons {
+        reason
+            .write(&local_db_dir, name)
+            .with_context(|| format!("failed to preserve install reason for '{name}'"))?;
+    }
 
     println!(":: Upgrade complete.");
     Ok(())
@@ -784,11 +814,24 @@ fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
         });
     }
 
-    if args.explicit || args.deps || args.orphans {
+    if args.orphans {
         anyhow::bail!(
-            "xpm query: --explicit/--deps/--orphans need install-reason metadata, \
-             which the local database does not track yet"
+            "xpm query: --orphans needs dependency tracking (which packages require each \
+             installed package), which the local database does not record yet"
         );
+    }
+
+    if args.explicit && args.deps {
+        anyhow::bail!("xpm query: --explicit and --deps are mutually exclusive");
+    }
+
+    if args.explicit || args.deps {
+        let wanted = if args.explicit {
+            InstallReason::Explicit
+        } else {
+            InstallReason::Dep
+        };
+        retain_by_reason(&local_db_dir, &mut packages, wanted);
     }
 
     packages.sort();

@@ -83,9 +83,15 @@ already wired around prepare/commit; only the hook scripts are pending.
 ### 4. Stable machine output — **implemented**
 
 `xpm query --format tsv` prints `name<TAB>version` (plain by default);
-filtering and `--upgrades` work. `--explicit/--deps/--orphans` fail with a
-clear message until install-reason metadata is tracked in the local database.
-`origin`/`explicit|dep` columns are the next step.
+filtering and `--upgrades` work. Install-reason metadata is tracked as
+`<db_path>/local/<pkg>/reason` (`explicit` or `dep`): `xpm install` writes it
+(default `explicit`, `--as-deps` for dependencies; using both flags is an
+error) and `xpm upgrade` preserves the previous value. A package without a
+`reason` file (installed before this feature) counts as `explicit`.
+`--explicit`/`--deps` filter on it. `--orphans` still fails with a clear
+message: the local database does not record the reverse dependency graph, so
+orphan detection is not trivial yet. The `origin` column (repository
+provenance) and `--orphans` are the next step.
 
 ### 5. Version pinning and downgrade
 
@@ -121,7 +127,8 @@ what was done.
    x-scripts pending; `XPM_*` env covered by unit tests).
 3. ~~`xpm query --format tsv`.~~ done.
 4. `xpm rollback --last` (guidance) + `xpm diff`; `history` links generation
-   ids; install-reason metadata.
+   ids; ~~install-reason metadata~~ done (section 4: `reason` file,
+   `--explicit/--deps`; `--orphans`/`origin` pending).
 5. Version pinning consumed from the xpkg history index.
 
 See also: `../scripts/docs/en/generations.md` (engine),
