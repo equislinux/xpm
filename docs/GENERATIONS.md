@@ -88,10 +88,28 @@ filtering and `--upgrades` work. Install-reason metadata is tracked as
 (default `explicit`, `--as-deps` for dependencies; using both flags is an
 error) and `xpm upgrade` preserves the previous value. A package without a
 `reason` file (installed before this feature) counts as `explicit`.
-`--explicit`/`--deps` filter on it. `--orphans` still fails with a clear
-message: the local database does not record the reverse dependency graph, so
-orphan detection is not trivial yet. The `origin` column (repository
-provenance) and `--orphans` are the next step.
+`--explicit`/`--deps` filter on it.
+
+Each installed package also carries the metadata the generation restore path
+needs:
+
+- `<db_path>/local/<pkg>/files` — pacman-compatible manifest (`%FILES%` header,
+  relative paths, directories with a trailing `/`) derived from the package's
+  `.MTREE`, so it covers files, directories and symlinks. This is exactly what
+  `xgen_restore_pkg` (`scripts/install/helpers/xgen.sh`) consumes: it skips
+  `%` lines and restores the rest. `xpm install`/`xpm upgrade` write it, and
+  `xpm files <pkg>` reads it back.
+- `<db_path>/local/<pkg>/origin` — name of the repository the package came
+  from; absent for a local-file install. `xpm info <pkg>` shows it (plus the
+  sync entry's repository, description and dependencies when the sync database
+  is present, with the same repository priority as `read_latest_remote_entries`).
+
+Missing `reason`, `origin` or `files` files (legacy or local-file installs)
+never fail: they default to `explicit`, `None` and an empty list.
+
+`--orphans` still fails with a clear message: the local database does not
+record the reverse dependency graph, so orphan detection is not trivial yet.
+`--orphans` is the next step.
 
 ### 5. Version pinning and downgrade
 
@@ -106,7 +124,7 @@ rollback.
 | Item | Where it stands |
 |------|-----------------|
 | Resolver wired into the CLI | Pending (`future-integration.md` item 1); needed before upgrade journaling is meaningful |
-| Stub commands (`query`, `files`, ...) | Partially pending; journal/hooks do not need them |
+| Stub commands (`query`, `files`, ...) | `query`, `files` and `info` implemented; `search` still a stub |
 | Transaction hardening (`.pacnew`, hooks, rollback tests) | Open items in `ROADMAP.md` Phase 7/8 |
 | Config keyring path inconsistency | Pending reconciliation |
 
@@ -128,7 +146,9 @@ what was done.
 3. ~~`xpm query --format tsv`.~~ done.
 4. `xpm rollback --last` (guidance) + `xpm diff`; `history` links generation
    ids; ~~install-reason metadata~~ done (section 4: `reason` file,
-   `--explicit/--deps`; `--orphans`/`origin` pending).
+   `--explicit/--deps`); ~~`origin` provenance + package `files` manifest~~ done
+   (section 4: `local/<pkg>/origin` and `%FILES%` manifest from `.MTREE`, plus
+   `xpm files`/`xpm info`; `--orphans` pending).
 5. Version pinning consumed from the xpkg history index.
 
 See also: `../scripts/docs/en/generations.md` (engine),

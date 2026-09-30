@@ -19,6 +19,7 @@ use cli::{Cli, Command};
 use xpm_core::config::Repository;
 use xpm_core::install_reason::{retain_by_reason, InstallReason};
 use xpm_core::journal::{Journal, JournalPackage};
+use xpm_core::local_db;
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db};
 use xpm_core::repo_sync::{
@@ -316,6 +317,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
     let mut journal_pkgs = Vec::new();
+    // (package name, origin repository) for local-db metadata after commit.
+    let mut installed = Vec::new();
 
     // Phase 1: Download and validate packages
     for pkg_name in &args.packages {
@@ -379,6 +382,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         println!("   source: {}", mirror);
 
         journal_pkgs.push(JournalPackage::install(&entry.name, &entry.version));
+        installed.push((entry.name.clone(), repo.name.clone()));
 
         // Add to transaction
         tx.add_install(entry.name.clone(), entry.version.clone(), dest)
@@ -398,10 +402,12 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     // Phase 2/3: prepare, commit, hooks and journal.
     commit_transaction(config, "install", journal_pkgs, &mut tx)?;
 
-    for pkg_name in &args.packages {
+    for (pkg_name, repo_name) in &installed {
         reason
             .write(&local_db_dir, pkg_name)
             .with_context(|| format!("failed to record install reason for '{pkg_name}'"))?;
+        local_db::write_origin(&local_db_dir, pkg_name, repo_name)
+            .with_context(|| format!("failed to record origin for '{pkg_name}'"))?;
     }
 
     println!(
@@ -540,6 +546,8 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
     let mut journal_pkgs = Vec::new();
+    // (package name, origin repository) for local-db metadata after commit.
+    let mut upgraded = Vec::new();
 
     for (repo, entry, local_version) in planned {
         let filename = entry.filename.clone().ok_or_else(|| {
@@ -579,6 +587,7 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             &local_version,
             &entry.version,
         ));
+        upgraded.push((entry.name.clone(), repo.name.clone()));
 
         tx.add_remove(entry.name.clone())
             .context("failed to add remove op to transaction")?;
@@ -592,6 +601,11 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         reason
             .write(&local_db_dir, name)
             .with_context(|| format!("failed to preserve install reason for '{name}'"))?;
+    }
+
+    for (name, repo_name) in &upgraded {
+        local_db::write_origin(&local_db_dir, name, repo_name)
+            .with_context(|| format!("failed to record origin for '{name}'"))?;
     }
 
     println!(":: Upgrade complete.");
@@ -851,16 +865,71 @@ fn cmd_search(_config: &XpmConfig, args: &cli::SearchArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_info(_config: &XpmConfig, args: &cli::InfoArgs) -> Result<()> {
-    let db = if args.local { "local" } else { "sync" };
-    println!(":: Package info ({db}): {}", args.package);
-    println!(":: Info complete (stub).");
+fn cmd_info(config: &XpmConfig, args: &cli::InfoArgs) -> Result<()> {
+    let local_db_dir = config.options.db_path.join("local");
+    let installed_version = local_db::read_version(&local_db_dir, &args.package);
+
+    // Repository metadata (latest version, highest-priority repo wins), unless
+    // the user explicitly asked for the local database only.
+    let remote = if args.local {
+        None
+    } else {
+        let sync_dir = config.options.db_path.join("sync");
+        read_latest_remote_entries(config, &sync_dir)?.remove(&args.package)
+    };
+
+    if installed_version.is_none() && remote.is_none() {
+        return Err(XpmError::PackageNotFound {
+            name: args.package.clone(),
+        }
+        .into());
+    }
+
+    println!("Name            : {}", args.package);
+
+    if let Some(version) = &installed_version {
+        println!("Version         : {version}");
+        println!(
+            "Install Reason  : {}",
+            InstallReason::read(&local_db_dir, &args.package).as_str()
+        );
+        println!(
+            "Origin          : {}",
+            local_db::read_origin(&local_db_dir, &args.package)
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+
+    if let Some((repo, entry)) = &remote {
+        println!("Repository      : {}", repo.name);
+        if installed_version.is_none() {
+            println!("Version         : {}", entry.version);
+        }
+        if let Some(description) = entry.description.as_deref() {
+            println!("Description     : {description}");
+        }
+        if !entry.depends.is_empty() {
+            println!("Depends On      : {}", entry.depends.join("  "));
+        }
+    }
+
     Ok(())
 }
 
-fn cmd_files(_config: &XpmConfig, args: &cli::FilesArgs) -> Result<()> {
-    println!(":: Files owned by '{}':", args.package);
-    println!(":: File listing complete (stub).");
+fn cmd_files(config: &XpmConfig, args: &cli::FilesArgs) -> Result<()> {
+    let local_db_dir = config.options.db_path.join("local");
+    if !local_db_dir.join(&args.package).is_dir() {
+        return Err(XpmError::PackageNotFound {
+            name: args.package.clone(),
+        }
+        .into());
+    }
+
+    let files = local_db::read_files(&local_db_dir, &args.package)
+        .with_context(|| format!("failed to read the file list for '{}'", args.package))?;
+    for file in &files {
+        println!("{file}");
+    }
     Ok(())
 }
 

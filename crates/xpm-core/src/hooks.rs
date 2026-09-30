@@ -144,16 +144,31 @@ impl Hook for FileExtractionHook {
             ensure_shell_path_on_bash_zsh()?;
         }
 
-        if !installed_files.is_empty() || !shell_shims.is_empty() {
-            let pkg_dir = context.local_db_dir.join(&context.pkg_name);
-            fs::create_dir_all(&pkg_dir)?;
+        // Prefer the .MTREE manifest (files, directories and symlinks) in
+        // pacman's `files` format; fall back to the extracted entries when the
+        // package has no usable manifest.
+        let mut manifest = match crate::package::reader::read_raw_entry(pkg_file, ".MTREE")? {
+            Some(data) => match crate::package::mtree::parse_mtree(&data) {
+                Ok(entries) if !entries.is_empty() => crate::local_db::mtree_paths(&entries),
+                Ok(_) => installed_files.clone(),
+                Err(e) => {
+                    tracing::warn!(
+                        package = %context.pkg_name,
+                        error = %e,
+                        "unreadable .MTREE; falling back to the extracted file list"
+                    );
+                    installed_files.clone()
+                }
+            },
+            None => installed_files.clone(),
+        };
 
-            let files_path = pkg_dir.join("files");
-            for shim in shell_shims {
-                installed_files.push(format!("@ABS:{}", shim.display()));
-            }
+        for shim in shell_shims {
+            manifest.push(format!("@ABS:{}", shim.display()));
+        }
 
-            fs::write(files_path, installed_files.join("\n"))?;
+        if !manifest.is_empty() {
+            crate::local_db::write_file_list(&context.local_db_dir, &context.pkg_name, &manifest)?;
         }
 
         // Persist .INSTALL scriptlet in local db for future lifecycle hooks.
@@ -417,7 +432,7 @@ impl Hook for FileRemovalHook {
         }
 
         for file_path in file_list.lines() {
-            if file_path.is_empty() {
+            if file_path.is_empty() || file_path.starts_with('%') {
                 continue;
             }
 
@@ -697,7 +712,11 @@ mod tests {
 
         let pkg_dir = ctx.local_db_dir.join(&ctx.pkg_name);
         fs::create_dir_all(&pkg_dir).expect("create package db dir");
-        fs::write(pkg_dir.join("files"), "usr/bin/xfetch\n").expect("write files manifest");
+        fs::write(
+            pkg_dir.join("files"),
+            "%FILES%\nusr/\nusr/bin/\nusr/bin/xfetch\n",
+        )
+        .expect("write files manifest");
 
         hook.run(&ctx).expect("run hook");
 

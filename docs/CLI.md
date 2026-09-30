@@ -132,6 +132,7 @@ xpm Q [FILTER] [OPTIONS]         # pacman-style alias
 
 | Flag | Short | Description |
 |------|-------|-------------|
+| `--format` | — | Output format: `plain` (default) or `tsv` |
 | `--explicit` | `-e` | List only explicitly installed packages |
 | `--deps` | `-d` | List only packages installed as dependencies |
 | `--orphans` | `-t` | List orphan packages (no longer required) |
@@ -180,7 +181,12 @@ xpm search --local vim            # Search installed packages
 
 ### `info` — Package Information
 
-Display detailed information about a package.
+Display detailed information about an installed package: name, version,
+install reason (`explicit`/`dep`) and origin repository. When the sync
+database is available, the repository description and dependencies are
+added (highest-priority repository wins, same order as `xpm query
+--upgrades`). For packages that are not installed, the sync entry alone is
+shown.
 
 ```bash
 xpm info <PACKAGE> [OPTIONS]
@@ -189,21 +195,40 @@ xpm Si <PACKAGE> [OPTIONS]       # pacman-style alias
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--local` | `-l` | Query local database instead of sync |
+| `--local` | `-l` | Query the local database only (no sync enrichment) |
 
 **Examples:**
 
 ```bash
-xpm info linux                    # Info from sync database
+xpm info linux                    # Local info + sync description/deps
 xpm Si firefox                    # Same, pacman-style
-xpm info --local vim              # Info for installed package
+xpm info --local vim              # Installed metadata only
 ```
+
+**Output (installed package):**
+
+```
+Name            : kitty
+Version         : 0.44.0-1
+Install Reason  : explicit
+Origin          : x
+Repository      : x
+Description     : A cross-platform, fast, feature full, GPU based terminal emulator
+Depends On      : glfw  libglvnd  wayland
+```
+
+Legacy installs without `reason`/`origin` files default to `explicit` and
+`unknown` instead of failing.
 
 ---
 
 ### `files` — List Package Files
 
-List all files owned by a package.
+List all files owned by an installed package, read from
+`<db_path>/local/<pkg>/files`. The manifest is pacman-compatible: it is
+derived from the package's `.MTREE`, so it includes directories (trailing
+`/`) and symlinks. This is the same manifest consumed by
+`x gen restore --pkg`.
 
 ```bash
 xpm files <PACKAGE>
@@ -215,6 +240,14 @@ xpm Ql <PACKAGE>                 # pacman-style alias
 ```bash
 xpm files bash                    # List files in bash package
 xpm Ql linux                      # pacman-style
+```
+
+**Output:**
+
+```
+usr/
+usr/bin/
+usr/bin/bash
 ```
 
 ---
