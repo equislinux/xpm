@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
 use xpm_core::config::Repository;
+use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db};
 use xpm_core::repo_sync::{
@@ -24,6 +25,7 @@ use xpm_core::repo_sync::{
     verify_remote_signature, verify_sha256,
 };
 use xpm_core::resolver::Version;
+use xpm_core::txhooks::run_transaction_hooks;
 use xpm_core::{HookChain, Transaction};
 use xpm_core::{XpmConfig, XpmError};
 
@@ -84,6 +86,7 @@ fn main() -> Result<()> {
         Command::Info(args) => cmd_info(&config, args),
         Command::Files(args) => cmd_files(&config, args),
         Command::Repo(args) => cmd_repo(&config, args),
+        Command::History(args) => cmd_history(&config, args),
         Command::Usage(args) => cmd_help(args),
     }
 }
@@ -302,6 +305,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     tx.set_hooks(hooks);
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
+    let mut journal_pkgs = Vec::new();
+
     // Phase 1: Download and validate packages
     for pkg_name in &args.packages {
         let mut resolved = None;
@@ -363,6 +368,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         println!("   downloaded: {}", dest.display());
         println!("   source: {}", mirror);
 
+        journal_pkgs.push(JournalPackage::install(&entry.name, &entry.version));
+
         // Add to transaction
         tx.add_install(entry.name.clone(), entry.version.clone(), dest)
             .context("failed to add install to transaction")?;
@@ -378,16 +385,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         no_confirm,
     )?;
 
-    // Phase 2: Prepare transaction (pre-flight checks)
-    println!(
-        ":: Preparing transaction ({} operation(s))...",
-        tx.operation_count()
-    );
-    tx.prepare().context("transaction preparation failed")?;
-
-    // Phase 3: Commit transaction (write changes)
-    println!(":: Committing transaction...");
-    tx.commit().context("transaction commit failed")?;
+    // Phase 2/3: prepare, commit, hooks and journal.
+    commit_transaction(config, "install", journal_pkgs, &mut tx)?;
 
     println!(
         ":: {} package(s) installed successfully.",
@@ -418,6 +417,7 @@ fn cmd_remove(config: &XpmConfig, args: &cli::RemoveArgs, no_confirm: bool) -> R
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
     // Add remove operations for each package
+    let mut journal_pkgs = Vec::new();
     for pkg_name in &args.packages {
         // Verify package is installed
         let pkg_dir = local_db_dir.join(pkg_name);
@@ -427,22 +427,20 @@ fn cmd_remove(config: &XpmConfig, args: &cli::RemoveArgs, no_confirm: bool) -> R
             );
         }
 
+        let version = std::fs::read_to_string(pkg_dir.join("version"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        journal_pkgs.push(JournalPackage::remove(pkg_name, version));
+
         tx.add_remove(pkg_name.clone())
             .context("failed to add remove to transaction")?;
     }
 
     confirm_action(":: Proceed with removal? [y/N] ", no_confirm)?;
 
-    // Phase 2: Prepare transaction (pre-flight checks)
-    println!(
-        ":: Preparing transaction ({} operation(s))...",
-        tx.operation_count()
-    );
-    tx.prepare().context("transaction preparation failed")?;
-
-    // Phase 3: Commit transaction (write changes)
-    println!(":: Committing transaction...");
-    tx.commit().context("transaction commit failed")?;
+    // Phase 2/3: prepare, commit, hooks and journal.
+    commit_transaction(config, "remove", journal_pkgs, &mut tx)?;
 
     println!(
         ":: {} package(s) removed successfully.",
@@ -517,7 +515,9 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
     tx.set_hooks(hooks);
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
-    for (repo, entry, _) in planned {
+    let mut journal_pkgs = Vec::new();
+
+    for (repo, entry, local_version) in planned {
         let filename = entry.filename.clone().ok_or_else(|| {
             XpmError::Database(format!(
                 "package '{}' in repo '{}' is missing FILENAME metadata",
@@ -550,20 +550,19 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             verify_sha256(&dest, sum)?;
         }
 
+        journal_pkgs.push(JournalPackage::upgrade(
+            &entry.name,
+            &local_version,
+            &entry.version,
+        ));
+
         tx.add_remove(entry.name.clone())
             .context("failed to add remove op to transaction")?;
         tx.add_install(entry.name.clone(), entry.version.clone(), dest)
             .context("failed to add install op to transaction")?;
     }
 
-    println!(
-        ":: Preparing transaction ({} operation(s))...",
-        tx.operation_count()
-    );
-    tx.prepare().context("transaction preparation failed")?;
-
-    println!(":: Committing transaction...");
-    tx.commit().context("transaction commit failed")?;
+    commit_transaction(config, "upgrade", journal_pkgs, &mut tx)?;
 
     println!(":: Upgrade complete.");
     Ok(())
@@ -642,23 +641,163 @@ fn read_latest_remote_entries(
     Ok(latest)
 }
 
-fn cmd_query(_config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
-    let filter_type = if args.explicit {
-        "explicitly installed"
-    } else if args.deps {
-        "dependency"
-    } else if args.orphans {
-        "orphan"
-    } else if args.upgrades {
-        "upgradeable"
-    } else {
-        "all"
-    };
-    println!(":: Querying {filter_type} packages...");
-    if let Some(ref f) = args.filter {
-        println!("   filter: {f}");
+fn journal_dir(config: &XpmConfig) -> PathBuf {
+    config.options.db_path.join("journal")
+}
+
+fn hooks_dir() -> PathBuf {
+    std::env::var_os("XPM_HOOKS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/lib/xpm/hooks"))
+}
+
+fn run_phase_hooks(
+    config: &XpmConfig,
+    journal: &Journal,
+    phase: &str,
+    action: &str,
+    abort: bool,
+) -> Result<()> {
+    let dir = hooks_dir().join(format!("{phase}-transaction.d"));
+    let envs = vec![
+        (
+            "XPM_ROOT_DIR".to_string(),
+            config.options.root_dir.display().to_string(),
+        ),
+        ("XPM_ACTION".to_string(), action.to_string()),
+        (
+            "XPM_JOURNAL".to_string(),
+            journal.path.display().to_string(),
+        ),
+        (
+            "XPM_PKG_NAMES".to_string(),
+            journal
+                .packages
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        (
+            "XPM_PKG_VERSIONS".to_string(),
+            journal
+                .packages
+                .iter()
+                .map(|p| p.to.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    ];
+    let outcome = run_transaction_hooks(&dir, &envs)
+        .with_context(|| format!("failed to run {phase}-transaction hooks"))?;
+    for hook in &outcome.ran {
+        tracing::debug!(hook = %hook, "transaction hook ran");
     }
-    println!(":: Query complete (stub).");
+    if !outcome.failed.is_empty() {
+        let list = outcome.failed.join(", ");
+        if abort {
+            anyhow::bail!("{phase}-transaction hook(s) failed: {list}");
+        }
+        eprintln!("xpm: warning: {phase}-transaction hook(s) failed: {list}");
+    }
+    Ok(())
+}
+
+/// Prepares, commits and journals a transaction, running the hook
+/// directories around it.
+fn commit_transaction(
+    config: &XpmConfig,
+    action: &str,
+    packages: Vec<JournalPackage>,
+    tx: &mut Transaction,
+) -> Result<()> {
+    let mut journal = Journal::start(
+        &journal_dir(config),
+        action,
+        &config.options.root_dir,
+        packages,
+    )
+    .context("failed to start the transaction journal")?;
+
+    let result = (|| -> Result<()> {
+        run_phase_hooks(config, &journal, "pre", action, true)?;
+        println!(
+            ":: Preparing transaction ({} operation(s))...",
+            tx.operation_count()
+        );
+        tx.prepare().context("transaction preparation failed")?;
+        println!(":: Committing transaction...");
+        tx.commit().context("transaction commit failed")?;
+        run_phase_hooks(config, &journal, "post", action, false)?;
+        Ok(())
+    })();
+
+    match &result {
+        Ok(()) => {
+            journal
+                .finish("ok", None)
+                .context("failed to finalize the transaction journal")?;
+        }
+        Err(e) => {
+            let _ = journal.finish("failed", Some(format!("{e:#}")));
+        }
+    }
+    result
+}
+
+fn cmd_history(config: &XpmConfig, args: &cli::HistoryArgs) -> Result<()> {
+    let entries =
+        Journal::list(&journal_dir(config)).context("failed to read the transaction journal")?;
+    if entries.is_empty() {
+        println!(":: No transactions recorded.");
+        return Ok(());
+    }
+    if args.json {
+        for journal in &entries {
+            println!("{}", journal.to_json());
+        }
+        return Ok(());
+    }
+    for journal in &entries {
+        println!("{}", journal.summary());
+    }
+    Ok(())
+}
+
+fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
+    let local_db_dir = config.options.db_path.join("local");
+    let installed = read_installed_versions(&local_db_dir)?;
+    let mut packages: Vec<(String, String)> = installed.into_iter().collect();
+
+    if let Some(filter) = args.filter.as_deref() {
+        packages.retain(|(name, _)| name.contains(filter));
+    }
+
+    if args.upgrades {
+        let sync_dir = config.options.db_path.join("sync");
+        let remote = read_latest_remote_entries(config, &sync_dir)?;
+        packages.retain(|(name, version)| {
+            remote
+                .get(name)
+                .map(|(_, entry)| Version::cmp_versions(&entry.version, version).is_gt())
+                .unwrap_or(false)
+        });
+    }
+
+    if args.explicit || args.deps || args.orphans {
+        anyhow::bail!(
+            "xpm query: --explicit/--deps/--orphans need install-reason metadata, \
+             which the local database does not track yet"
+        );
+    }
+
+    packages.sort();
+    for (name, version) in &packages {
+        match args.format.as_str() {
+            "tsv" => println!("{name}\t{version}"),
+            _ => println!("{name} {version}"),
+        }
+    }
     Ok(())
 }
 

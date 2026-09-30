@@ -18,10 +18,11 @@ generation-aware **without coupling xpm to x-scripts**.
 
 ## Proposal
 
-### 1. Transaction journal (xpm side)
+### 1. Transaction journal — **implemented** (`xpm-core::journal`)
 
-Write `/var/lib/xpm/journal/<epoch>-<pid>.json`, fsynced **before** touching
-files and finalized after:
+Write `<db_path>/journal/<epoch>-<pid>.json` (default
+`/var/lib/xpm/journal/`), written **before** touching files and finalized
+after (`xpm history` reads it back):
 
 ```json
 {
@@ -39,16 +40,19 @@ files and finalized after:
 }
 ```
 
-`sha256`/`source` come from the repo metadata xpm already parses (`SHA256SUM`,
-`URL` extended fields, see `docs/INTEGRATION.md`). The transaction engine
-already has a `rollback()` primitive and a state machine
+Timestamps are epoch seconds in the JSON (`started`/`finished`); `xpm history`
+renders them as ISO-8601 (`summary()`). `sha256`/`source` are the next addition
+(they come from the repo metadata xpm already parses: `SHA256SUM`, `URL`
+extended fields, see `docs/INTEGRATION.md`). The transaction engine already has
+a `rollback()` primitive and a state machine
 (`crates/xpm-core/src/transaction.rs`); the journal is the persistent record of
-it.
+it. `install`, `remove` and `upgrade` already write it via
+`commit_transaction`, and finish it as `ok`/`failed`.
 
-### 2. Hook directories (contract)
+### 2. Hook directories (contract) — **implemented** (`xpm-core::txhooks`)
 
-`/usr/lib/xpm/hooks/pre-transaction.d/*` and `post-transaction.d/*`, executed
-in lexical order with the environment:
+`/usr/lib/xpm/hooks/pre-transaction.d/*` and `post-transaction.d/*` (override
+with `XPM_HOOKS_DIR`), executed in lexical order with the environment:
 
 | Variable | Meaning |
 |----------|---------|
@@ -62,23 +66,26 @@ Failure policy: a **pre** hook failure aborts the transaction (no changes); a
 
 `x-scripts` would ship `10-x-gen-pre` (safety generation) and `10-x-gen-post`
 (`x gen new --reason xpm:<action>`) only when generations are supported.
-xpm stays unaware of snapshots, mirrors or `/var/lib/x`.
+xpm stays unaware of snapshots, mirrors or `/var/lib/x`. The runner is
+already wired around prepare/commit; only the hook scripts are pending.
 
 ### 3. History and rollback
 
-- `xpm history [--json]` — reads the journal; if generations exist, appends the
-  generation id created after each transaction.
+- `xpm history [--json]` — **implemented**: reads the journal, newest first
+  (human summary or one JSON object per line). Linking generation ids is
+  pending (needs the hooks above).
 - `xpm rollback --last` — prints (or executes) the recovery path. Full system
   recovery remains `x gen rollback` (F1 of the design): snapshot ownership
   stays in the provisioning payload, not in xpm.
 - `xpm diff <generation>` — later: transaction packages vs the generation
   manifest's `packages.tsv`.
 
-### 4. Stable machine output
+### 4. Stable machine output — **implemented**
 
-`xpm query --format tsv` (or `xpm query --manifest`): `name`, `version`,
-`origin`, `explicit|dep`. Today `xgen_capture_packages` falls back to
-`xpm query` human output; this makes the capture exact.
+`xpm query --format tsv` prints `name<TAB>version` (plain by default);
+filtering and `--upgrades` work. `--explicit/--deps/--orphans` fail with a
+clear message until install-reason metadata is tracked in the local database.
+`origin`/`explicit|dep` columns are the next step.
 
 ### 5. Version pinning and downgrade
 
@@ -107,12 +114,14 @@ what was done.
 - No hard dependency on `x-scripts`; if the hook files are absent, xpm works
   exactly as today.
 
-## Suggested phases
+## Phases
 
-1. Transaction journal + `xpm history --json`.
-2. Hook directories + environment contract.
-3. `xpm query --format tsv`.
-4. `xpm rollback --last` (guidance) + `xpm diff`; `history` links generation ids.
+1. ~~Transaction journal + `xpm history --json`.~~ done.
+2. ~~Hook directories + environment contract.~~ runner done (hook scripts in
+   x-scripts pending; `XPM_*` env covered by unit tests).
+3. ~~`xpm query --format tsv`.~~ done.
+4. `xpm rollback --last` (guidance) + `xpm diff`; `history` links generation
+   ids; install-reason metadata.
 5. Version pinning consumed from the xpkg history index.
 
 See also: `../scripts/docs/en/generations.md` (engine),

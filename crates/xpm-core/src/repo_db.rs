@@ -296,10 +296,7 @@ mod tests {
         assert_eq!(hello.arch.as_deref(), Some("x86_64"));
         assert_eq!(hello.filename.as_deref(), Some("hello-1.0-1-x86_64.xp"));
         assert_eq!(hello.sha256sum.as_deref(), Some("abc123"));
-        assert_eq!(
-            hello.url.as_deref(),
-            Some("https://github.com/xlnux/hello")
-        );
+        assert_eq!(hello.url.as_deref(), Some("https://github.com/xlnux/hello"));
         assert_eq!(hello.depends, vec!["libc>=2.39"]);
         assert_eq!(hello.provides, vec!["hello-bin"]);
         assert_eq!(hello.conflicts, vec!["hello-git"]);
@@ -422,10 +419,7 @@ mod tests {
             xpkg.sha256sum.as_deref(),
             Some("deadbeefcafebabe0000000000000000deadbeefcafebabe0000000000000000")
         );
-        assert_eq!(
-            xpkg.url.as_deref(),
-            Some("https://github.com/xlnux/xpkg")
-        );
+        assert_eq!(xpkg.url.as_deref(), Some("https://github.com/xlnux/xpkg"));
         assert_eq!(xpkg.depends, vec!["rust"]);
         assert_eq!(xpkg.provides, vec!["xpkg-core"]);
     }
