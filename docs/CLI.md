@@ -121,6 +121,36 @@ xpm upgrade --ignore pkg1 --ignore pkg2
 
 ---
 
+### `history` — Transaction Journal
+
+Show the recorded transactions, newest first. Every `install`, `remove` and
+`upgrade` writes a JSON entry under `<db_path>/journal/<epoch>-<pid>.json`
+before touching the filesystem and finalizes it as `ok`/`failed` after the
+commit. `pre-transaction.d`/`post-transaction.d` hooks (default
+`/usr/lib/xpm/hooks`, override with `XPM_HOOKS_DIR`) run around it with
+`XPM_ROOT_DIR`, `XPM_ACTION`, `XPM_JOURNAL`, `XPM_PKG_NAMES` and
+`XPM_PKG_VERSIONS`. See `GENERATIONS.md`.
+
+```bash
+xpm history [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Emit one JSON object per transaction (machine consumption) |
+
+**Examples:**
+
+```bash
+xpm history                # Human summary (ISO-8601 timestamps)
+xpm history --json         # One JSON line per transaction
+```
+
+Transactions left in `running` state (for example after a crash) stay in the
+journal as evidence; the generation layer (`x gen`) is the recovery path.
+
+---
+
 ### `query` — Query Local Database
 
 Query the local package database for installed packages.
@@ -354,6 +384,7 @@ xpm usage repos                   # Repository help
 |----------|-------------|
 | `XPM_CONFIG` | Override default configuration file path |
 | `XPM_CACHE_DIR` | Override default cache directory |
+| `XPM_HOOKS_DIR` | Override the transaction-hook root (default `/usr/lib/xpm/hooks`) |
 | `NO_COLOR` | Disable colored output (standard) |
 | `RUST_LOG` | Set logging verbosity (e.g., `debug`, `trace`) |
 
