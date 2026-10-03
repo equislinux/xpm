@@ -20,6 +20,8 @@ use xpm_core::config::Repository;
 use xpm_core::install_reason::{retain_by_reason, InstallReason};
 use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::local_db;
+use xpm_core::orphans::{find_orphans, InstalledPackage};
+use xpm_core::package::read_metadata;
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db};
 use xpm_core::repo_sync::{
@@ -317,8 +319,9 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
     let mut journal_pkgs = Vec::new();
-    // (package name, origin repository) for local-db metadata after commit.
-    let mut installed = Vec::new();
+    // (package name, origin repository, depends, provides) for local-db
+    // metadata after commit.
+    let mut installed: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
 
     // Phase 1: Download and validate packages
     for pkg_name in &args.packages {
@@ -378,11 +381,19 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             verify_sha256(&dest, sum)?;
         }
 
+        let metadata = read_metadata(&dest)
+            .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
+
         println!("   downloaded: {}", dest.display());
         println!("   source: {}", mirror);
 
         journal_pkgs.push(JournalPackage::install(&entry.name, &entry.version));
-        installed.push((entry.name.clone(), repo.name.clone()));
+        installed.push((
+            entry.name.clone(),
+            repo.name.clone(),
+            metadata.meta.depends.clone(),
+            metadata.meta.provides.clone(),
+        ));
 
         // Add to transaction
         tx.add_install(entry.name.clone(), entry.version.clone(), dest)
@@ -402,12 +413,16 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     // Phase 2/3: prepare, commit, hooks and journal.
     commit_transaction(config, "install", journal_pkgs, &mut tx)?;
 
-    for (pkg_name, repo_name) in &installed {
+    for (pkg_name, repo_name, depends, provides) in &installed {
         reason
             .write(&local_db_dir, pkg_name)
             .with_context(|| format!("failed to record install reason for '{pkg_name}'"))?;
         local_db::write_origin(&local_db_dir, pkg_name, repo_name)
             .with_context(|| format!("failed to record origin for '{pkg_name}'"))?;
+        local_db::write_depends(&local_db_dir, pkg_name, depends)
+            .with_context(|| format!("failed to record dependencies for '{pkg_name}'"))?;
+        local_db::write_provides(&local_db_dir, pkg_name, provides)
+            .with_context(|| format!("failed to record provides for '{pkg_name}'"))?;
     }
 
     println!(
@@ -546,8 +561,9 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
     let mut journal_pkgs = Vec::new();
-    // (package name, origin repository) for local-db metadata after commit.
-    let mut upgraded = Vec::new();
+    // (package name, origin repository, depends, provides) for local-db
+    // metadata after commit.
+    let mut upgraded: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
 
     for (repo, entry, local_version) in planned {
         let filename = entry.filename.clone().ok_or_else(|| {
@@ -582,12 +598,20 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             verify_sha256(&dest, sum)?;
         }
 
+        let metadata = read_metadata(&dest)
+            .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
+
         journal_pkgs.push(JournalPackage::upgrade(
             &entry.name,
             &local_version,
             &entry.version,
         ));
-        upgraded.push((entry.name.clone(), repo.name.clone()));
+        upgraded.push((
+            entry.name.clone(),
+            repo.name.clone(),
+            metadata.meta.depends.clone(),
+            metadata.meta.provides.clone(),
+        ));
 
         tx.add_remove(entry.name.clone())
             .context("failed to add remove op to transaction")?;
@@ -603,9 +627,13 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             .with_context(|| format!("failed to preserve install reason for '{name}'"))?;
     }
 
-    for (name, repo_name) in &upgraded {
+    for (name, repo_name, depends, provides) in &upgraded {
         local_db::write_origin(&local_db_dir, name, repo_name)
             .with_context(|| format!("failed to record origin for '{name}'"))?;
+        local_db::write_depends(&local_db_dir, name, depends)
+            .with_context(|| format!("failed to record dependencies for '{name}'"))?;
+        local_db::write_provides(&local_db_dir, name, provides)
+            .with_context(|| format!("failed to record provides for '{name}'"))?;
     }
 
     println!(":: Upgrade complete.");
@@ -829,10 +857,20 @@ fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
     }
 
     if args.orphans {
-        anyhow::bail!(
-            "xpm query: --orphans needs dependency tracking (which packages require each \
-             installed package), which the local database does not record yet"
-        );
+        let mut installed_packages = Vec::with_capacity(packages.len());
+        for (name, _) in &packages {
+            let depends = local_db::read_depends(&local_db_dir, name)?;
+            installed_packages.push(InstalledPackage {
+                name: name.clone(),
+                explicit: InstallReason::read(&local_db_dir, name) == InstallReason::Explicit,
+                has_depends_record: depends.is_some(),
+                depends: depends.unwrap_or_default(),
+                provides: local_db::read_provides(&local_db_dir, name)?,
+            });
+        }
+        let orphans: std::collections::HashSet<String> =
+            find_orphans(&installed_packages).into_iter().collect();
+        packages.retain(|(name, _)| orphans.contains(name));
     }
 
     if args.explicit && args.deps {

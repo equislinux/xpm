@@ -9,6 +9,7 @@ pub mod hooks;
 pub mod install_reason;
 pub mod journal;
 pub mod local_db;
+pub mod orphans;
 pub mod package;
 pub mod repo;
 pub mod repo_db;

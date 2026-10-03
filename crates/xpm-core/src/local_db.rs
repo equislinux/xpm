@@ -9,9 +9,15 @@
 //!   directories with a trailing `/`. `x gen restore --pkg` consumes it.
 //! - `origin` — name of the repository the package was installed from
 //!   (absent for local-file installs).
+//! - `depends` — declared runtime dependencies (one per line, raw specs such
+//!   as `libc>=2.39`). `None` when absent (legacy install): different from an
+//!   empty record, which means the package declares no dependencies.
+//! - `provides` — virtual names the package provides, used to resolve which
+//!   installed package satisfies a dependency.
 //!
 //! Missing files never make a legacy install fail: `files` reads as empty
-//! and `origin`/`version` as `None`.
+//! and `origin`/`version` as `None`; `depends` as `None` and `provides` as
+//! empty.
 
 use std::collections::HashSet;
 use std::fs;
@@ -26,6 +32,10 @@ pub const FILES_FILE: &str = "files";
 pub const ORIGIN_FILE: &str = "origin";
 /// File name of the installed version.
 pub const VERSION_FILE: &str = "version";
+/// File name of the declared runtime dependencies.
+pub const DEPENDS_FILE: &str = "depends";
+/// File name of the provided virtual names.
+pub const PROVIDES_FILE: &str = "provides";
 /// First line of a pacman-compatible `files` manifest.
 pub const FILES_HEADER: &str = "%FILES%";
 
@@ -148,6 +158,55 @@ pub fn read_version(local_db_dir: &Path, pkg: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+// ── depends / provides ────────────────────────────────────────
+
+fn write_list(local_db_dir: &Path, pkg: &str, file: &str, entries: &[String]) -> XpmResult<()> {
+    let pkg_dir = local_db_dir.join(pkg);
+    fs::create_dir_all(&pkg_dir)?;
+    let mut out = String::new();
+    for entry in entries {
+        out.push_str(entry);
+        out.push('\n');
+    }
+    fs::write(pkg_dir.join(file), out)?;
+    Ok(())
+}
+
+fn read_list(local_db_dir: &Path, pkg: &str, file: &str) -> XpmResult<Option<Vec<String>>> {
+    match fs::read_to_string(local_db_dir.join(pkg).join(file)) {
+        Ok(raw) => Ok(Some(
+            raw.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Writes the package's declared runtime dependencies (raw specs).
+pub fn write_depends(local_db_dir: &Path, pkg: &str, depends: &[String]) -> XpmResult<()> {
+    write_list(local_db_dir, pkg, DEPENDS_FILE, depends)
+}
+
+/// Reads the declared dependencies. `None` for a legacy install without a
+/// record; `Some(vec![])` when the package explicitly declares none.
+pub fn read_depends(local_db_dir: &Path, pkg: &str) -> XpmResult<Option<Vec<String>>> {
+    read_list(local_db_dir, pkg, DEPENDS_FILE)
+}
+
+/// Writes the virtual names the package provides.
+pub fn write_provides(local_db_dir: &Path, pkg: &str, provides: &[String]) -> XpmResult<()> {
+    write_list(local_db_dir, pkg, PROVIDES_FILE, provides)
+}
+
+/// Reads the provided virtual names (empty for legacy installs).
+pub fn read_provides(local_db_dir: &Path, pkg: &str) -> XpmResult<Vec<String>> {
+    Ok(read_list(local_db_dir, pkg, PROVIDES_FILE)?.unwrap_or_default())
+}
+
 // ── Tests ─────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -267,6 +326,39 @@ mod tests {
 
         write_origin(&local_db, "empty", "").expect("write empty origin");
         assert_eq!(read_origin(&local_db, "empty"), None);
+    }
+
+    #[test]
+    fn depends_roundtrip_and_legacy_is_none() {
+        let tmp = TempDir::new().expect("tmp");
+        let local_db = tmp.path().join("local");
+
+        assert_eq!(read_depends(&local_db, "legacy").expect("read"), None);
+
+        let deps = vec!["glibc".to_string(), "libx11>=1.8".to_string()];
+        write_depends(&local_db, "hello", &deps).expect("write");
+        assert_eq!(read_depends(&local_db, "hello").expect("read"), Some(deps));
+
+        write_depends(&local_db, "empty", &[]).expect("write empty");
+        assert_eq!(
+            read_depends(&local_db, "empty").expect("read"),
+            Some(Vec::new()),
+            "an empty record is not the same as a missing one"
+        );
+    }
+
+    #[test]
+    fn provides_roundtrip_and_missing_is_empty() {
+        let tmp = TempDir::new().expect("tmp");
+        let local_db = tmp.path().join("local");
+
+        assert!(read_provides(&local_db, "legacy").expect("read").is_empty());
+
+        write_provides(&local_db, "hello", &["hello-bin".to_string()]).expect("write");
+        assert_eq!(
+            read_provides(&local_db, "hello").expect("read"),
+            vec!["hello-bin".to_string()]
+        );
     }
 
     #[test]

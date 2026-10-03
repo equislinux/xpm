@@ -103,13 +103,21 @@ needs:
   from; absent for a local-file install. `xpm info <pkg>` shows it (plus the
   sync entry's repository, description and dependencies when the sync database
   is present, with the same repository priority as `read_latest_remote_entries`).
+- `<db_path>/local/<pkg>/depends` — declared runtime dependencies (raw specs
+  such as `libc>=2.39`), recorded by `xpm install`/`xpm upgrade` from the
+  package's `.PKGINFO`.
+- `<db_path>/local/<pkg>/provides` — virtual names the package provides, used
+  to resolve which installed package satisfies a dependency.
 
 Missing `reason`, `origin` or `files` files (legacy or local-file installs)
-never fail: they default to `explicit`, `None` and an empty list.
+never fail: they default to `explicit`, `None` and an empty list. `depends`
+reads as `None` when absent and `provides` as empty.
 
-`--orphans` still fails with a clear message: the local database does not
-record the reverse dependency graph, so orphan detection is not trivial yet.
-`--orphans` is the next step.
+`--orphans` walks the recorded dependency edges: a `reason: dep` package is an
+orphan when it is not reachable from any explicitly installed package (directly
+or transitively, version constraints stripped, `provides` taken into account).
+Legacy entries without a `depends` record are never reported, because their
+edges are unknown.
 
 ### 5. Version pinning and downgrade
 
@@ -124,7 +132,7 @@ rollback.
 | Item | Where it stands |
 |------|-----------------|
 | Resolver wired into the CLI | Pending (`future-integration.md` item 1); needed before upgrade journaling is meaningful |
-| Stub commands (`query`, `files`, ...) | `query`, `files`, `info` and `search` implemented; `query --orphans` pending dependency-edge recording |
+| Stub commands (`query`, `files`, ...) | `query` (including `--orphans`), `files`, `info` and `search` implemented |
 | Transaction hardening (`.pacnew`, hooks, rollback tests) | Open items in `ROADMAP.md` Phase 7/8 |
 | Config keyring path inconsistency | Pending reconciliation |
 
@@ -148,7 +156,8 @@ what was done.
    ids; ~~install-reason metadata~~ done (section 4: `reason` file,
    `--explicit/--deps`); ~~`origin` provenance + package `files` manifest~~ done
    (section 4: `local/<pkg>/origin` and `%FILES%` manifest from `.MTREE`, plus
-   `xpm files`/`xpm info`; `--orphans` pending).
+   `xpm files`/`xpm info`); ~~`--orphans`~~ done (dependency edges recorded at
+   install).
 5. Version pinning consumed from the xpkg history index.
 
 See also: `../scripts/docs/en/generations.md` (engine),

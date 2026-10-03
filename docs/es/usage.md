@@ -126,8 +126,9 @@ xpm Q [FILTER] [OPTIONS]
 | `--upgrades` | `-u` | Paquetes con actualizaciones disponibles |
 
 Nota de implementación: implementado contra las bases local y sync (filtro por nombre más
-`--explicit`, `--deps` y `--upgrades`). `--orphans` hoy da error: la base local todavía no
-registra aristas de dependencia (qué paquete requiere a cuál).
+`--explicit`, `--deps` y `--upgrades`). `--orphans` lista paquetes de dependencia que ningún
+paquete explícito requiere, usando las aristas `depends`/`provides` registradas al instalar;
+las entradas legacy sin registro se omiten.
 
 ### `search` — Buscar paquetes
 

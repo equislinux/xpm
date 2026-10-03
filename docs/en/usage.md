@@ -124,8 +124,9 @@ xpm Q [FILTER] [OPTIONS]
 | `--upgrades` | `-u` | Packages with available updates |
 
 Implementation note: implemented against the local and sync databases (name filter plus
-`--explicit`, `--deps` and `--upgrades`). `--orphans` currently errors: the local database does
-not record dependency edges (which package requires which) yet.
+`--explicit`, `--deps` and `--upgrades`). `--orphans` lists dependency packages that no
+explicitly installed package requires, using the `depends`/`provides` edges recorded at install
+time; legacy entries without a record are skipped.
 
 ### `search` — Search packages
 
