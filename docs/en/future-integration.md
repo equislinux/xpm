@@ -42,8 +42,9 @@ own roadmap and current `main.rs`):
    level, but `install` selects packages by name from the synced database and `upgrade` uses
    plain version comparison. An install/upgrade path that truly resolves dependency closures
    needs to call the solver.
-2. **Finish the stub commands.** `query`, `search`, `info`, and `files` currently only parse
-   their arguments.
+2. **Finish the remaining query feature.** Only `query --orphans` is pending: it needs
+   dependency edges recorded at install time. `query`, `search`, `info`, and `files` already
+   read the databases.
 3. **Complete transaction hardening.** The repo roadmap lists open items: `.pacnew`/`.pacsave`
    configuration-file management, alpm-hooks execution beyond `.INSTALL` scriptlets, upgrade
    end-to-end test, conflict resolution and rollback tests.

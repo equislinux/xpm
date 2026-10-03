@@ -183,7 +183,7 @@ fn cmd_sync(config: &XpmConfig, args: &cli::SyncArgs) -> Result<()> {
             );
         }
     }
-    println!(":: Sync complete (stub).");
+    println!(":: Sync complete.");
     Ok(())
 }
 
@@ -858,10 +858,55 @@ fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_search(_config: &XpmConfig, args: &cli::SearchArgs) -> Result<()> {
-    let db = if args.local { "local" } else { "sync" };
-    println!(":: Searching {db} database for '{}'...", args.query);
-    println!(":: Search complete (stub).");
+fn cmd_search(config: &XpmConfig, args: &cli::SearchArgs) -> Result<()> {
+    use xpm_core::repo_db::{matches_query, RepoEntry};
+
+    let mut hits: Vec<(String, RepoEntry)> = Vec::new();
+
+    if args.local {
+        let local_db_dir = config.options.db_path.join("local");
+        for (name, version) in read_installed_versions(&local_db_dir)? {
+            if name.to_lowercase().contains(&args.query.to_lowercase()) {
+                hits.push((
+                    "local".to_string(),
+                    RepoEntry {
+                        name,
+                        version,
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    } else {
+        let sync_dir = config.options.db_path.join("sync");
+        for repo in &config.repositories {
+            let db_path = sync_dir.join(format!("{}.db", repo.name));
+            if !db_path.exists() {
+                continue;
+            }
+            let db = parse_sync_db(&db_path, &repo.name)
+                .with_context(|| format!("failed to parse sync db {}", db_path.display()))?;
+            for entry in db.entries {
+                if matches_query(&entry, &args.query) {
+                    hits.push((repo.name.clone(), entry));
+                }
+            }
+        }
+    }
+
+    hits.sort_by(|a, b| a.1.name.cmp(&b.1.name).then_with(|| a.0.cmp(&b.0)));
+
+    if hits.is_empty() {
+        println!(":: No packages found for '{}'.", args.query);
+        return Ok(());
+    }
+
+    for (repo, entry) in &hits {
+        println!("{}/{} {}", repo, entry.name, entry.version);
+        if let Some(description) = &entry.description {
+            println!("    {description}");
+        }
+    }
     Ok(())
 }
 

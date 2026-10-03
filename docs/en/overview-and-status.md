@@ -96,8 +96,8 @@ The workspace `Cargo.toml` currently reports version `0.1.0`.
 Not every subcommand is fully wired to engine logic yet. From `crates/xpm/src/main.rs`:
 
 - `sync`, `install`, `remove`, `upgrade`, and `repo` dispatch to real transaction/download logic.
-- `query`, `search`, `info`, and `files` parse their arguments but currently print
-  "complete (stub)" messages; they do not yet query the databases.
+- `query`, `search`, `info`, and `files` read the local and sync databases. `query --orphans`
+  is the remaining gap: it needs dependency edges recorded at install time.
 
 See [Usage](usage.md) for the full reference and [Architecture](architecture.md) for the
 implementation details, including the note that the CLI install path currently selects packages

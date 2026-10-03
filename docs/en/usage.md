@@ -123,8 +123,9 @@ xpm Q [FILTER] [OPTIONS]
 | `--orphans` | `-t` | Orphan packages (no longer required) |
 | `--upgrades` | `-u` | Packages with available updates |
 
-Implementation note: the flags and filter are parsed, but the handler is currently a stub that
-only prints the intended filter type.
+Implementation note: implemented against the local and sync databases (name filter plus
+`--explicit`, `--deps` and `--upgrades`). `--orphans` currently errors: the local database does
+not record dependency edges (which package requires which) yet.
 
 ### `search` — Search packages
 
@@ -139,7 +140,8 @@ xpm Ss <QUERY> [OPTIONS]
 |------|-------|-------------|
 | `--local` | `-l` | Search in the local database instead of the sync databases |
 
-Implementation note: currently a stub.
+Implementation note: implemented as a case-insensitive match over name, description and
+provides; `--local` matches installed package names.
 
 ### `info` — Package information
 
@@ -154,7 +156,8 @@ xpm Si <PACKAGE> [OPTIONS]
 |------|-------|-------------|
 | `--local` | `-l` | Query the local database instead of the sync databases |
 
-Implementation note: currently a stub.
+Implementation note: implemented; merges the installed entry with the highest-priority sync
+entry, and `--local` limits the output to the installed database.
 
 ### `files` — List package files
 
@@ -165,7 +168,8 @@ xpm files <PACKAGE>
 xpm Ql <PACKAGE>
 ```
 
-Implementation note: currently a stub.
+Implementation note: implemented; reads the `files` manifest recorded at install time (empty
+for legacy installs).
 
 ### `repo` — Repository management
 

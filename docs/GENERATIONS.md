@@ -124,7 +124,7 @@ rollback.
 | Item | Where it stands |
 |------|-----------------|
 | Resolver wired into the CLI | Pending (`future-integration.md` item 1); needed before upgrade journaling is meaningful |
-| Stub commands (`query`, `files`, ...) | `query`, `files` and `info` implemented; `search` still a stub |
+| Stub commands (`query`, `files`, ...) | `query`, `files`, `info` and `search` implemented; `query --orphans` pending dependency-edge recording |
 | Transaction hardening (`.pacnew`, hooks, rollback tests) | Open items in `ROADMAP.md` Phase 7/8 |
 | Config keyring path inconsistency | Pending reconciliation |
 

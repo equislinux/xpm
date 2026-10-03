@@ -191,6 +191,25 @@ fn is_xz(bytes: &[u8]) -> bool {
     bytes.len() >= 6 && bytes[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]
 }
 
+/// Case-insensitive match of `query` against an entry's name, description or
+/// provides (the `xpm search` contract).
+pub fn matches_query(entry: &RepoEntry, query: &str) -> bool {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+
+    entry.name.to_lowercase().contains(&query)
+        || entry
+            .description
+            .as_deref()
+            .is_some_and(|desc| desc.to_lowercase().contains(&query))
+        || entry
+            .provides
+            .iter()
+            .any(|provide| provide.to_lowercase().contains(&query))
+}
+
 fn merge_sections(into: &mut HashMap<String, Vec<String>>, from: HashMap<String, Vec<String>>) {
     for (k, mut v) in from {
         into.entry(k).or_default().append(&mut v);
@@ -280,6 +299,24 @@ mod tests {
             builder.finish().expect("finish tar builder");
         }
         zstd::encode_all(&raw[..], 3).expect("compress zstd")
+    }
+
+    #[test]
+    fn matches_query_searches_name_description_and_provides() {
+        let entry = RepoEntry {
+            name: "firefox".to_string(),
+            version: "128.0-1".to_string(),
+            description: Some("Fast, Private Browser".to_string()),
+            provides: vec!["browser".to_string()],
+            ..Default::default()
+        };
+
+        assert!(matches_query(&entry, "fire"));
+        assert!(matches_query(&entry, "FIREFOX"), "case-insensitive name");
+        assert!(matches_query(&entry, "private"), "description match");
+        assert!(matches_query(&entry, "BROWSER"), "provides match");
+        assert!(!matches_query(&entry, "chromium"));
+        assert!(!matches_query(&entry, ""), "empty query never matches");
     }
 
     #[test]
