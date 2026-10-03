@@ -98,8 +98,8 @@ No todos los subcomandos están conectados del todo con la lógica del motor. De
 
 - `sync`, `install`, `remove`, `upgrade` y `repo` despachan a lógica real de transacción y
   descarga.
-- `query`, `search`, `info` y `files` parsean sus argumentos pero hoy imprimen mensajes de
-  "complete (stub)"; todavía no consultan las bases de datos.
+- `query` (incluido `--orphans`), `search`, `info` y `files` leen las bases local y sync; el
+  hueco restante antes del camino nativo es conectar el resolver a install/upgrade.
 
 Ver [Uso](usage.md) para la referencia completa y [Arquitectura](architecture.md) para los
 detalles de implementación, incluida la nota de que el camino de instalación del CLI selecciona

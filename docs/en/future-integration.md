@@ -42,16 +42,14 @@ own roadmap and current `main.rs`):
    level, but `install` selects packages by name from the synced database and `upgrade` uses
    plain version comparison. An install/upgrade path that truly resolves dependency closures
    needs to call the solver.
-2. **Finish the stub commands.** `query`, `search`, `info`, and `files` currently only parse
-   their arguments.
-3. **Complete transaction hardening.** The repo roadmap lists open items: `.pacnew`/`.pacsave`
+2. **Complete transaction hardening.** The repo roadmap lists open items: `.pacnew`/`.pacsave`
    configuration-file management, alpm-hooks execution beyond `.INSTALL` scriptlets, upgrade
    end-to-end test, conflict resolution and rollback tests.
-4. **Close production-readiness milestones** (repo ROADMAP Phase 8 and Phase 9): benchmarks vs
+3. **Close production-readiness milestones** (repo ROADMAP Phase 8 and Phase 9): benchmarks vs
    pacman, stress testing against a full repository, fuzzing, error-handling audit (partial
    downloads, corrupt packages, disk full), and post-v1.0 goals (Python bindings, i18n, TUI,
    smart mirror selection, configurable cache).
-5. **Reconcile config inconsistencies** such as the GPG keyring default
+4. **Reconcile config inconsistencies** such as the GPG keyring default
    (`config.rs` uses `/etc/pacman.d/gnupg/` while README guidance uses `/etc/xpm/gnupg/`).
 
 ## Integration with xpkg
@@ -85,7 +83,8 @@ compatibility surfaces and documented carefully when they change:
   `/repo/x86_64`), signatures as detached `.sig`, keyring as `trustedkeys.gpg`.
 - **Configuration**: `/etc/xpm.conf` (TOML), user repos under `/etc/xpm.d/`, `$repo`/`$arch`
   URL variables, `sig_level` semantics.
-- **Local database layout**: `/var/lib/xpm/local/<pkg>/` with `version` and `files` entries,
+- **Local database layout**: `/var/lib/xpm/local/<pkg>/` with `version`, `reason`, `origin`,
+  `files`, `depends` and `provides` entries,
   sync DBs under `/var/lib/xpm/sync/`.
 - **Scriptlet contract**: bash functions sourced from `.INSTALL` with `XPM_ROOT_DIR`,
   `XPM_PKG_NAME`, `XPM_PKG_VERSION` environment variables.

@@ -125,8 +125,10 @@ xpm Q [FILTER] [OPTIONS]
 | `--orphans` | `-t` | Paquetes huérfanos (ya no requeridos) |
 | `--upgrades` | `-u` | Paquetes con actualizaciones disponibles |
 
-Nota de implementación: las flags y el filtro se parsean, pero el handler es hoy un stub que solo
-imprime el tipo de filtro pretendido.
+Nota de implementación: implementado contra las bases local y sync (filtro por nombre más
+`--explicit`, `--deps` y `--upgrades`). `--orphans` lista paquetes de dependencia que ningún
+paquete explícito requiere, usando las aristas `depends`/`provides` registradas al instalar;
+las entradas legacy sin registro se omiten.
 
 ### `search` — Buscar paquetes
 
@@ -141,7 +143,8 @@ xpm Ss <QUERY> [OPTIONS]
 |------|-------|-------------|
 | `--local` | `-l` | Busca en la base de datos local en lugar de en las de sync |
 
-Nota de implementación: actualmente es un stub.
+Nota de implementación: implementado como match case-insensitive sobre nombre, descripción y
+provides; `--local` matchea nombres de paquetes instalados.
 
 ### `info` — Información de paquete
 
@@ -156,7 +159,8 @@ xpm Si <PACKAGE> [OPTIONS]
 |------|-------|-------------|
 | `--local` | `-l` | Consulta la base de datos local en lugar de las de sync |
 
-Nota de implementación: actualmente es un stub.
+Nota de implementación: implementado; combina la entrada instalada con la entrada sync de mayor
+prioridad, y `--local` limita la salida a la base instalada.
 
 ### `files` — Listar archivos de un paquete
 
@@ -167,7 +171,8 @@ xpm files <PACKAGE>
 xpm Ql <PACKAGE>
 ```
 
-Nota de implementación: actualmente es un stub.
+Nota de implementación: implementado; lee el manifiesto `files` registrado al instalar (vacío
+para instalaciones legacy).
 
 ### `repo` — Gestión de repositorios
 

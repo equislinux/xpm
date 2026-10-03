@@ -9,6 +9,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
+use xz2::read::XzDecoder;
 
 use crate::XpmError;
 use crate::XpmResult;
@@ -122,7 +123,7 @@ fn merge_files_db_bytes(bytes: &[u8], db: &mut SyncDb) -> XpmResult<()> {
 }
 
 fn read_repo_archive(bytes: &[u8]) -> XpmResult<HashMap<String, ArchivePackage>> {
-    let mut archive = open_archive(bytes);
+    let mut archive = open_archive(bytes)?;
     let mut packages = HashMap::<String, ArchivePackage>::new();
 
     for entry_result in archive.entries()? {
@@ -159,18 +160,54 @@ fn read_repo_archive(bytes: &[u8]) -> XpmResult<HashMap<String, ArchivePackage>>
     Ok(packages)
 }
 
-fn open_archive(bytes: &[u8]) -> tar::Archive<Box<dyn Read>> {
+fn open_archive(bytes: &[u8]) -> XpmResult<tar::Archive<Box<dyn Read>>> {
     let reader: Box<dyn Read> = if is_gzip(bytes) {
         Box::new(GzDecoder::new(Cursor::new(bytes.to_vec())))
+    } else if is_zstd(bytes) {
+        // xpkg repo-add writes zstd-compressed databases by default; ALPM-style
+        // `.db` files can also arrive gzip or xz compressed.
+        Box::new(
+            zstd::Decoder::new(Cursor::new(bytes.to_vec()))
+                .map_err(|e| XpmError::Database(format!("failed to decode zstd database: {e}")))?,
+        )
+    } else if is_xz(bytes) {
+        Box::new(XzDecoder::new(Cursor::new(bytes.to_vec())))
     } else {
         Box::new(Cursor::new(bytes.to_vec()))
     };
 
-    tar::Archive::new(reader)
+    Ok(tar::Archive::new(reader))
 }
 
 fn is_gzip(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b
+}
+
+fn is_zstd(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[..4] == [0x28, 0xb5, 0x2f, 0xfd]
+}
+
+fn is_xz(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && bytes[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]
+}
+
+/// Case-insensitive match of `query` against an entry's name, description or
+/// provides (the `xpm search` contract).
+pub fn matches_query(entry: &RepoEntry, query: &str) -> bool {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+
+    entry.name.to_lowercase().contains(&query)
+        || entry
+            .description
+            .as_deref()
+            .is_some_and(|desc| desc.to_lowercase().contains(&query))
+        || entry
+            .provides
+            .iter()
+            .any(|provide| provide.to_lowercase().contains(&query))
 }
 
 fn merge_sections(into: &mut HashMap<String, Vec<String>>, from: HashMap<String, Vec<String>>) {
@@ -245,6 +282,61 @@ fn parse_alpm_sections(input: &str) -> HashMap<String, Vec<String>> {
 mod tests {
     use super::*;
 
+    fn make_zstd_tar(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw);
+            for (path, contents) in entries {
+                let bytes = contents.as_bytes();
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, *path, bytes)
+                    .expect("append tar entry");
+            }
+            builder.finish().expect("finish tar builder");
+        }
+        zstd::encode_all(&raw[..], 3).expect("compress zstd")
+    }
+
+    #[test]
+    fn matches_query_searches_name_description_and_provides() {
+        let entry = RepoEntry {
+            name: "firefox".to_string(),
+            version: "128.0-1".to_string(),
+            description: Some("Fast, Private Browser".to_string()),
+            provides: vec!["browser".to_string()],
+            ..Default::default()
+        };
+
+        assert!(matches_query(&entry, "fire"));
+        assert!(matches_query(&entry, "FIREFOX"), "case-insensitive name");
+        assert!(matches_query(&entry, "private"), "description match");
+        assert!(matches_query(&entry, "BROWSER"), "provides match");
+        assert!(!matches_query(&entry, "chromium"));
+        assert!(!matches_query(&entry, ""), "empty query never matches");
+    }
+
+    #[test]
+    fn parse_sync_db_reads_zstd_xpkg_database() {
+        let bytes = make_zstd_tar(&[(
+            "hello-1.0-1/desc",
+            "%NAME%\nhello\n\n%VERSION%\n1.0-1\n\n%DESC%\nzstd database entry\n\n%ARCH%\nx86_64\n\n%FILENAME%\nhello-1.0-1-x86_64.xp\n",
+        )]);
+
+        let db = parse_sync_db_bytes(&bytes, "x").expect("parse zstd sync db");
+
+        assert_eq!(db.entries.len(), 1);
+        assert_eq!(db.entries[0].name, "hello");
+        assert_eq!(db.entries[0].version, "1.0-1");
+        assert_eq!(
+            db.entries[0].filename.as_deref(),
+            Some("hello-1.0-1-x86_64.xp")
+        );
+    }
+
     fn make_gzip_tar(entries: &[(&str, &str)]) -> Vec<u8> {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         {
@@ -296,10 +388,7 @@ mod tests {
         assert_eq!(hello.arch.as_deref(), Some("x86_64"));
         assert_eq!(hello.filename.as_deref(), Some("hello-1.0-1-x86_64.xp"));
         assert_eq!(hello.sha256sum.as_deref(), Some("abc123"));
-        assert_eq!(
-            hello.url.as_deref(),
-            Some("https://github.com/xlnux/hello")
-        );
+        assert_eq!(hello.url.as_deref(), Some("https://github.com/xlnux/hello"));
         assert_eq!(hello.depends, vec!["libc>=2.39"]);
         assert_eq!(hello.provides, vec!["hello-bin"]);
         assert_eq!(hello.conflicts, vec!["hello-git"]);
@@ -422,10 +511,7 @@ mod tests {
             xpkg.sha256sum.as_deref(),
             Some("deadbeefcafebabe0000000000000000deadbeefcafebabe0000000000000000")
         );
-        assert_eq!(
-            xpkg.url.as_deref(),
-            Some("https://github.com/xlnux/xpkg")
-        );
+        assert_eq!(xpkg.url.as_deref(), Some("https://github.com/xlnux/xpkg"));
         assert_eq!(xpkg.depends, vec!["rust"]);
         assert_eq!(xpkg.provides, vec!["xpkg-core"]);
     }

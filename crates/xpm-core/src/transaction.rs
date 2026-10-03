@@ -525,6 +525,21 @@ mod tests {
             header.set_cksum();
             builder.append(&header, &buildinfo[..]).unwrap();
 
+            // .MTREE
+            let mtree = b"#mtree\n\
+                ./usr type=dir mode=0755 uid=0 gid=0\n\
+                ./usr/bin type=dir mode=0755 uid=0 gid=0\n\
+                ./usr/bin/test type=file mode=0755 size=12 uid=0 gid=0\n\
+                ./usr/bin/test-link type=link link=test uid=0 gid=0\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_path(".MTREE").unwrap();
+            header.set_size(mtree.len() as u64);
+            header.set_mode(0o644);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append(&header, &mtree[..]).unwrap();
+
             // Create usr/bin/ directory and test file
             let mut header = tar::Header::new_gnu();
             header.set_path("usr/").unwrap();
@@ -555,6 +570,17 @@ mod tests {
             header.set_gid(0);
             header.set_cksum();
             builder.append(&header, &content[..]).unwrap();
+
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_path("usr/bin/test-link").unwrap();
+            header.set_link_name("test").unwrap();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append(&header, &[][..]).unwrap();
 
             builder.finish().unwrap();
         }
@@ -608,6 +634,20 @@ mod tests {
         let version_content =
             fs::read_to_string(local_db.join("test/version")).expect("read version");
         assert_eq!(version_content, "1.0.0-1", "version should match");
+
+        // Verify symlink was extracted
+        assert!(
+            root.join("usr/bin/test-link").is_symlink(),
+            "symlink from the package should be extracted"
+        );
+
+        // Verify pacman-compatible file manifest derived from .MTREE
+        let files_content =
+            fs::read_to_string(local_db.join("test/files")).expect("read files manifest");
+        assert_eq!(
+            files_content,
+            "%FILES%\nusr/\nusr/bin/\nusr/bin/test\nusr/bin/test-link\n"
+        );
     }
 
     #[test]

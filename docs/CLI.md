@@ -121,6 +121,36 @@ xpm upgrade --ignore pkg1 --ignore pkg2
 
 ---
 
+### `history` — Transaction Journal
+
+Show the recorded transactions, newest first. Every `install`, `remove` and
+`upgrade` writes a JSON entry under `<db_path>/journal/<epoch>-<pid>.json`
+before touching the filesystem and finalizes it as `ok`/`failed` after the
+commit. `pre-transaction.d`/`post-transaction.d` hooks (default
+`/usr/lib/xpm/hooks`, override with `XPM_HOOKS_DIR`) run around it with
+`XPM_ROOT_DIR`, `XPM_ACTION`, `XPM_JOURNAL`, `XPM_PKG_NAMES` and
+`XPM_PKG_VERSIONS`. See `GENERATIONS.md`.
+
+```bash
+xpm history [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Emit one JSON object per transaction (machine consumption) |
+
+**Examples:**
+
+```bash
+xpm history                # Human summary (ISO-8601 timestamps)
+xpm history --json         # One JSON line per transaction
+```
+
+Transactions left in `running` state (for example after a crash) stay in the
+journal as evidence; the generation layer (`x gen`) is the recovery path.
+
+---
+
 ### `query` — Query Local Database
 
 Query the local package database for installed packages.
@@ -132,6 +162,7 @@ xpm Q [FILTER] [OPTIONS]         # pacman-style alias
 
 | Flag | Short | Description |
 |------|-------|-------------|
+| `--format` | — | Output format: `plain` (default) or `tsv` |
 | `--explicit` | `-e` | List only explicitly installed packages |
 | `--deps` | `-d` | List only packages installed as dependencies |
 | `--orphans` | `-t` | List orphan packages (no longer required) |
@@ -180,7 +211,12 @@ xpm search --local vim            # Search installed packages
 
 ### `info` — Package Information
 
-Display detailed information about a package.
+Display detailed information about an installed package: name, version,
+install reason (`explicit`/`dep`) and origin repository. When the sync
+database is available, the repository description and dependencies are
+added (highest-priority repository wins, same order as `xpm query
+--upgrades`). For packages that are not installed, the sync entry alone is
+shown.
 
 ```bash
 xpm info <PACKAGE> [OPTIONS]
@@ -189,21 +225,40 @@ xpm Si <PACKAGE> [OPTIONS]       # pacman-style alias
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--local` | `-l` | Query local database instead of sync |
+| `--local` | `-l` | Query the local database only (no sync enrichment) |
 
 **Examples:**
 
 ```bash
-xpm info linux                    # Info from sync database
+xpm info linux                    # Local info + sync description/deps
 xpm Si firefox                    # Same, pacman-style
-xpm info --local vim              # Info for installed package
+xpm info --local vim              # Installed metadata only
 ```
+
+**Output (installed package):**
+
+```
+Name            : kitty
+Version         : 0.44.0-1
+Install Reason  : explicit
+Origin          : x
+Repository      : x
+Description     : A cross-platform, fast, feature full, GPU based terminal emulator
+Depends On      : glfw  libglvnd  wayland
+```
+
+Legacy installs without `reason`/`origin` files default to `explicit` and
+`unknown` instead of failing.
 
 ---
 
 ### `files` — List Package Files
 
-List all files owned by a package.
+List all files owned by an installed package, read from
+`<db_path>/local/<pkg>/files`. The manifest is pacman-compatible: it is
+derived from the package's `.MTREE`, so it includes directories (trailing
+`/`) and symlinks. This is the same manifest consumed by
+`x gen restore --pkg`.
 
 ```bash
 xpm files <PACKAGE>
@@ -215,6 +270,14 @@ xpm Ql <PACKAGE>                 # pacman-style alias
 ```bash
 xpm files bash                    # List files in bash package
 xpm Ql linux                      # pacman-style
+```
+
+**Output:**
+
+```
+usr/
+usr/bin/
+usr/bin/bash
 ```
 
 ---
@@ -321,6 +384,7 @@ xpm usage repos                   # Repository help
 |----------|-------------|
 | `XPM_CONFIG` | Override default configuration file path |
 | `XPM_CACHE_DIR` | Override default cache directory |
+| `XPM_HOOKS_DIR` | Override the transaction-hook root (default `/usr/lib/xpm/hooks`) |
 | `NO_COLOR` | Disable colored output (standard) |
 | `RUST_LOG` | Set logging verbosity (e.g., `debug`, `trace`) |
 

@@ -85,6 +85,9 @@ pub enum Command {
     /// Manage repositories — add, remove, or list.
     Repo(RepoArgs),
 
+    /// Show the transaction journal (history and rollback material).
+    History(HistoryArgs),
+
     /// Display detailed usage information and guides.
     Usage(HelpArgs),
 }
@@ -153,6 +156,10 @@ pub struct UpgradeArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct QueryArgs {
+    /// Output format: plain (default) or tsv for machine consumption.
+    #[arg(long, value_parser = ["plain", "tsv"], default_value = "plain")]
+    pub format: String,
+
     /// List only explicitly installed packages.
     #[arg(long, short = 'e')]
     pub explicit: bool,
@@ -236,6 +243,13 @@ pub struct RepoRemoveArgs {
     /// Name of the repository to remove.
     #[arg(required = true)]
     pub name: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct HistoryArgs {
+    /// Emit one JSON object per transaction (machine consumption).
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, clap::Args)]

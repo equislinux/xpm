@@ -44,18 +44,16 @@ propio roadmap del repo y del `main.rs` actual):
    pero `install` selecciona paquetes por nombre desde la base de datos sincronizada y `upgrade`
    usa comparación de versiones simple. Un camino de install/upgrade que resuelva de verdad el
    cierre de dependencias necesita llamar al solver.
-2. **Terminar los comandos stub.** `query`, `search`, `info` y `files` hoy solo parsean sus
-   argumentos.
-3. **Completar el endurecimiento de transacciones.** El roadmap del repo lista pendientes:
+2. **Completar el endurecimiento de transacciones.** El roadmap del repo lista pendientes:
    gestión de archivos de configuración `.pacnew`/`.pacsave`, ejecución de alpm-hooks más allá de
    los scriptlets de `.INSTALL`, test end-to-end de upgrade, y tests de resolución de conflictos
    y rollback.
-4. **Cerrar los hitos de preparación para producción** (Fase 8 y Fase 9 del ROADMAP del repo):
+3. **Cerrar los hitos de preparación para producción** (Fase 8 y Fase 9 del ROADMAP del repo):
    benchmarks frente a pacman, stress testing contra un repositorio completo, fuzzing, auditoría
    de manejo de errores (descargas parciales, paquetes corruptos, disco lleno) y objetivos
    post-v1.0 (bindings de Python, i18n, TUI, selección inteligente de mirrors, caché
    configurable).
-5. **Reconciliar inconsistencias de configuración** como el default del keyring GPG
+4. **Reconciliar inconsistencias de configuración** como el default del keyring GPG
    (`config.rs` usa `/etc/pacman.d/gnupg/` mientras que la guía del README usa
    `/etc/xpm/gnupg/`).
 
@@ -91,8 +89,8 @@ superficies de compatibilidad y documentarse con cuidado cuando cambien:
   `/repo/x86_64`), firmas como `.sig` separadas, keyring como `trustedkeys.gpg`.
 - **Configuración**: `/etc/xpm.conf` (TOML), repos de usuario en `/etc/xpm.d/`, variables de URL
   `$repo`/`$arch`, semántica de `sig_level`.
-- **Layout de la base de datos local**: `/var/lib/xpm/local/<pkg>/` con entradas `version` y
-  `files`, DBs de sync bajo `/var/lib/xpm/sync/`.
+- **Layout de la base de datos local**: `/var/lib/xpm/local/<pkg>/` con entradas `version`, `reason`, `origin`,
+  `files`, `depends` y `provides`, DBs de sync bajo `/var/lib/xpm/sync/`.
 - **Contrato de scriptlets**: funciones bash ejecutadas desde `.INSTALL` con las variables de
   entorno `XPM_ROOT_DIR`, `XPM_PKG_NAME` y `XPM_PKG_VERSION`.
 
