@@ -58,17 +58,16 @@ xpm S <PACKAGES>... [OPTIONS]
 | `--as-explicit` | | Marca el paquete como instalado explícitamente |
 | `--no-optional` | | Omite las dependencias opcionales |
 
-Comportamiento (de `main.rs`): el paquete se localiza por nombre exacto recorriendo los
-repositorios configurados en orden (gana el primero que lo ofrezca), se descarga al directorio
-de caché, se comprueba contra un `.sig` remoto según el `sig_level` efectivo y contra el
-`sha256sum` cuando la entrada de la base de datos lo incluye. La descarga se convierte entonces
-en una operación de instalación sobre un `Transaction`. Con `--download-only` la ejecución se
-detiene tras descargar. En caso contrario xpm pide confirmación (salvo `--no-confirm`) y luego
-prepara y commitea la transacción, que extrae los archivos y registra el paquete en la base de
-datos local.
-
-Nota: pese al mensaje "Resolving dependencies...", el camino de instalación actual del CLI no
-ejecuta el solver SAT; selecciona el paquete por nombre desde la base de datos sincronizada.
+Comportamiento (de `main.rs`): se cargan todas las bases sincronizadas configuradas y los
+requisitos pedidos (`nombre` o `nombre=versión`) se resuelven con el solver SAT, que elige
+candidatos, respeta `depends`/`conflicts` y los `provides` sin versión, y devuelve el cierre en
+orden de dependencias. Cada paquete se descarga al directorio de caché, se comprueba contra un
+`.sig` remoto según el `sig_level` efectivo y contra el `sha256sum` cuando la entrada lo incluye,
+y luego se commitea como operaciones de instalación sobre un `Transaction` (los pedidos quedan
+explícitos; las dependencias arrastradas, como deps; `--as-deps`/`--as-explicit` lo sobrescriben).
+Con `--download-only` la ejecución se detiene tras descargar. En caso contrario xpm pide
+confirmación (salvo `--no-confirm`) y la transacción extrae los archivos y registra cada paquete
+en la base de datos local.
 
 ### `remove` — Eliminar paquetes
 
@@ -103,10 +102,11 @@ xpm Su [OPTIONS]
 | `--force` | | Fuerza la reinstalación de paquetes ya al día |
 | `--ignore` | | Omite paquetes concretos (repetible, `--ignore <PKG>`) |
 
-`upgrade` refresca siempre primero las bases de datos (equivalente a `pacman -Syu`), compara las
-versiones instaladas con las entradas remotas más recientes usando la comparación de versiones
-compatible con ALPM, y planifica operaciones remove+install por paquete cambiado. Sin paquetes
-instalados informa de que no hay nada que hacer.
+`upgrade` refresca siempre primero las bases de datos (equivalente a `pacman -Syu`) y luego
+resuelve el cierre transitivo de los paquetes con versión más nueva, de modo que las dependencias
+nuevas o que ahora se requieren se instalan en la misma pasada. Los paquetes actualizados
+conservan su razón de instalación; las dependencias arrastradas se registran como deps. Sin
+paquetes instalados informa de que no hay nada que hacer.
 
 ### `query` — Consultar la base de datos local
 

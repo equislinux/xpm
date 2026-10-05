@@ -47,7 +47,9 @@ xpm Sy -f                 # Same as above, pacman-style
 
 ### `install` — Install Packages
 
-Install one or more packages from sync databases.
+Install one or more packages from sync databases. Dependencies are resolved with the SAT
+solver. Arguments that point to an existing `.xp` file are installed straight from disk
+(`origin=local`) and may be mixed with repository package names (`name` or `name=version`).
 
 ```bash
 xpm install <PACKAGES>... [OPTIONS]

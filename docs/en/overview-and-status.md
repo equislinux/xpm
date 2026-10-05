@@ -55,7 +55,7 @@ crates plus integration tests under `tests/`). Within the reboot initiative, how
   installed systems goes through pacman, not through xpm.
 - `xpm` is therefore **not yet the active path** in the reboot flow. It is a functioning
   tooling codebase with its own internal roadmap, waiting to be revisited when the native `.xp`
-  repository or the SAT resolver is actually required.
+  repository is actually required (the SAT resolver is already wired into `install`).
 
 The repository still publishes its own binaries as `.xp` packages in the xpm-native tree (see the
 README for the key bootstrap and signature checklist), which is separate from the pacman path
@@ -96,10 +96,11 @@ The workspace `Cargo.toml` currently reports version `0.1.0`.
 Not every subcommand is fully wired to engine logic yet. From `crates/xpm/src/main.rs`:
 
 - `sync`, `install`, `remove`, `upgrade`, and `repo` dispatch to real transaction/download logic.
+- `install` runs the SAT resolver over the sync databases: dependency closure, dependency order,
+  `name=version` requirements and unversioned `provides`.
 - `query` (including `--orphans`), `search`, `info`, and `files` read the local and sync
-  databases; the remaining gap before the native path is wiring the resolver into
-  install/upgrade.
+  databases; the remaining gaps before the native path are `rollback --last`,
+  `diff <generation>` and `.pacnew`/`.pacsave` handling.
 
 See [Usage](usage.md) for the full reference and [Architecture](architecture.md) for the
-implementation details, including the note that the CLI install path currently selects packages
-by name from the synced database rather than through the SAT solver.
+implementation details.

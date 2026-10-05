@@ -131,14 +131,13 @@ rollback.
 
 | Item | Where it stands |
 |------|-----------------|
-| Resolver wired into the CLI | Pending (`future-integration.md` item 1); needed before upgrade journaling is meaningful |
+| Resolver wired into the CLI | Done for `install` (repo names + local `.xp`) and `upgrade` (dependency closure); `rollback`/`diff` still pending |
 | Stub commands (`query`, `files`, ...) | `query` (including `--orphans`), `files`, `info` and `search` implemented |
 | Transaction hardening (`.pacnew`, hooks, rollback tests) | Open items in `ROADMAP.md` Phase 7/8 |
 | Config keyring path inconsistency | Pending reconciliation |
 
-The **journal + hooks** slice can be implemented before the resolver: the
-install path already selects packages by name, and the journal only records
-what was done.
+The **journal + hooks** slice lands on top of the resolver: `install` resolves
+the closure before journaling, and the journal records what was done.
 
 ## Non-goals
 

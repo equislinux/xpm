@@ -170,6 +170,22 @@ impl PackagePool {
         self.name_to_solvables.get(&name_id).map(|v| v.as_slice())
     }
 
+    /// Register a candidate under the names of the virtual packages it
+    /// provides, so dependencies on those names can be satisfied.
+    ///
+    /// Version constraints on versioned provides are matched against the
+    /// provider's own version (documented simplification until provides
+    /// carry their own version sets).
+    pub fn add_provides(&mut self, solvable: SolvableId, provides: &[DepConstraint]) {
+        for provide in provides {
+            let name_id = self.intern_name(&provide.name);
+            let entry = self.name_to_solvables.entry(name_id).or_default();
+            if !entry.contains(&solvable) {
+                entry.push(solvable);
+            }
+        }
+    }
+
     // ── Version set management ───────────────────────────────────────
 
     /// Intern a version set (name + constraint pair).
