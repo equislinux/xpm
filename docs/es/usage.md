@@ -58,17 +58,16 @@ xpm S <PACKAGES>... [OPTIONS]
 | `--as-explicit` | | Marca el paquete como instalado explícitamente |
 | `--no-optional` | | Omite las dependencias opcionales |
 
-Comportamiento (de `main.rs`): el paquete se localiza por nombre exacto recorriendo los
-repositorios configurados en orden (gana el primero que lo ofrezca), se descarga al directorio
-de caché, se comprueba contra un `.sig` remoto según el `sig_level` efectivo y contra el
-`sha256sum` cuando la entrada de la base de datos lo incluye. La descarga se convierte entonces
-en una operación de instalación sobre un `Transaction`. Con `--download-only` la ejecución se
-detiene tras descargar. En caso contrario xpm pide confirmación (salvo `--no-confirm`) y luego
-prepara y commitea la transacción, que extrae los archivos y registra el paquete en la base de
-datos local.
-
-Nota: pese al mensaje "Resolving dependencies...", el camino de instalación actual del CLI no
-ejecuta el solver SAT; selecciona el paquete por nombre desde la base de datos sincronizada.
+Comportamiento (de `main.rs`): se cargan todas las bases sincronizadas configuradas y los
+requisitos pedidos (`nombre` o `nombre=versión`) se resuelven con el solver SAT, que elige
+candidatos, respeta `depends`/`conflicts` y los `provides` sin versión, y devuelve el cierre en
+orden de dependencias. Cada paquete se descarga al directorio de caché, se comprueba contra un
+`.sig` remoto según el `sig_level` efectivo y contra el `sha256sum` cuando la entrada lo incluye,
+y luego se commitea como operaciones de instalación sobre un `Transaction` (los pedidos quedan
+explícitos; las dependencias arrastradas, como deps; `--as-deps`/`--as-explicit` lo sobrescriben).
+Con `--download-only` la ejecución se detiene tras descargar. En caso contrario xpm pide
+confirmación (salvo `--no-confirm`) y la transacción extrae los archivos y registra cada paquete
+en la base de datos local.
 
 ### `remove` — Eliminar paquetes
 

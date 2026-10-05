@@ -58,16 +58,15 @@ xpm S <PACKAGES>... [OPTIONS]
 | `--as-explicit` | | Mark the package as explicitly installed |
 | `--no-optional` | | Skip optional dependencies |
 
-Behavior (from `main.rs`): the package is located by exact name across the configured
-repositories in order (first repository that provides it wins), downloaded to the cache
-directory, checked against a remote `.sig` file according to the effective `sig_level`, and
-checked against `sha256sum` when the database entry carries one. The download then becomes an
-install operation on a `Transaction`. With `--download-only` the run stops after downloading.
-Otherwise xpm asks for confirmation (unless `--no-confirm`) and then prepares and commits the
-transaction, which extracts the files and registers the package in the local database.
-
-Note: despite the "Resolving dependencies..." message, the current CLI install path does not run
-the SAT resolver; it selects the package by name from the synced database.
+Behavior (from `main.rs`): every configured sync database is loaded and the requested
+requirements (`name` or `name=version`) are solved with the SAT resolver, which picks candidates,
+honors `depends`/`conflicts` and unversioned `provides`, and returns the closure in dependency
+order. Each package is downloaded to the cache directory, checked against a remote `.sig` per the
+effective `sig_level` and against `sha256sum` when the database entry carries one, then committed
+as install operations on a `Transaction` (requested packages explicit, pulled dependencies as
+deps; `--as-deps`/`--as-explicit` override). With `--download-only` the run stops after
+downloading. Otherwise xpm asks for confirmation (unless `--no-confirm`) and the transaction
+extracts the files and registers each package in the local database.
 
 ### `remove` — Remove packages
 

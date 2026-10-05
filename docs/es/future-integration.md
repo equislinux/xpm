@@ -27,8 +27,9 @@ workspace:
 
 - La distro necesita el **repositorio `.xp` nativo** como canal de distribución (dejar de
   consumir el layout pacman para los paquetes x).
-- El **resolver SAT** es necesario para calcular el cierre de dependencias en install/upgrade en
-  lugar de depender del solver de pacman o de la selección por nombre.
+- Al **camino de instalación nativo** le quedan piezas (instalación local de `.xp`, cierres de
+  `upgrade`, rollback) para sustituir al solver de pacman y a la selección por nombre; el
+  resolver SAT ya está conectado a `install`.
 - El empaquetado reproducible y con lint (xpkg) con firmas OpenPGP se convierte en un requisito
   duro del pipeline de payload.
 
@@ -40,10 +41,9 @@ no debe añadir suposiciones sobre xpm instalado.
 Huecos a nivel de código que deben resolverse cuando la herramienta se reactive (honesto, del
 propio roadmap del repo y del `main.rs` actual):
 
-1. **Conectar el resolver al CLI.** El resolver SAT existe y está testeado a nivel de librería,
-   pero `install` selecciona paquetes por nombre desde la base de datos sincronizada y `upgrade`
-   usa comparación de versiones simple. Un camino de install/upgrade que resuelva de verdad el
-   cierre de dependencias necesita llamar al solver.
+1. **Resolver los cierres de upgrade.** `install` ya usa el resolver SAT sobre las bases
+   sincronizadas (orden de dependencias, `name=version`, `provides` sin versión). `upgrade`
+   sigue comparando versiones por paquete y no calcula cierre todavía.
 2. **Completar el endurecimiento de transacciones.** El roadmap del repo lista pendientes:
    gestión de archivos de configuración `.pacnew`/`.pacsave`, ejecución de alpm-hooks más allá de
    los scriptlets de `.INSTALL`, test end-to-end de upgrade, y tests de resolución de conflictos

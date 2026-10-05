@@ -4,15 +4,19 @@
 
 ## Current Status
 
-Phases 0–1 mostly complete — project scaffolding, CLI with 8 subcommands,
-and TOML configuration parser are implemented and tested.
-Phase 3 complete — native SAT-based dependency resolver using resolvo,
-with ALPM-compatible version comparison, dependency parsing, conflict
-handling, and a full integration test suite.
-Phase 4 complete — package format support with .xp/.pkg.tar.zst readers,
-metadata parsers (.PKGINFO, .BUILDINFO, .MTREE), archive extraction,
-and post-installation integrity validation (94 tests).
-Next step: Phase 5 (repository database).
+The install path is complete end to end: every sync database is loaded, the
+requested requirements (`name` or `name=version`) are solved with the SAT
+resolver (dependency closure, dependency order, conflicts and unversioned
+`provides`), packages are downloaded and signature/checksum-verified, then
+committed as transactions that record `reason`, `origin`, `files`, `depends`
+and `provides` in the local database. `query` (including `--orphans`),
+`search`, `info`, `files`, `remove`, `upgrade`, `repo`, `history` and `usage`
+are wired to real engine logic. Test suite: ~171 unit tests plus the
+repository-database integration tests and the xpkg↔xpm lifecycle E2E.
+
+Still missing before the native path replaces pacman: local `.xp` file
+install, dependency-aware `upgrade` closures, `rollback --last`,
+`diff <generation>`, `.pacnew`/`.pacsave` handling and benchmark coverage.
 
 ---
 

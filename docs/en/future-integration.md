@@ -25,8 +25,9 @@ Reasons that would pull xpm (and its companion xpkg) back into scope, per the wo
 
 - The distro needs the **native `.xp` repository** as the distribution channel (moving away from
   consuming the pacman layout for x packages).
-- The **SAT resolver** is required to compute dependency closures at install/upgrade time
-  instead of relying on pacman's solver or on name-based selection.
+- The **native install path** needs its remaining pieces (local `.xp` install, `upgrade`
+  closures, rollback) to replace pacman's solver and name-based flows; the SAT resolver is
+  already wired into `install`.
 - Reproducible, linted packaging (xpkg) with OpenPGP signatures becomes a hard requirement of
   the payload pipeline.
 
@@ -38,10 +39,9 @@ should not add assumptions about xpm being installed.
 Code-level gaps that must be addressed when the tool is re-activated (honest, from the repo's
 own roadmap and current `main.rs`):
 
-1. **Wire the resolver into the CLI.** The SAT resolver exists and is tested at the library
-   level, but `install` selects packages by name from the synced database and `upgrade` uses
-   plain version comparison. An install/upgrade path that truly resolves dependency closures
-   needs to call the solver.
+1. **Resolve upgrade closures.** `install` runs the SAT resolver over the sync databases
+   (dependency order, `name=version`, unversioned `provides`). `upgrade` still compares
+   versions per package and does not compute a closure yet.
 2. **Complete transaction hardening.** The repo roadmap lists open items: `.pacnew`/`.pacsave`
    configuration-file management, alpm-hooks execution beyond `.INSTALL` scriptlets, upgrade
    end-to-end test, conflict resolution and rollback tests.
