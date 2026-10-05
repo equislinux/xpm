@@ -1272,7 +1272,7 @@ USAGE:
 
 DESCRIPTION:
     Install one or more packages from the synchronized databases.
-    Dependencies are resolved automatically.
+    Dependencies are not resolved automatically yet; install them explicitly.
 
 ARGUMENTS:
     <PACKAGES>      One or more package names to install
