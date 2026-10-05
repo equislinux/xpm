@@ -102,10 +102,11 @@ xpm Su [OPTIONS]
 | `--force` | | Fuerza la reinstalación de paquetes ya al día |
 | `--ignore` | | Omite paquetes concretos (repetible, `--ignore <PKG>`) |
 
-`upgrade` refresca siempre primero las bases de datos (equivalente a `pacman -Syu`), compara las
-versiones instaladas con las entradas remotas más recientes usando la comparación de versiones
-compatible con ALPM, y planifica operaciones remove+install por paquete cambiado. Sin paquetes
-instalados informa de que no hay nada que hacer.
+`upgrade` refresca siempre primero las bases de datos (equivalente a `pacman -Syu`) y luego
+resuelve el cierre transitivo de los paquetes con versión más nueva, de modo que las dependencias
+nuevas o que ahora se requieren se instalan en la misma pasada. Los paquetes actualizados
+conservan su razón de instalación; las dependencias arrastradas se registran como deps. Sin
+paquetes instalados informa de que no hay nada que hacer.
 
 ### `query` — Consultar la base de datos local
 

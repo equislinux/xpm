@@ -14,8 +14,7 @@ and `provides` in the local database. `query` (including `--orphans`),
 are wired to real engine logic. Test suite: ~171 unit tests plus the
 repository-database integration tests and the xpkg↔xpm lifecycle E2E.
 
-Still missing before the native path replaces pacman: local `.xp` file
-install, dependency-aware `upgrade` closures, `rollback --last`,
+Still missing before the native path replaces pacman: `rollback --last`,
 `diff <generation>`, `.pacnew`/`.pacsave` handling and benchmark coverage.
 
 ---

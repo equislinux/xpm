@@ -27,9 +27,9 @@ workspace:
 
 - La distro necesita el **repositorio `.xp` nativo** como canal de distribución (dejar de
   consumir el layout pacman para los paquetes x).
-- Al **camino de instalación nativo** le quedan piezas (instalación local de `.xp`, cierres de
-  `upgrade`, rollback) para sustituir al solver de pacman y a la selección por nombre; el
-  resolver SAT ya está conectado a `install`.
+- El **camino de instalación nativo** ya es funcional (`install` con resolver para nombres de
+  repo y archivos `.xp` locales, `upgrade` con cierre de dependencias, base `.files`); quedan
+  rollback/diff y el despliegue del repositorio `.xp` nativo.
 - El empaquetado reproducible y con lint (xpkg) con firmas OpenPGP se convierte en un requisito
   duro del pipeline de payload.
 
@@ -41,9 +41,9 @@ no debe añadir suposiciones sobre xpm instalado.
 Huecos a nivel de código que deben resolverse cuando la herramienta se reactive (honesto, del
 propio roadmap del repo y del `main.rs` actual):
 
-1. **Resolver los cierres de upgrade.** `install` ya usa el resolver SAT sobre las bases
-   sincronizadas (orden de dependencias, `name=version`, `provides` sin versión). `upgrade`
-   sigue comparando versiones por paquete y no calcula cierre todavía.
+1. **Implementar rollback y diffs de generaciones.** `install` (repo o `.xp` local) y `upgrade`
+   con cierre de dependencias ya usan el resolver; quedan `rollback --last`, `diff <generation>`
+   y enlazar las entradas del journal con ids de generación.
 2. **Completar el endurecimiento de transacciones.** El roadmap del repo lista pendientes:
    gestión de archivos de configuración `.pacnew`/`.pacsave`, ejecución de alpm-hooks más allá de
    los scriptlets de `.INSTALL`, test end-to-end de upgrade, y tests de resolución de conflictos

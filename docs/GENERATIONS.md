@@ -131,7 +131,7 @@ rollback.
 
 | Item | Where it stands |
 |------|-----------------|
-| Resolver wired into the CLI | Done for `install` (`resolver::resolve_closure`): dependency closure and order, `name=version`, unversioned `provides`; `upgrade` still compares versions |
+| Resolver wired into the CLI | Done for `install` (repo names + local `.xp`) and `upgrade` (dependency closure); `rollback`/`diff` still pending |
 | Stub commands (`query`, `files`, ...) | `query` (including `--orphans`), `files`, `info` and `search` implemented |
 | Transaction hardening (`.pacnew`, hooks, rollback tests) | Open items in `ROADMAP.md` Phase 7/8 |
 | Config keyring path inconsistency | Pending reconciliation |

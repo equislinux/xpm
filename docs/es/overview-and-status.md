@@ -102,8 +102,8 @@ No todos los subcomandos están conectados del todo con la lógica del motor. De
 - `install` ejecuta el resolver SAT sobre las bases sincronizadas: cierre de dependencias, orden
   de dependencias, requisitos `nombre=versión` y `provides` sin versión.
 - `query` (incluido `--orphans`), `search`, `info` y `files` leen las bases local y sync; los
-  huecos restantes antes del camino nativo son la instalación local de `.xp`, los cierres de
-  `upgrade` y rollback.
+  huecos restantes antes del camino nativo son `rollback --last`, `diff <generation>` y la
+  gestión de `.pacnew`/`.pacsave`.
 
 Ver [Uso](usage.md) para la referencia completa y [Arquitectura](architecture.md) para los
 detalles de implementación.

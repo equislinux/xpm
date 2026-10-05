@@ -100,10 +100,10 @@ xpm Su [OPTIONS]
 | `--force` | | Force reinstallation of up-to-date packages |
 | `--ignore` | | Skip specific packages (repeatable, `--ignore <PKG>`) |
 
-`upgrade` always refreshes the databases first (equivalent to `pacman -Syu`), compares installed
-versions against the remote latest entries using the ALPM-compatible version comparison, and
-plans remove+install operations per package that changed. With no packages installed it reports
-"Nothing to do".
+`upgrade` always refreshes the databases first (equivalent to `pacman -Syu`), then resolves the
+transitive closure of the packages with newer versions so new or newly-required dependencies are
+installed in the same run. Upgraded packages keep their install reason; pulled dependencies are
+recorded as deps. With no packages installed it reports "Nothing to do".
 
 ### `query` — Query the local database
 

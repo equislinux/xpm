@@ -99,8 +99,8 @@ Not every subcommand is fully wired to engine logic yet. From `crates/xpm/src/ma
 - `install` runs the SAT resolver over the sync databases: dependency closure, dependency order,
   `name=version` requirements and unversioned `provides`.
 - `query` (including `--orphans`), `search`, `info`, and `files` read the local and sync
-  databases; the remaining gaps before the native path are local `.xp` install, `upgrade`
-  closures and rollback.
+  databases; the remaining gaps before the native path are `rollback --last`,
+  `diff <generation>` and `.pacnew`/`.pacsave` handling.
 
 See [Usage](usage.md) for the full reference and [Architecture](architecture.md) for the
 implementation details.
