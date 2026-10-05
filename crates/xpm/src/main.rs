@@ -23,15 +23,15 @@ use xpm_core::local_db;
 use xpm_core::orphans::{find_orphans, InstalledPackage};
 use xpm_core::package::read_metadata;
 use xpm_core::repo::RepoManager;
-use xpm_core::repo_db::{merge_files_db, parse_sync_db};
+use xpm_core::repo_db::{merge_files_db, parse_sync_db, RepoEntry};
 use xpm_core::repo_sync::{
     download_first_available, package_download_candidates, sync_repo_databases,
     verify_remote_signature, verify_sha256,
 };
-use xpm_core::resolver::Version;
+use xpm_core::resolver::{resolve_closure, DepConstraint, PackageCandidate, Requirement, Version};
 use xpm_core::txhooks::run_transaction_hooks;
 use xpm_core::{HookChain, Transaction};
-use xpm_core::{XpmConfig, XpmError};
+use xpm_core::{XpmConfig, XpmError, XpmResult};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -283,15 +283,43 @@ fn confirm_action(prompt: &str, no_confirm: bool) -> Result<()> {
     }
 }
 
+/// Build a resolver candidate from a sync database entry.
+fn resolver_candidate(entry: &RepoEntry) -> PackageCandidate {
+    PackageCandidate {
+        name: entry.name.clone(),
+        version: Version::parse(&entry.version),
+        depends: entry
+            .depends
+            .iter()
+            .map(|d| DepConstraint::parse(d))
+            .collect(),
+        conflicts: entry
+            .conflicts
+            .iter()
+            .map(|c| DepConstraint::parse(c))
+            .collect(),
+        provides: entry
+            .provides
+            .iter()
+            .map(|p| DepConstraint::parse(p))
+            .collect(),
+        optdepends: entry.opt_depends.clone(),
+    }
+}
+
+/// Local-database metadata recorded for every package installed in a run.
+struct InstalledRecord {
+    name: String,
+    repo: String,
+    depends: Vec<String>,
+    provides: Vec<String>,
+    reason: InstallReason,
+}
+
 fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) -> Result<()> {
     if args.as_deps && args.as_explicit {
         anyhow::bail!("xpm install: --as-deps and --as-explicit are mutually exclusive");
     }
-    let reason = if args.as_deps {
-        InstallReason::Dep
-    } else {
-        InstallReason::Explicit
-    };
 
     println!(
         ":: Resolving dependencies for: {}",
@@ -309,6 +337,60 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("failed to create cache dir {}", cache_dir.display()))?;
 
+    // ── Load every sync database and resolve the dependency closure ──
+    let mut candidates = Vec::new();
+    let mut sync_entries: Vec<(Repository, RepoEntry)> = Vec::new();
+    for repo in &config.repositories {
+        let db_path = sync_dir.join(format!("{}.db", repo.name));
+        if !db_path.exists() {
+            continue;
+        }
+        let db = parse_sync_db(&db_path, &repo.name)
+            .with_context(|| format!("failed to parse sync db {}", display_rel_or_abs(&db_path)))?;
+        for entry in db.entries {
+            candidates.push(resolver_candidate(&entry));
+            sync_entries.push((repo.clone(), entry));
+        }
+    }
+
+    let requirements = args
+        .packages
+        .iter()
+        .map(|spec| Requirement::parse(spec))
+        .collect::<XpmResult<Vec<_>>>()?;
+    let plan = resolve_closure(candidates, &requirements).with_context(|| {
+        format!(
+            "failed to resolve dependencies for: {}",
+            args.packages.join(", ")
+        )
+    })?;
+
+    // Map solved candidates back to their repository entry (exact version).
+    let mut resolved = Vec::new();
+    for (candidate, explicit) in plan {
+        let selected = sync_entries
+            .iter()
+            .find(|(_, entry)| {
+                entry.name == candidate.name && Version::parse(&entry.version) == candidate.version
+            })
+            .cloned();
+        let Some((repo, entry)) = selected else {
+            return Err(XpmError::PackageNotFound {
+                name: candidate.name.clone(),
+            }
+            .into());
+        };
+        resolved.push((repo, entry, explicit));
+    }
+
+    let explicit_count = resolved.iter().filter(|(_, _, explicit)| *explicit).count();
+    println!(
+        ":: Resolved {} package(s): {} explicit, {} as dependencies",
+        resolved.len(),
+        explicit_count,
+        resolved.len() - explicit_count
+    );
+
     // Create transaction
     let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
         .context("failed to create transaction")?;
@@ -319,36 +401,11 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
     let mut journal_pkgs = Vec::new();
-    // (package name, origin repository, depends, provides) for local-db
-    // metadata after commit.
-    let mut installed: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new();
+    let mut installed: Vec<InstalledRecord> = Vec::new();
 
-    // Phase 1: Download and validate packages
-    for pkg_name in &args.packages {
-        let mut resolved = None;
-
-        for repo in &config.repositories {
-            let db_path = sync_dir.join(format!("{}.db", repo.name));
-            if !db_path.exists() {
-                continue;
-            }
-
-            let db = parse_sync_db(&db_path, &repo.name).with_context(|| {
-                format!("failed to parse sync db {}", display_rel_or_abs(&db_path))
-            })?;
-
-            if let Some(entry) = db.entries.into_iter().find(|e| e.name == *pkg_name) {
-                resolved = Some((repo.clone(), entry));
-                break;
-            }
-        }
-
-        let Some((repo, entry)) = resolved else {
-            return Err(XpmError::PackageNotFound {
-                name: pkg_name.clone(),
-            }
-            .into());
-        };
+    // Phase 1: Download and validate the resolved plan (dependencies first)
+    for (repo, entry, explicit) in &resolved {
+        let pkg_name = &entry.name;
 
         let filename = entry.filename.clone().ok_or_else(|| {
             XpmError::Database(format!(
@@ -357,7 +414,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             ))
         })?;
         let dest = cache_dir.join(&filename);
-        let urls = package_download_candidates(&repo, &arch, &entry);
+        let urls = package_download_candidates(repo, &arch, entry);
         let mirror = download_first_available(&urls, &dest, 3).with_context(|| {
             format!(
                 "failed to download '{}' from repo '{}'",
@@ -384,16 +441,25 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         let metadata = read_metadata(&dest)
             .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
 
+        let pkg_reason = if args.as_deps {
+            InstallReason::Dep
+        } else if args.as_explicit || *explicit {
+            InstallReason::Explicit
+        } else {
+            InstallReason::Dep
+        };
+
         println!("   downloaded: {}", dest.display());
         println!("   source: {}", mirror);
 
         journal_pkgs.push(JournalPackage::install(&entry.name, &entry.version));
-        installed.push((
-            entry.name.clone(),
-            repo.name.clone(),
-            metadata.meta.depends.clone(),
-            metadata.meta.provides.clone(),
-        ));
+        installed.push(InstalledRecord {
+            name: entry.name.clone(),
+            repo: repo.name.clone(),
+            depends: metadata.meta.depends.clone(),
+            provides: metadata.meta.provides.clone(),
+            reason: pkg_reason,
+        });
 
         // Add to transaction
         tx.add_install(entry.name.clone(), entry.version.clone(), dest)
@@ -413,22 +479,20 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     // Phase 2/3: prepare, commit, hooks and journal.
     commit_transaction(config, "install", journal_pkgs, &mut tx)?;
 
-    for (pkg_name, repo_name, depends, provides) in &installed {
-        reason
-            .write(&local_db_dir, pkg_name)
-            .with_context(|| format!("failed to record install reason for '{pkg_name}'"))?;
-        local_db::write_origin(&local_db_dir, pkg_name, repo_name)
-            .with_context(|| format!("failed to record origin for '{pkg_name}'"))?;
-        local_db::write_depends(&local_db_dir, pkg_name, depends)
-            .with_context(|| format!("failed to record dependencies for '{pkg_name}'"))?;
-        local_db::write_provides(&local_db_dir, pkg_name, provides)
-            .with_context(|| format!("failed to record provides for '{pkg_name}'"))?;
+    for record in &installed {
+        record
+            .reason
+            .write(&local_db_dir, &record.name)
+            .with_context(|| format!("failed to record install reason for '{}'", record.name))?;
+        local_db::write_origin(&local_db_dir, &record.name, &record.repo)
+            .with_context(|| format!("failed to record origin for '{}'", record.name))?;
+        local_db::write_depends(&local_db_dir, &record.name, &record.depends)
+            .with_context(|| format!("failed to record dependencies for '{}'", record.name))?;
+        local_db::write_provides(&local_db_dir, &record.name, &record.provides)
+            .with_context(|| format!("failed to record provides for '{}'", record.name))?;
     }
 
-    println!(
-        ":: {} package(s) installed successfully.",
-        args.packages.len()
-    );
+    println!(":: {} package(s) installed successfully.", installed.len());
     if config.options.root_dir != Path::new("/") {
         println!(":: Shell integration enabled via ~/.local/bin shims.");
         println!(":: If this shell does not find new commands yet, run: hash -r");
