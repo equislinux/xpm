@@ -317,7 +317,7 @@ xpm repo add <NAME> <URL>
 
 ```bash
 xpm repo add chaotic-aur https://cdn-mirror.chaotic.cx/$repo/$arch
-xpm repo add x-repo https://xlnux.github.io/x-repo/$arch
+xpm repo add x-repo https://equislinux.github.io/x-repo/$arch
 ```
 
 #### `repo remove`

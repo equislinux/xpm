@@ -79,7 +79,7 @@ compatibility surfaces and documented carefully when they change:
   `.BUILDINFO`, `.MTREE`, optional `.INSTALL`). Format version is implicit in the `.PKGINFO`
   structure; both tools should move in lockstep.
 - **Repository layout**: sync endpoint `<server>/<repo>.db` (+ `.files`), xpm-native tree at
-  `https://xlnux.github.io/x-repo/x/$arch` (do not confuse with the pacman endpoint under
+  `https://equislinux.github.io/x-repo/x/$arch` (do not confuse with the pacman endpoint under
   `/repo/x86_64`), signatures as detached `.sig`, keyring as `trustedkeys.gpg`.
 - **Configuration**: `/etc/xpm.conf` (TOML), user repos under `/etc/xpm.d/`, `$repo`/`$arch`
   URL variables, `sig_level` semantics.

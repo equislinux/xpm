@@ -36,7 +36,7 @@ Repository URLs support variable substitution for dynamic path construction.
 https://mirror.rackspace.com/archlinux/$repo/os/$arch
 
 # GitHub Pages hosted repository  
-https://xlnux.github.io/x-repo/$arch
+https://equislinux.github.io/x-repo/$arch
 
 # Local mirror
 file:///srv/repo/$repo/$arch
@@ -66,7 +66,7 @@ These repositories are built into xpm and configured in `/etc/xpm.conf`.
 
 [[repo]]
 name = "x-repo"
-server = ["https://xlnux.github.io/x-repo/$arch"]
+server = ["https://equislinux.github.io/x-repo/$arch"]
 sig_level = "optional"
 
 [[repo]]

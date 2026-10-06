@@ -22,8 +22,8 @@ It is designed as a native Rust replacement for `pacman` and `libalpm`:
 - Repository management with predefined repositories plus user-added repositories under
   `/etc/xpm.d/`.
 
-The project belongs to the `xlnux` organization. Packages are built by the companion builder
-tool `xpkg` (repo `xlnux/xpkg`); `xpm` consumes what `xpkg` produces.
+The project belongs to the `equislinux` organization. Packages are built by the companion builder
+tool `xpkg` (repo `equislinux/xpkg`); `xpm` consumes what `xpkg` produces.
 
 ## Position in the x-lnux workspace
 
@@ -32,11 +32,11 @@ independent GitHub repo with its own origin. The relevant folders are:
 
 | Folder    | Repo             | Role |
 |-----------|------------------|------|
-| `x`       | `xlnux/x`        | The distro (archiso build of image/ISO and provisioning) |
-| `scripts` | `xlnux/scripts`  | System kickstart / provisioning scripts |
-| `xpkg`    | `xlnux/xpkg`     | Rust packaging tool (builder) |
-| `xpm`     | `xlnux/xpm`      | Rust package manager (this repo) |
-| `x-repo`  | `xlnux/x-repo`   | Package repository and portal |
+| `x`       | `equislinux/x`        | The distro (archiso build of image/ISO and provisioning) |
+| `scripts` | `equislinux/scripts`  | System kickstart / provisioning scripts |
+| `xpkg`    | `equislinux/xpkg`     | Rust packaging tool (builder) |
+| `xpm`     | `equislinux/xpm`      | Rust package manager (this repo) |
+| `x-repo`  | `equislinux/x-repo`   | Package repository and portal |
 
 This repo follows the shared conventions of the workspace: work for the reboot initiative lives
 on the `x/reboot` branch of each repo, commits stay local (no push), and messages carry no emojis
@@ -60,7 +60,7 @@ crates plus integration tests under `tests/`). Within the reboot initiative, how
 The repository still publishes its own binaries as `.xp` packages in the xpm-native tree (see the
 README for the key bootstrap and signature checklist), which is separate from the pacman path
 used in production today. The two layouts must not be confused: the xpm-native endpoint is
-`https://xlnux.github.io/x-repo/x/$arch`, not the pacman endpoint under `/repo/x86_64`.
+`https://equislinux.github.io/x-repo/x/$arch`, not the pacman endpoint under `/repo/x86_64`.
 
 ## Internal roadmap and milestones
 

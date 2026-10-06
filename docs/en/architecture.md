@@ -199,14 +199,14 @@ check_space = true
 
 [[repo]]
 name = "x"
-server = ["https://xlnux.github.io/x-repo/x/$arch"]
+server = ["https://equislinux.github.io/x-repo/x/$arch"]
 # sig_level = "required"             # optional per-repo override
 ```
 
 Notes:
 
 - If the file does not exist, xpm falls back to built-in defaults (`XpmConfig::default`), whose
-  single repository is `x` at `https://xlnux.github.io/x-repo/x/$arch`.
+  single repository is `x` at `https://equislinux.github.io/x-repo/x/$arch`.
 - The example file and some README/help snippets differ on the GPG directory default: code uses
   `/etc/pacman.d/gnupg/`, while README guidance uses `/etc/xpm/gnupg/`. This discrepancy is
   worth reconciling before depending on it.
@@ -219,7 +219,7 @@ Notes:
 
 ## Repository hosting
 
-The default repository is hosted on GitHub Pages at `xlnux.github.io/x-repo` and is reachable as
+The default repository is hosted on GitHub Pages at `equislinux.github.io/x-repo` and is reachable as
 a static file tree; xpm therefore supports any HTTP-based static file server (VPS migration is
 transparent). Predefined mirror order in config decides package priority (first repository that
 provides a package wins); within a repository, mirrors are tried in order until one succeeds.

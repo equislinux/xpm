@@ -109,7 +109,7 @@ impl Default for XpmConfig {
             options: GeneralOptions::default(),
             repositories: vec![Repository {
                 name: "x".to_string(),
-                server: vec!["https://xlnux.github.io/x-repo/x/$arch".into()],
+                server: vec!["https://equislinux.github.io/x-repo/x/$arch".into()],
                 sig_level: None,
             }],
         }

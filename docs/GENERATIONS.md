@@ -1,7 +1,7 @@
 # xpm — Generation integration plan
 
 Context: X Linux versions the system with **generations** (immutable btrfs
-snapshot + manifest per change; `xlnux/scripts`, `docs/en/generations.md`).
+snapshot + manifest per change; `equislinux/scripts`, `docs/en/generations.md`).
 `xpm` is today postponed (see `docs/en/future-integration.md`) but is the
 native package manager of the distribution. This document proposes the
 seams so that, when xpm is re-activated, its transactions are

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-XPM_PKG_URL_DEFAULT="https://xlnux.github.io/x-repo/x/x86_64/xpm-0.1.0-3-x86_64.xp"
+XPM_PKG_URL_DEFAULT="https://equislinux.github.io/x-repo/x/x86_64/xpm-0.1.0-3-x86_64.xp"
 XPM_PKG_URL="${XPM_PKG_URL:-$XPM_PKG_URL_DEFAULT}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 BIN_DEST="$INSTALL_PREFIX/bin/xpm"

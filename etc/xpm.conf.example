@@ -65,7 +65,7 @@ check_space = true
 [[repo]]
 name = "x"
 server = [
-    "https://xlnux.github.io/x-repo/x/$arch",
+    "https://equislinux.github.io/x-repo/x/$arch",
 ]
 
 # Optional additional repositories can be appended below.

@@ -5,8 +5,8 @@
 <p align="center">
     <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg">
     <img alt="Rust" src="https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white">
-    <img alt="Version" src="https://img.shields.io/github/v/release/xlnux/xpm?include_prereleases&label=version">
-    <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/xlnux/xpm/ci.yml?branch=main&label=CI&logo=github">
+    <img alt="Version" src="https://img.shields.io/github/v/release/equislinux/xpm?include_prereleases&label=version">
+    <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/equislinux/xpm/ci.yml?branch=main&label=CI&logo=github">
     <img alt="Status" src="https://img.shields.io/badge/Status-Active%20Development-2ea44f">
 </p>
 
@@ -41,7 +41,7 @@
 
 <h2 align="center" id="overview">Overview</h2>
 
-<p><code>xpm</code> is a native Rust replacement for <code>pacman</code> and <code>libalpm</code>, designed for the X distribution. It uses the <code>.xp</code> package format (X Package) natively and maintains compatibility with Arch Linux <code>.pkg.tar.zst</code> packages. Packages are built with <a href="https://github.com/xlnux/xpkg"><code>xpkg</code></a>, the companion builder tool.</p>
+<p><code>xpm</code> is a native Rust replacement for <code>pacman</code> and <code>libalpm</code>, designed for the X distribution. It uses the <code>.xp</code> package format (X Package) natively and maintains compatibility with Arch Linux <code>.pkg.tar.zst</code> packages. Packages are built with <a href="https://github.com/equislinux/xpkg"><code>xpkg</code></a>, the companion builder tool.</p>
 
 <h3 align="center" id="key-features">Key Features</h3>
 
@@ -61,12 +61,12 @@
 
 <p>Install the latest published <code>xpm</code> build directly from the official repository:</p>
 
-<pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/xlnux/xpm/main/install.sh | bash
+<pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/equislinux/xpm/main/install.sh | bash
 </code></pre>
 
 <p>If <code>curl</code> is not available:</p>
 
-<pre><code class="language-bash">wget -qO- https://raw.githubusercontent.com/xlnux/xpm/main/install.sh | bash
+<pre><code class="language-bash">wget -qO- https://raw.githubusercontent.com/equislinux/xpm/main/install.sh | bash
 </code></pre>
 
 <p>Optional environment variables for the installer:</p>
@@ -78,13 +78,13 @@
 
 <p>Example:</p>
 
-<pre><code class="language-bash">INSTALL_PREFIX=/usr XPM_PKG_URL="https://xlnux.github.io/x-repo/x/x86_64/xpm-0.1.0-3-x86_64.xp" \
-curl -fsSL https://raw.githubusercontent.com/xlnux/xpm/main/install.sh | bash
+<pre><code class="language-bash">INSTALL_PREFIX=/usr XPM_PKG_URL="https://equislinux.github.io/x-repo/x/x86_64/xpm-0.1.0-3-x86_64.xp" \
+curl -fsSL https://raw.githubusercontent.com/equislinux/xpm/main/install.sh | bash
 </code></pre>
 
 <h3 align="center" id="build-from-source">Build From Source</h3>
 
-<pre><code class="language-bash">git clone https://github.com/xlnux/xpm.git
+<pre><code class="language-bash">git clone https://github.com/equislinux/xpm.git
 cd xpm
 cargo build --release
 sudo cp target/release/xpm /usr/local/bin/
@@ -225,7 +225,7 @@ parallel_downloads = 5
 [[repo]]
 name = "x"
 server = [
-        "https://xlnux.github.io/x-repo/x/$arch",
+        "https://equislinux.github.io/x-repo/x/$arch",
 ]
 </code></pre>
 
@@ -240,12 +240,12 @@ sudo install -d -m 755 /etc/xpm/gnupg
 
 # Download repository public keyring
 sudo curl -fsSL \
-        https://xlnux.github.io/x-repo/x/x86_64/trustedkeys.gpg \
+        https://equislinux.github.io/x-repo/x/x86_64/trustedkeys.gpg \
         -o /etc/xpm/gnupg/trustedkeys.gpg
 
 # Optional: keep the ASCII-armored public key for auditing
 sudo curl -fsSL \
-        https://xlnux.github.io/x-repo/x/x86_64/signing.pub \
+        https://equislinux.github.io/x-repo/x/x86_64/signing.pub \
         -o /etc/xpm/gnupg/signing.pub
 </code></pre>
 
@@ -260,7 +260,7 @@ sig_level = "required"
 
 <pre><code class="language-toml">[[repo]]
 name = "x"
-server = ["https://xlnux.github.io/x-repo/x/$arch"]
+server = ["https://equislinux.github.io/x-repo/x/$arch"]
 sig_level = "required"
 </code></pre>
 
@@ -272,9 +272,9 @@ sig_level = "required"
 sudo install -d -m 755 /etc/xpm/gnupg
 
 # 2) Import published keyring + public key
-sudo curl -fsSL https://xlnux.github.io/x-repo/x/x86_64/trustedkeys.gpg \
+sudo curl -fsSL https://equislinux.github.io/x-repo/x/x86_64/trustedkeys.gpg \
         -o /etc/xpm/gnupg/trustedkeys.gpg
-sudo curl -fsSL https://xlnux.github.io/x-repo/x/x86_64/signing.pub \
+sudo curl -fsSL https://equislinux.github.io/x-repo/x/x86_64/signing.pub \
         -o /etc/xpm/gnupg/signing.pub
 
 # 3) Confirm /etc/xpm.conf points to x endpoint and required signatures
@@ -289,7 +289,7 @@ parallel_downloads = 5
 
 [[repo]]
 name = "x"
-server = ["https://xlnux.github.io/x-repo/x/$arch"]
+server = ["https://equislinux.github.io/x-repo/x/$arch"]
 sig_level = "required"
 EOF
 
@@ -318,7 +318,7 @@ sudo xpm install xpkg
     </li>
     <li>Package not found:
         <ul>
-            <li>Confirm xpm repository URL is <code>https://xlnux.github.io/x-repo/x/$arch</code> and not the pacman endpoint under <code>/repo/x86_64</code>.</li>
+            <li>Confirm xpm repository URL is <code>https://equislinux.github.io/x-repo/x/$arch</code> and not the pacman endpoint under <code>/repo/x86_64</code>.</li>
         </ul>
     </li>
 </ul>
@@ -404,7 +404,7 @@ sudo xpm install xpkg
 
 <h2 align="center" id="repository-hosting">Repository Hosting</h2>
 
-<p>The default package repository is hosted on <strong>GitHub Pages</strong> at <code>xlnux.github.io/x-repo</code>. This will migrate to the <code>xlnux</code> organization for consistency as the project grows. <code>xpm</code> supports any HTTP-based static file server, making future migration to a VPS transparent.</p>
+<p>The default package repository is hosted on <strong>GitHub Pages</strong> at <code>equislinux.github.io/x-repo</code> (organization <code>equislinux</code>). <code>xpm</code> supports any HTTP-based static file server, making future migrations transparent.</p>
 
 <h2 align="center" id="relationship-with-xpkg">Relationship with xpkg</h2>
 
@@ -513,4 +513,4 @@ xpm repo list
         <a href="https://github.com/xscriptor">X Profile</a>
     </p>
 </div>
-- Documentation: https://github.com/xlnux/wiki
+- Documentation: https://github.com/equislinux/wiki

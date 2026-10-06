@@ -85,7 +85,7 @@ superficies de compatibilidad y documentarse con cuidado cuando cambien:
   `.BUILDINFO`, `.MTREE` y `.INSTALL` opcional). La versión de formato es implícita en la
   estructura del `.PKGINFO`; ambas herramientas deben moverse en lockstep.
 - **Layout de repositorio**: endpoint de sync `<server>/<repo>.db` (+ `.files`), árbol nativo
-  xpm en `https://xlnux.github.io/x-repo/x/$arch` (no confundir con el endpoint pacman bajo
+  xpm en `https://equislinux.github.io/x-repo/x/$arch` (no confundir con el endpoint pacman bajo
   `/repo/x86_64`), firmas como `.sig` separadas, keyring como `trustedkeys.gpg`.
 - **Configuración**: `/etc/xpm.conf` (TOML), repos de usuario en `/etc/xpm.d/`, variables de URL
   `$repo`/`$arch`, semántica de `sig_level`.

@@ -3,7 +3,7 @@ name = "xpm"
 version = "0.1.0"
 release = 3
 description = "Modern Rust-based package manager for X Distribution"
-url = "https://github.com/xlnux/xpm"
+url = "https://github.com/equislinux/xpm"
 license = ["GPL-3.0-or-later"]
 arch = ["x86_64"]
 

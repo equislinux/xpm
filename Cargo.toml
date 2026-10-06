@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["xscriptor"]
-repository = "https://github.com/xlnux/xpm"
+repository = "https://github.com/equislinux/xpm"
 description = "Modern Rust-based package manager for X Distribution"
 
 [workspace.dependencies]
