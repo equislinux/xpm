@@ -16,7 +16,9 @@ use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
+use xpm_core::alpm_hooks::{self, HookOperation, HookTransaction, HookWhen};
 use xpm_core::config::Repository;
+use xpm_core::generations;
 use xpm_core::install_reason::{retain_by_reason, InstallReason};
 use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::local_db;
@@ -29,6 +31,7 @@ use xpm_core::repo_sync::{
     verify_remote_signature, verify_sha256,
 };
 use xpm_core::resolver::{resolve_closure, DepConstraint, PackageCandidate, Requirement, Version};
+use xpm_core::rollback::{last_rollback_candidate, RollbackOp, RollbackPlan};
 use xpm_core::txhooks::run_transaction_hooks;
 use xpm_core::{HookChain, Transaction};
 use xpm_core::{XpmConfig, XpmError, XpmResult};
@@ -91,6 +94,8 @@ fn main() -> Result<()> {
         Command::Files(args) => cmd_files(&config, args),
         Command::Repo(args) => cmd_repo(&config, args),
         Command::History(args) => cmd_history(&config, args),
+        Command::Rollback(args) => cmd_rollback(&config, args, cli.no_confirm),
+        Command::Diff(args) => cmd_diff(&config, args),
         Command::Usage(args) => cmd_help(args),
     }
 }
@@ -118,7 +123,7 @@ fn cmd_sync(config: &XpmConfig, args: &cli::SyncArgs) -> Result<()> {
         3,
         config.options.parallel_downloads.max(1) as usize,
         config.options.sig_level,
-        config.options.gpg_dir.join("trustedkeys.gpg"),
+        config.options.keyring_path(),
     );
     let mut remote_by_repo: HashMap<String, Result<xpm_core::repo_sync::RepoSyncResult, XpmError>> =
         remote_results.into_iter().collect();
@@ -459,12 +464,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     for (repo, entry, explicit) in &resolved {
         let pkg_name = &entry.name;
 
-        let filename = entry.filename.clone().ok_or_else(|| {
-            XpmError::Database(format!(
-                "package '{}' in repo '{}' is missing FILENAME metadata",
-                entry.name, repo.name
-            ))
-        })?;
+        let filename = entry.resolved_filename(&arch);
         let dest = cache_dir.join(&filename);
         let urls = package_download_candidates(repo, &arch, entry);
         let mirror = download_first_available(&urls, &dest, 3).with_context(|| {
@@ -475,7 +475,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         })?;
 
         let sig_level = repo.sig_level.unwrap_or(config.options.sig_level);
-        let keyring_path = config.options.gpg_dir.join("trustedkeys.gpg");
+        let keyring_path = config.options.keyring_path();
         let sig_url = format!("{mirror}.sig");
         verify_remote_signature(&dest, &sig_url, sig_level, &keyring_path, 3).with_context(
             || {
@@ -504,7 +504,13 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         println!("   downloaded: {}", dest.display());
         println!("   source: {}", mirror);
 
-        journal_pkgs.push(JournalPackage::install(&entry.name, &entry.version));
+        let mut journal_pkg = JournalPackage::install(&entry.name, &entry.version)
+            .with_repo(&repo.name)
+            .with_source(&mirror);
+        if let Some(sum) = entry.sha256sum.as_deref() {
+            journal_pkg = journal_pkg.with_sha256(sum);
+        }
+        journal_pkgs.push(journal_pkg);
         installed.push(InstalledRecord {
             name: entry.name.clone(),
             repo: repo.name.clone(),
@@ -568,6 +574,7 @@ fn cmd_remove(config: &XpmConfig, args: &cli::RemoveArgs, no_confirm: bool) -> R
     let hooks = HookChain::default();
     tx.set_hooks(hooks);
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
+    tx.set_save_configs(!args.nosave);
 
     // Add remove operations for each package
     let mut journal_pkgs = Vec::new();
@@ -726,12 +733,7 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
     let mut installed_records: Vec<InstalledRecord> = Vec::new();
 
     for (repo, entry, local_version, is_new) in plan {
-        let filename = entry.filename.clone().ok_or_else(|| {
-            XpmError::Database(format!(
-                "package '{}' in repo '{}' is missing FILENAME metadata",
-                entry.name, repo.name
-            ))
-        })?;
+        let filename = entry.resolved_filename(&arch);
 
         let dest = cache_dir.join(&filename);
         let urls = package_download_candidates(&repo, &arch, &entry);
@@ -743,7 +745,7 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         })?;
 
         let sig_level = repo.sig_level.unwrap_or(config.options.sig_level);
-        let keyring_path = config.options.gpg_dir.join("trustedkeys.gpg");
+        let keyring_path = config.options.keyring_path();
         let sig_url = format!("{mirror}.sig");
         verify_remote_signature(&dest, &sig_url, sig_level, &keyring_path, 3).with_context(
             || {
@@ -761,17 +763,30 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         let metadata = read_metadata(&dest)
             .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
 
-        if is_new {
-            journal_pkgs.push(JournalPackage::install(&entry.name, &entry.version));
+        // New dependency: plain install. Upgrade of an existing package: a
+        // single `Upgrade` operation, so hooks can compare the old and new
+        // manifests (config files, stale files) before the local-db entry is
+        // rewritten.
+        let mut journal_pkg = if is_new {
+            tx.add_install(entry.name.clone(), entry.version.clone(), dest)
+                .context("failed to add install op to transaction")?;
+            JournalPackage::install(&entry.name, &entry.version)
         } else {
-            journal_pkgs.push(JournalPackage::upgrade(
-                &entry.name,
-                &local_version,
-                &entry.version,
-            ));
-            tx.add_remove(entry.name.clone())
-                .context("failed to add remove op to transaction")?;
+            tx.add_upgrade(
+                entry.name.clone(),
+                local_version.clone(),
+                entry.version.clone(),
+                dest,
+            )
+            .context("failed to add upgrade op to transaction")?;
+            JournalPackage::upgrade(&entry.name, &local_version, &entry.version)
+        };
+        journal_pkg = journal_pkg.with_repo(&repo.name).with_source(&mirror);
+        if let Some(sum) = entry.sha256sum.as_deref() {
+            journal_pkg = journal_pkg.with_sha256(sum);
         }
+        journal_pkgs.push(journal_pkg);
+
         let record_reason = if is_new {
             InstallReason::Dep
         } else {
@@ -786,9 +801,6 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             provides: metadata.meta.provides.clone(),
             reason: record_reason,
         });
-
-        tx.add_install(entry.name.clone(), entry.version.clone(), dest)
-            .context("failed to add install op to transaction")?;
     }
 
     commit_transaction(config, "upgrade", journal_pkgs, &mut tx)?;
@@ -945,6 +957,42 @@ fn run_phase_hooks(
     Ok(())
 }
 
+/// Runs the pacman-style ALPM `.hook` files for one phase of a transaction.
+///
+/// This is what makes xpm transactions generation-aware: the distribution
+/// ships `10-x-gen-pre.hook`/`20-x-gen-post.hook` in `/etc/pacman.d/hooks`.
+fn run_alpm_hooks(config: &XpmConfig, packages: &[JournalPackage], when: HookWhen) -> Result<()> {
+    let transaction = HookTransaction {
+        packages: packages
+            .iter()
+            .map(|pkg| {
+                let operation = match (&pkg.from, &pkg.to) {
+                    (None, Some(_)) => HookOperation::Install,
+                    (Some(_), None) => HookOperation::Remove,
+                    _ => HookOperation::Upgrade,
+                };
+                (pkg.name.as_str(), operation)
+            })
+            .collect(),
+        paths: Vec::new(),
+    };
+
+    let hooks =
+        alpm_hooks::load_hooks(&alpm_hooks::hook_dirs()).context("failed to load ALPM hooks")?;
+    if hooks.is_empty() {
+        return Ok(());
+    }
+
+    let installed = alpm_hooks::installed_names(&config.options.db_path.join("local"));
+    let failures =
+        alpm_hooks::run_hooks(&hooks, when, &transaction, |name| installed.contains(name))?;
+    let warnings = alpm_hooks::enforce_failures(when, &failures)?;
+    for warning in warnings {
+        eprintln!("xpm: warning: ALPM hook failed: {warning}");
+    }
+    Ok(())
+}
+
 /// Prepares, commits and journals a transaction, running the hook
 /// directories around it.
 fn commit_transaction(
@@ -963,6 +1011,7 @@ fn commit_transaction(
 
     let result = (|| -> Result<()> {
         run_phase_hooks(config, &journal, "pre", action, true)?;
+        run_alpm_hooks(config, &journal.packages, HookWhen::PreTransaction)?;
         println!(
             ":: Preparing transaction ({} operation(s))...",
             tx.operation_count()
@@ -971,11 +1020,16 @@ fn commit_transaction(
         println!(":: Committing transaction...");
         tx.commit().context("transaction commit failed")?;
         run_phase_hooks(config, &journal, "post", action, false)?;
+        run_alpm_hooks(config, &journal.packages, HookWhen::PostTransaction)?;
         Ok(())
     })();
 
     match &result {
         Ok(()) => {
+            // Link the finished transaction to the generation that is current
+            // after the post hooks (the generation engine ships one that
+            // snapshots here). Absent/unreadable state leaves `None`.
+            journal.generation = generations::read_current(&config.options.root_dir);
             journal
                 .finish("ok", None)
                 .context("failed to finalize the transaction journal")?;
@@ -1003,6 +1057,239 @@ fn cmd_history(config: &XpmConfig, args: &cli::HistoryArgs) -> Result<()> {
     for journal in &entries {
         println!("{}", journal.summary());
     }
+    Ok(())
+}
+
+/// `xpm diff <generation>` — compare the live local database against the
+/// `packages.tsv` capture of a generation.
+fn cmd_diff(config: &XpmConfig, args: &cli::DiffArgs) -> Result<()> {
+    let local_db_dir = config.options.db_path.join("local");
+    let installed = read_installed_versions(&local_db_dir)?;
+
+    let generation = if args.generation == "current" {
+        generations::read_current(&config.options.root_dir).ok_or_else(|| {
+            XpmError::Other(
+                "no current generation found; pass an explicit generation id (see `x gen list`)"
+                    .to_string(),
+            )
+        })?
+    } else {
+        args.generation.clone()
+    };
+
+    let captured = generations::read_generation_packages(&config.options.root_dir, &generation)
+        .with_context(|| format!("failed to read generation '{generation}'"))?;
+
+    let diff = generations::diff_installed(&installed, &captured, &generation);
+
+    if args.json {
+        println!("{}", diff.to_json());
+        return Ok(());
+    }
+
+    if diff.is_empty() {
+        println!(":: No differences vs generation {generation}.");
+        return Ok(());
+    }
+
+    if !diff.added.is_empty() {
+        println!(
+            ":: Added since generation {generation} ({}):",
+            diff.added.len()
+        );
+        for pkg in &diff.added {
+            println!("   + {} {}", pkg.name, pkg.version);
+        }
+    }
+    if !diff.removed.is_empty() {
+        println!(
+            ":: Removed since generation {generation} ({}):",
+            diff.removed.len()
+        );
+        for pkg in &diff.removed {
+            println!("   - {} {}", pkg.name, pkg.version);
+        }
+    }
+    if !diff.changed.is_empty() {
+        println!(
+            ":: Changed since generation {generation} ({}):",
+            diff.changed.len()
+        );
+        for change in &diff.changed {
+            println!("   ~ {} {} -> {}", change.name, change.from, change.to);
+        }
+    }
+    Ok(())
+}
+
+/// Prints a rollback plan with indentation.
+fn print_rollback_plan(plan: &RollbackPlan) {
+    for op in &plan.ops {
+        println!("   {}", op.describe());
+    }
+    for (name, version) in &plan.missing {
+        println!("   MISSING {name} {version} (not in cache)");
+    }
+    for skipped in &plan.skipped {
+        println!("   skipped {skipped}");
+    }
+}
+
+/// `xpm rollback [--last|--journal ID] [--dry-run]` — undo the package changes
+/// of a successful transaction from the local cache.
+fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) -> Result<()> {
+    let local_db_dir = config.options.db_path.join("local");
+    let entries =
+        Journal::list(&journal_dir(config)).context("failed to read the transaction journal")?;
+
+    let journal = if let Some(id) = &args.journal {
+        entries
+            .iter()
+            .find(|entry| &entry.id == id)
+            .ok_or_else(|| {
+                XpmError::Other(format!("journal '{id}' not found (see `xpm history`)"))
+            })?
+    } else {
+        last_rollback_candidate(&entries).ok_or_else(|| {
+            XpmError::Other(
+                "no successful install/remove/upgrade transaction to roll back".to_string(),
+            )
+        })?
+    };
+
+    if journal.result != "ok" {
+        anyhow::bail!(
+            "journal '{}' is '{}': only successful transactions can be rolled back",
+            journal.id,
+            journal.result
+        );
+    }
+
+    let plan = xpm_core::rollback::build_plan(journal, &local_db_dir, &config.options.cache_dir)
+        .context("failed to compute the rollback plan")?;
+
+    println!(
+        ":: Rollback of journal {} ({}){}",
+        plan.journal_id,
+        plan.action,
+        plan.generation
+            .as_deref()
+            .map(|g| format!(", gen:{g}"))
+            .unwrap_or_default()
+    );
+
+    if args.dry_run {
+        print_rollback_plan(&plan);
+        return Ok(());
+    }
+
+    if plan.ops.is_empty() && plan.missing.is_empty() {
+        println!(":: Nothing to do.");
+        return Ok(());
+    }
+
+    if !plan.is_executable() {
+        print_rollback_plan(&plan);
+        let missing = plan
+            .missing
+            .iter()
+            .map(|(name, version)| format!("{name} {version}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "rollback cannot proceed: package file(s) not in {}: {missing}\n\
+             Re-download them with `xpm install name=version`, or use `x gen rollback` for a full system rollback.",
+            config.options.cache_dir.display()
+        );
+    }
+
+    confirm_action(":: Proceed with rollback? [y/N] ", no_confirm)?;
+
+    let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
+        .context("failed to create transaction")?;
+    let hooks = HookChain::default();
+    tx.set_hooks(hooks);
+    tx.set_shell_integration(config.options.root_dir != Path::new("/"));
+
+    let mut journal_pkgs = Vec::new();
+    let mut reinstall_records: Vec<InstalledRecord> = Vec::new();
+
+    for op in &plan.ops {
+        match op {
+            RollbackOp::Remove { name, version } => {
+                tx.add_remove(name.clone())
+                    .context("failed to add remove op to rollback transaction")?;
+                journal_pkgs.push(JournalPackage::remove(
+                    name.clone(),
+                    version.clone().unwrap_or_default(),
+                ));
+            }
+            RollbackOp::Reinstall {
+                name,
+                version,
+                file,
+            } => {
+                let metadata = read_metadata(file)
+                    .with_context(|| format!("failed to read metadata from {}", file.display()))?;
+                let current = local_db::read_version(&local_db_dir, name);
+
+                match current.as_deref().filter(|current| *current != version) {
+                    // Downgrade of an installed package: config-safe upgrade op.
+                    Some(current_version) => {
+                        tx.add_upgrade(
+                            name.clone(),
+                            current_version.to_string(),
+                            version.clone(),
+                            file.clone(),
+                        )
+                        .context("failed to add downgrade op to rollback transaction")?;
+                        journal_pkgs.push(JournalPackage::upgrade(
+                            name.clone(),
+                            current_version,
+                            version.clone(),
+                        ));
+                    }
+                    // Undo of a remove: plain install from the cache.
+                    None => {
+                        tx.add_install(name.clone(), version.clone(), file.clone())
+                            .context("failed to add install op to rollback transaction")?;
+                        journal_pkgs.push(JournalPackage::install(name.clone(), version.clone()));
+                    }
+                }
+
+                let reason = if current.is_some() {
+                    InstallReason::read_optional(&local_db_dir, name)
+                        .unwrap_or(InstallReason::Explicit)
+                } else {
+                    InstallReason::Explicit
+                };
+                reinstall_records.push(InstalledRecord {
+                    name: name.clone(),
+                    repo: "cache".to_string(),
+                    depends: metadata.meta.depends.clone(),
+                    provides: metadata.meta.provides.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+
+    commit_transaction(config, "rollback", journal_pkgs, &mut tx)?;
+
+    for record in &reinstall_records {
+        record
+            .reason
+            .write(&local_db_dir, &record.name)
+            .with_context(|| format!("failed to record install reason for '{}'", record.name))?;
+        local_db::write_origin(&local_db_dir, &record.name, &record.repo)
+            .with_context(|| format!("failed to record origin for '{}'", record.name))?;
+        local_db::write_depends(&local_db_dir, &record.name, &record.depends)
+            .with_context(|| format!("failed to record dependencies for '{}'", record.name))?;
+        local_db::write_provides(&local_db_dir, &record.name, &record.provides)
+            .with_context(|| format!("failed to record provides for '{}'", record.name))?;
+    }
+
+    println!(":: Rollback complete ({} operation(s)).", plan.ops.len());
     Ok(())
 }
 
@@ -1307,6 +1594,9 @@ QUERIES:
     search      Search for packages in sync databases
     info        Display detailed package information
     files       List files owned by a package
+    history     Show the transaction journal
+    rollback    Undo the last transaction (package level, from the cache)
+    diff        Compare installed packages against a generation capture
 
 REPOSITORY MANAGEMENT:
     repo add    Add a temporary repository
@@ -1336,7 +1626,8 @@ GENERAL OPTIONS:
     db_path = "/var/lib/xpm/"         # Database directory
     cache_dir = "/var/cache/xpm/pkg/" # Package cache
     log_file = "/var/log/xpm.log"     # Log file location
-    gpg_dir = "/etc/pacman.d/gnupg/"  # GPG keyring
+    gpg_dir = "/etc/pacman.d/gnupg/"  # GPG keyring (shared with pacman;
+                                      # falls back to /etc/xpm/gnupg)
     sig_level = "optional"            # required | optional | never
     parallel_downloads = 5            # Concurrent downloads
     check_space = true                # Check disk space
@@ -1612,6 +1903,65 @@ EXAMPLES:
     xpm repo remove chaotic-aur
 
 See `xpm help repos` for more details on repository configuration.
+"#
+        ),
+        "history" => println!(
+            r#"xpm history — Transaction Journal
+
+USAGE:
+    xpm history [--json]
+
+DESCRIPTION:
+    Show past xpm transactions, newest first. When generations are
+    available, each entry shows the generation it produced (`gen:NNNN`).
+
+OPTIONS:
+    --json          One JSON object per transaction (machine output)
+
+EXAMPLES:
+    xpm history
+    xpm history --json
+"#
+        ),
+        "rollback" => println!(
+            r#"xpm rollback — Undo the Last Transaction
+
+USAGE:
+    xpm rollback [--last | --journal <ID>] [--dry-run]
+
+DESCRIPTION:
+    Compute the inverse of a successful transaction and replay it using
+    the local package cache. This is the package-level recovery path;
+    whole-system recovery remains `x gen rollback`.
+
+OPTIONS:
+    --last              Undo the newest successful transaction (default)
+    --journal <ID>      Undo a specific journal id (see `xpm history`)
+    --dry-run           Print the inverse plan without changing anything
+
+EXAMPLES:
+    xpm rollback --dry-run
+    xpm rollback --last
+    xpm rollback --journal 1727900000-1234
+"#
+        ),
+        "diff" => println!(
+            r#"xpm diff — Compare Against a Generation
+
+USAGE:
+    xpm diff <GENERATION> [--json]
+
+DESCRIPTION:
+    Compare the installed packages (local database) against the
+    `packages.tsv` capture of a generation. Use `current` for the
+    default generation.
+
+OPTIONS:
+    --json              Emit a single JSON object
+
+EXAMPLES:
+    xpm diff 0003
+    xpm diff current --json
 "#
         ),
         _ => println!(

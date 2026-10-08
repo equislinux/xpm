@@ -99,8 +99,15 @@ Not every subcommand is fully wired to engine logic yet. From `crates/xpm/src/ma
 - `install` runs the SAT resolver over the sync databases: dependency closure, dependency order,
   `name=version` requirements and unversioned `provides`.
 - `query` (including `--orphans`), `search`, `info`, and `files` read the local and sync
-  databases; the remaining gaps before the native path are `rollback --last`,
-  `diff <generation>` and `.pacnew`/`.pacsave` handling.
+  databases.
+- `history` links each transaction to the generation it produced (`gen:NNNN`), `diff <generation>`
+  compares the live database against a generation's `packages.tsv`, and `rollback --last`
+  replays the inverse of the newest successful transaction from the package cache
+  (`--dry-run` supported).
+- `.pacnew`/`.pacsave` handling follows the `backup` entries of `.PKGINFO`: modified
+  configuration files are never silently overwritten and survive removals unless `--nosave`.
+- Pacman-style ALPM hooks (`/usr/share/libalpm/hooks`, `/etc/pacman.d/hooks`) run around every
+  transaction, so the distribution's generation hooks work under xpm as well.
 
 See [Usage](usage.md) for the full reference and [Architecture](architecture.md) for the
 implementation details.

@@ -298,3 +298,61 @@ fn solve_shared_dependency() {
     assert_eq!(result.len(), 3);
     assert!(result.contains(&"libcommon-1.0-1".to_string()));
 }
+
+#[test]
+fn solve_large_dependency_chain_at_scale() {
+    // Synthetic stress test (roadmap #38): a 2000-package chain must resolve
+    // to the full closure quickly and without unbounded growth.
+    let count = 2000usize;
+    let mut candidates = Vec::with_capacity(count);
+    for index in 0..count {
+        let name = format!("pkg{index:04}");
+        if index == 0 {
+            candidates.push(simple(&name, "1.0-1"));
+        } else {
+            let previous = format!("pkg{:04}", index - 1);
+            candidates.push(with_deps(&name, "1.0-1", &[previous.as_str()]));
+        }
+    }
+
+    let mut provider = build_provider(candidates);
+    // The root has no dependents, so intern its requirement manually.
+    let root_id = provider.pool.intern_name("pkg1999");
+    provider
+        .pool
+        .intern_version_set(root_id, DepConstraint::parse("pkg1999"));
+
+    let started = std::time::Instant::now();
+    let solved = solve(provider, &["pkg1999"]).expect("large closure must resolve");
+    let elapsed = started.elapsed();
+
+    assert_eq!(solved.len(), count, "every chain link must be selected");
+    assert!(solved.contains(&"pkg0000-1.0-1".to_string()));
+    assert!(solved.contains(&"pkg1999-1.0-1".to_string()));
+    assert!(
+        elapsed.as_secs() < 30,
+        "resolver took too long: {elapsed:?}"
+    );
+}
+
+#[test]
+fn solve_wide_fanout_resolves_all_versions_once() {
+    // One root package depending on 500 distinct libraries.
+    let mut deps: Vec<String> = (0..500).map(|i| format!("lib{i:03}")).collect();
+    deps.sort();
+    let dep_refs: Vec<&str> = deps.iter().map(String::as_str).collect();
+
+    let mut candidates = vec![with_deps("app-wide", "1.0-1", &dep_refs)];
+    for name in &deps {
+        candidates.push(simple(name, "1.0-1"));
+    }
+
+    let mut provider = build_provider(candidates);
+    let root_id = provider.pool.intern_name("app-wide");
+    provider
+        .pool
+        .intern_version_set(root_id, DepConstraint::parse("app-wide"));
+
+    let solved = solve(provider, &["app-wide"]).expect("fan-out must resolve");
+    assert_eq!(solved.len(), 501);
+}

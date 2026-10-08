@@ -41,13 +41,13 @@ after (`xpm history` reads it back):
 ```
 
 Timestamps are epoch seconds in the JSON (`started`/`finished`); `xpm history`
-renders them as ISO-8601 (`summary()`). `sha256`/`source` are the next addition
-(they come from the repo metadata xpm already parses: `SHA256SUM`, `URL`
-extended fields, see `docs/INTEGRATION.md`). The transaction engine already has
-a `rollback()` primitive and a state machine
-(`crates/xpm-core/src/transaction.rs`); the journal is the persistent record of
-it. `install`, `remove` and `upgrade` already write it via
-`commit_transaction`, and finish it as `ok`/`failed`.
+renders them as ISO-8601 (`summary()`). Each package entry also carries
+`repo`/`sha256`/`source` provenance (from the sync database's `FILENAME`/
+`SHA256SUM` and the mirror URL) and the journal as a whole carries `generation`
+when it could be linked. The transaction engine already has a `rollback()`
+primitive and a state machine (`crates/xpm-core/src/transaction.rs`); the
+journal is the persistent record of it. `install`, `remove`, `upgrade` and
+`rollback` write it via `commit_transaction`, and finish it as `ok`/`failed`.
 
 ### 2. Hook directories (contract) — **implemented** (`xpm-core::txhooks`)
 
@@ -69,16 +69,34 @@ Failure policy: a **pre** hook failure aborts the transaction (no changes); a
 xpm stays unaware of snapshots, mirrors or `/var/lib/x`. The runner is
 already wired around prepare/commit; only the hook scripts are pending.
 
-### 3. History and rollback
+**Additionally**, xpm executes the pacman-style ALPM `.hook` files
+(`/usr/share/libalpm/hooks`, `/etc/pacman.d/hooks`, override with
+`XPM_ALPM_HOOKS_DIRS`): the distribution's existing
+`10-x-gen-pre.hook`/`20-x-gen-post.hook` therefore fire under xpm with no
+changes to the payload. Trigger matching supports `Operation`/`Type=Package`
+globs, `Depends`, `AbortOnFail` and `NeedsTargets`; `Type=Path` triggers match
+only when the caller provides the transaction's file paths (package-level
+operations do not always expose them). See `crates/xpm-core/src/alpm_hooks.rs`.
 
-- `xpm history [--json]` — **implemented**: reads the journal, newest first
-  (human summary or one JSON object per line). Linking generation ids is
-  pending (needs the hooks above).
-- `xpm rollback --last` — prints (or executes) the recovery path. Full system
-  recovery remains `x gen rollback` (F1 of the design): snapshot ownership
-  stays in the provisioning payload, not in xpm.
-- `xpm diff <generation>` — later: transaction packages vs the generation
-  manifest's `packages.tsv`.
+### 3. History and rollback — **implemented**
+
+- `xpm history [--json]` — reads the journal, newest first (human summary or
+  one JSON object per line). Every finished transaction is linked to the
+  generation that is current when it ends (`generation` field, `gen:NNNN` in
+  the summary). The id is read from `<state>/current`; `X_GEN_STATE`
+  overrides the default `<root>/var/lib/x`. Unreadable/absent state simply
+  leaves the field empty: xpm never fails because generations are missing.
+- `xpm diff <generation>` — compares the live local database against
+  `<state>/generations/<id>/packages.tsv` and reports added/removed/changed
+  packages (`--json` for machines; `current` resolves the default id).
+- `xpm rollback [--last|--journal <id>] [--dry-run]` — computes the inverse of
+  a successful journal (`crates/xpm-core/src/rollback.rs`) and replays it as a
+  new transaction: installs are undone with removals, removals and upgrades
+  with reinstalls from the package cache (`crates/xpm-core/src/cache.rs`).
+  If any old package file is no longer cached the plan aborts **before**
+  touching the system and points to `xpm install name=version`. Full system
+  recovery remains `x gen rollback`: snapshot ownership stays in the
+  provisioning payload, not in xpm.
 
 ### 4. Stable machine output — **implemented**
 
@@ -131,10 +149,10 @@ rollback.
 
 | Item | Where it stands |
 |------|-----------------|
-| Resolver wired into the CLI | Done for `install` (repo names + local `.xp`) and `upgrade` (dependency closure); `rollback`/`diff` still pending |
-| Stub commands (`query`, `files`, ...) | `query` (including `--orphans`), `files`, `info` and `search` implemented |
-| Transaction hardening (`.pacnew`, hooks, rollback tests) | Open items in `ROADMAP.md` Phase 7/8 |
-| Config keyring path inconsistency | Pending reconciliation |
+| Resolver wired into the CLI | Done for `install` (repo names + local `.xp`) and `upgrade` (dependency closure); `rollback`/`diff` implemented |
+| Stub commands (`query`, `files`, ...) | `query` (including `--orphans`), `files`, `info`, `search`, `history`, `diff` and `rollback` implemented |
+| Transaction hardening (`.pacnew`, hooks, rollback tests) | Done: config-file management, ALPM hooks, upgrade/rollback CLI journeys |
+| Config keyring path inconsistency | Resolved: `effective_gpg_dir()` prefers the configured directory, then pacman's keyring, then `/etc/xpm/gnupg` |
 
 The **journal + hooks** slice lands on top of the resolver: `install` resolves
 the closure before journaling, and the journal records what was done.
@@ -151,8 +169,11 @@ the closure before journaling, and the journal records what was done.
 2. ~~Hook directories + environment contract.~~ runner done (hook scripts in
    x-scripts pending; `XPM_*` env covered by unit tests).
 3. ~~`xpm query --format tsv`.~~ done.
-4. `xpm rollback --last` (guidance) + `xpm diff`; `history` links generation
-   ids; ~~install-reason metadata~~ done (section 4: `reason` file,
+4. ~~`xpm rollback --last`~~ done (inverse transaction from the package cache,
+   `--dry-run`, `--journal <id>`); ~~`xpm diff`~~ done
+   (`packages.tsv` comparison, `--json`); ~~`history` links generation ids~~ done
+   (read from `<state>/current` after the post hooks);
+   ~~install-reason metadata~~ done (section 4: `reason` file,
    `--explicit/--deps`); ~~`origin` provenance + package `files` manifest~~ done
    (section 4: `local/<pkg>/origin` and `%FILES%` manifest from `.MTREE`, plus
    `xpm files`/`xpm info`); ~~`--orphans`~~ done (dependency edges recorded at

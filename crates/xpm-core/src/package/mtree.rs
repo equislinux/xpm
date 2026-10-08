@@ -7,7 +7,12 @@
 //! ./path/to/file type=file mode=0644 size=1234 sha256digest=abcdef... uid=0 gid=0
 //! ./path/to/link type=link link=target uid=0 gid=0
 //! ```
+//!
+//! Real Arch packages built by `makepkg` ship the manifest gzip-compressed
+//! (`pacman` grew this in 5.2) while xpkg writes it as plain text; both are
+//! accepted here.
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use crate::error::XpmError;
@@ -16,8 +21,11 @@ use crate::package::types::{MtreeEntry, MtreeFileType};
 // ── Public API ────────────────────────────────────────────────
 
 /// Parse the raw bytes of an `.MTREE` file into a list of [`MtreeEntry`].
+///
+/// Transparently decompresses the gzip-wrapped variant used by makepkg.
 pub fn parse_mtree(data: &[u8]) -> Result<Vec<MtreeEntry>, XpmError> {
-    let text = std::str::from_utf8(data)
+    let decoded = decode_mtree(data)?;
+    let text = std::str::from_utf8(&decoded)
         .map_err(|e| XpmError::Package(format!("invalid UTF-8 in .MTREE: {e}")))?;
 
     let mut entries = Vec::new();
@@ -33,6 +41,20 @@ pub fn parse_mtree(data: &[u8]) -> Result<Vec<MtreeEntry>, XpmError> {
     }
 
     Ok(entries)
+}
+
+/// Returns the plain-text manifest, decompressing gzip when needed.
+fn decode_mtree(data: &[u8]) -> Result<Vec<u8>, XpmError> {
+    if !data.starts_with(&[0x1F, 0x8B]) {
+        return Ok(data.to_vec());
+    }
+
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut decoded = Vec::new();
+    decoder
+        .read_to_end(&mut decoded)
+        .map_err(|e| XpmError::Package(format!("failed to decompress .MTREE: {e}")))?;
+    Ok(decoded)
 }
 
 // ── Line parser ───────────────────────────────────────────────
@@ -173,5 +195,26 @@ mod tests {
         let entries = parse_mtree(data.as_bytes()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].mode, 0o644);
+    }
+
+    #[test]
+    fn parses_gzip_compressed_mtree_as_written_by_makepkg() {
+        use std::io::Write;
+
+        let plain =
+            b"#mtree\n./usr/bin/hello type=file mode=0755 size=1 sha256digest=aa uid=0 gid=0\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain).expect("gzip write");
+        let gz = encoder.finish().expect("gzip finish");
+
+        let entries = parse_mtree(&gz).expect("gzip mtree must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sha256.as_deref(), Some("aa"));
+    }
+
+    #[test]
+    fn corrupt_gzip_mtree_reports_error() {
+        let result = parse_mtree(&[0x1F, 0x8B, 0x00, 0x01]);
+        assert!(result.is_err());
     }
 }

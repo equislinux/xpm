@@ -101,9 +101,14 @@ No todos los subcomandos están conectados del todo con la lógica del motor. De
   descarga.
 - `install` ejecuta el resolver SAT sobre las bases sincronizadas: cierre de dependencias, orden
   de dependencias, requisitos `nombre=versión` y `provides` sin versión.
-- `query` (incluido `--orphans`), `search`, `info` y `files` leen las bases local y sync; los
-  huecos restantes antes del camino nativo son `rollback --last`, `diff <generation>` y la
-  gestión de `.pacnew`/`.pacsave`.
+- `query` (incluido `--orphans`), `search`, `info` y `files` leen las bases local y sync.
+- `history` enlaza cada transacción con la generación que produjo (`gen:NNNN`), `diff <generation>`
+  compara la base viva contra el `packages.tsv` de una generación, y `rollback --last` reaplica la
+  inversa de la última transacción exitosa desde la caché de paquetes (soporta `--dry-run`).
+- Gestión `.pacnew`/`.pacsave` según las entradas `backup` del `.PKGINFO`: los archivos de
+  configuración modificados nunca se pisan en silencio y sobreviven a los removes salvo `--nosave`.
+- Los hooks estilo pacman (`/usr/share/libalpm/hooks`, `/etc/pacman.d/hooks`) corren alrededor de
+  cada transacción, así que los hooks de generaciones de la distro funcionan también con xpm.
 
 Ver [Uso](usage.md) para la referencia completa y [Arquitectura](architecture.md) para los
 detalles de implementación.

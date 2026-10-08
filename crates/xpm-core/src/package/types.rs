@@ -24,6 +24,9 @@ pub struct PackageMeta {
     pub provides: Vec<String>,
     pub conflicts: Vec<String>,
     pub replaces: Vec<String>,
+    /// Configuration files (`backup = etc/foo.conf`). These get `.pacnew`
+    /// handling on install/upgrade and `.pacsave` handling on removal.
+    pub backup: Vec<String>,
     /// Any additional key-value pairs not covered above.
     pub extra: HashMap<String, Vec<String>>,
 }

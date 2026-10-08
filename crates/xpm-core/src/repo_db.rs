@@ -32,6 +32,26 @@ pub struct RepoEntry {
     pub files: Vec<String>,
 }
 
+impl RepoEntry {
+    /// File name to download for this entry.
+    ///
+    /// xpkg-extended databases carry `FILENAME`; standard Arch databases do
+    /// not, so the Arch convention `name-version-arch.pkg.tar.zst` is derived
+    /// from the entry (falling back to the requested architecture for `any`).
+    pub fn resolved_filename(&self, default_arch: &str) -> String {
+        if let Some(filename) = &self.filename {
+            return filename.clone();
+        }
+        let arch = self
+            .arch
+            .as_deref()
+            .map(str::trim)
+            .filter(|arch| !arch.is_empty() && *arch != "any")
+            .unwrap_or(default_arch);
+        format!("{}-{}-{arch}.pkg.tar.zst", self.name, self.version)
+    }
+}
+
 /// Parsed sync database for a repository (e.g. `core.db`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncDb {
@@ -388,7 +408,10 @@ mod tests {
         assert_eq!(hello.arch.as_deref(), Some("x86_64"));
         assert_eq!(hello.filename.as_deref(), Some("hello-1.0-1-x86_64.xp"));
         assert_eq!(hello.sha256sum.as_deref(), Some("abc123"));
-        assert_eq!(hello.url.as_deref(), Some("https://github.com/equislinux/hello"));
+        assert_eq!(
+            hello.url.as_deref(),
+            Some("https://github.com/equislinux/hello")
+        );
         assert_eq!(hello.depends, vec!["libc>=2.39"]);
         assert_eq!(hello.provides, vec!["hello-bin"]);
         assert_eq!(hello.conflicts, vec!["hello-git"]);
@@ -511,7 +534,10 @@ mod tests {
             xpkg.sha256sum.as_deref(),
             Some("deadbeefcafebabe0000000000000000deadbeefcafebabe0000000000000000")
         );
-        assert_eq!(xpkg.url.as_deref(), Some("https://github.com/equislinux/xpkg"));
+        assert_eq!(
+            xpkg.url.as_deref(),
+            Some("https://github.com/equislinux/xpkg")
+        );
         assert_eq!(xpkg.depends, vec!["rust"]);
         assert_eq!(xpkg.provides, vec!["xpkg-core"]);
     }
@@ -700,5 +726,36 @@ mod tests {
         assert_eq!(db.entries.len(), 1);
         assert!(db.entries[0].depends.is_empty());
         assert!(db.entries[0].provides.is_empty());
+    }
+
+    #[test]
+    fn resolved_filename_prefers_extended_and_derives_arch_convention() {
+        let mut entry = RepoEntry {
+            name: "hello".to_string(),
+            version: "1.0-1".to_string(),
+            filename: Some("custom-name.xp".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(entry.resolved_filename("x86_64"), "custom-name.xp");
+
+        // Standard Arch databases carry no FILENAME: derive the convention.
+        entry.filename = None;
+        assert_eq!(
+            entry.resolved_filename("x86_64"),
+            "hello-1.0-1-x86_64.pkg.tar.zst"
+        );
+
+        // `arch = any` packages use the target architecture in the file name.
+        entry.arch = Some("any".to_string());
+        assert_eq!(
+            entry.resolved_filename("aarch64"),
+            "hello-1.0-1-aarch64.pkg.tar.zst"
+        );
+
+        entry.arch = Some("x86_64".to_string());
+        assert_eq!(
+            entry.resolved_filename("aarch64"),
+            "hello-1.0-1-x86_64.pkg.tar.zst"
+        );
     }
 }

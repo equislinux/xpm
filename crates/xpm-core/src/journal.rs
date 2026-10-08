@@ -18,11 +18,24 @@ use crate::error::{XpmError, XpmResult};
 pub const JOURNAL_SCHEMA: u32 = 1;
 
 /// One package affected by a transaction.
+///
+/// `repo`, `sha256` and `source` are provenance fields filled when the package
+/// comes from a repository. They are all optional so schema-1 journals written
+/// before they existed keep parsing unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JournalPackage {
     pub name: String,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// Repository the package was downloaded from (`None` for local files).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// SHA-256 of the downloaded package file, when the sync DB declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Mirror URL the package was downloaded from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl JournalPackage {
@@ -31,6 +44,9 @@ impl JournalPackage {
             name: name.into(),
             from: None,
             to: Some(version.into()),
+            repo: None,
+            sha256: None,
+            source: None,
         }
     }
 
@@ -39,6 +55,9 @@ impl JournalPackage {
             name: name.into(),
             from: Some(version.into()),
             to: None,
+            repo: None,
+            sha256: None,
+            source: None,
         }
     }
 
@@ -51,7 +70,28 @@ impl JournalPackage {
             name: name.into(),
             from: Some(from.into()),
             to: Some(to.into()),
+            repo: None,
+            sha256: None,
+            source: None,
         }
+    }
+
+    /// Attaches repository provenance to the entry.
+    pub fn with_repo(mut self, repo: impl Into<String>) -> Self {
+        self.repo = Some(repo.into());
+        self
+    }
+
+    /// Attaches the downloaded file checksum to the entry.
+    pub fn with_sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.sha256 = Some(sha256.into());
+        self
+    }
+
+    /// Attaches the download source URL to the entry.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 
     /// Human-readable form: `name 1.0-1`, `name 1.0-1 -> 1.1-1` or
@@ -79,6 +119,10 @@ pub struct Journal {
     pub result: String,
     pub packages: Vec<JournalPackage>,
     pub error: Option<String>,
+    /// Generation id active when the transaction was finalized (read from the
+    /// generations state directory; `None` when generations are unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -105,6 +149,7 @@ impl Journal {
             result: "running".to_string(),
             packages,
             error: None,
+            generation: None,
             path,
         };
         journal.persist()?;
@@ -157,7 +202,8 @@ impl Journal {
         Ok(out)
     }
 
-    /// Single-line human summary for `xpm history`.
+    /// Single-line human summary for `xpm history`. The generation marker is
+    /// appended only when the journal knows which generation it produced.
     pub fn summary(&self) -> String {
         let pkgs = self
             .packages
@@ -165,13 +211,18 @@ impl Journal {
             .map(JournalPackage::describe)
             .collect::<Vec<_>>()
             .join(", ");
+        let generation = match &self.generation {
+            Some(id) => format!("  gen:{id}"),
+            None => String::new(),
+        };
         format!(
-            "{}  {:<7}  {:<7}  {:>3} pkg  {}",
+            "{}  {:<7}  {:<7}  {:>3} pkg  {}{}",
             iso8601(self.started),
             self.result,
             self.action,
             self.packages.len(),
-            pkgs
+            pkgs,
+            generation
         )
     }
 
@@ -282,6 +333,76 @@ mod tests {
         assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601(946_684_800), "2000-01-01T00:00:00Z");
         assert_eq!(iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn legacy_schema1_journal_parses_without_new_fields() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("legacy.json");
+        // A journal exactly as written by older xpm versions: no `repo`,
+        // `sha256`, `source` or `generation` keys anywhere.
+        fs::write(
+            &path,
+            r#"{
+                "schema": 1,
+                "id": "1000-1",
+                "action": "install",
+                "root_dir": "/",
+                "started": 1000,
+                "finished": 1001,
+                "result": "ok",
+                "packages": [{"name": "kitty", "from": null, "to": "0.44.0-1"}],
+                "error": null
+            }"#,
+        )
+        .expect("write legacy journal");
+
+        let journal = Journal::load(&path).expect("legacy journal must load");
+        assert_eq!(journal.packages[0].repo, None);
+        assert_eq!(journal.packages[0].sha256, None);
+        assert_eq!(journal.packages[0].source, None);
+        assert_eq!(journal.generation, None);
+    }
+
+    #[test]
+    fn provenance_and_generation_roundtrip() {
+        let tmp = TempDir::new().expect("tmp");
+        let mut journal = Journal::start(
+            tmp.path(),
+            "install",
+            Path::new("/"),
+            vec![JournalPackage::install("kitty", "0.44.0-1")
+                .with_repo("x")
+                .with_sha256("abc123")
+                .with_source("https://example.com/kitty.pkg.tar.zst")],
+        )
+        .expect("start");
+        journal.generation = Some("0007".to_string());
+        journal.persist().expect("persist");
+
+        let loaded = Journal::load(&journal.path).expect("load");
+        assert_eq!(loaded.packages[0].repo.as_deref(), Some("x"));
+        assert_eq!(loaded.packages[0].sha256.as_deref(), Some("abc123"));
+        assert_eq!(
+            loaded.packages[0].source.as_deref(),
+            Some("https://example.com/kitty.pkg.tar.zst")
+        );
+        assert_eq!(loaded.generation.as_deref(), Some("0007"));
+
+        let json = loaded.to_json();
+        assert!(json.contains("\"generation\":\"0007\""));
+        assert!(json.contains("\"repo\":\"x\""));
+    }
+
+    #[test]
+    fn summary_appends_generation_only_when_known() {
+        let tmp = TempDir::new().expect("tmp");
+        let mut journal =
+            Journal::start(tmp.path(), "install", Path::new("/"), Vec::new()).expect("journal");
+        assert!(!journal.summary().contains("gen:"));
+
+        journal.generation = Some("0002".to_string());
+        assert!(journal.summary().contains("gen:0002"));
     }
 
     #[test]

@@ -10,7 +10,11 @@ const DEFAULT_ROOT_DIR: &str = "/";
 const DEFAULT_DB_PATH: &str = "/var/lib/xpm/";
 const DEFAULT_CACHE_DIR: &str = "/var/cache/xpm/pkg/";
 const DEFAULT_LOG_FILE: &str = "/var/log/xpm.log";
-const DEFAULT_GPG_DIR: &str = "/etc/pacman.d/gnupg/";
+/// Keyring shared with pacman (X Linux ships pacman's keyring).
+pub const DEFAULT_GPG_DIR: &str = "/etc/pacman.d/gnupg/";
+/// Native xpm keyring, used when the pacman one is absent (or by preference
+/// through the `gpg_dir` option).
+pub const XPM_GPG_DIR: &str = "/etc/xpm/gnupg/";
 const DEFAULT_CONFIG_PATH: &str = "/etc/xpm.conf";
 
 // ── Configuration structs ───────────────────────────────────────────────────
@@ -70,6 +74,32 @@ pub struct GeneralOptions {
     pub parallel_downloads: u32,
     /// Check available disk space before installing.
     pub check_space: bool,
+}
+
+impl GeneralOptions {
+    /// Keyring directory actually used for signature verification.
+    ///
+    /// Resolution order: the configured `gpg_dir` when it exists, then the
+    /// pacman keyring, then the native xpm keyring, and finally the configured
+    /// value (which produces the most useful error message when nothing
+    /// exists yet).
+    pub fn effective_gpg_dir(&self) -> PathBuf {
+        for candidate in [
+            self.gpg_dir.as_path(),
+            Path::new(DEFAULT_GPG_DIR),
+            Path::new(XPM_GPG_DIR),
+        ] {
+            if candidate.is_dir() {
+                return candidate.to_path_buf();
+            }
+        }
+        self.gpg_dir.clone()
+    }
+
+    /// Path of the trusted-keys file inside [`Self::effective_gpg_dir`].
+    pub fn keyring_path(&self) -> PathBuf {
+        self.effective_gpg_dir().join("trustedkeys.gpg")
+    }
 }
 
 impl Default for GeneralOptions {
@@ -278,6 +308,20 @@ server = ["https://mirror.example.com/archlinux/extra/os/x86_64"]
             config.options.cache_dir,
             PathBuf::from("/var/cache/xpm/pkg/")
         );
+    }
+
+    #[test]
+    fn keyring_path_prefers_existing_configured_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let options = GeneralOptions {
+            gpg_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        assert_eq!(options.effective_gpg_dir(), tmp.path());
+        assert_eq!(options.keyring_path(), tmp.path().join("trustedkeys.gpg"));
+        assert_eq!(DEFAULT_GPG_DIR, "/etc/pacman.d/gnupg/");
+        assert_eq!(XPM_GPG_DIR, "/etc/xpm/gnupg/");
     }
 
     #[test]

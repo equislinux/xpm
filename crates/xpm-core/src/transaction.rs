@@ -95,6 +95,7 @@ pub struct Transaction {
     rollback_counter: usize,
     hooks_chain: Option<HookChain>,
     shell_integration: bool,
+    save_configs: bool,
 }
 
 impl Transaction {
@@ -118,6 +119,7 @@ impl Transaction {
             rollback_counter: 0,
             hooks_chain: None,
             shell_integration: false,
+            save_configs: true,
         })
     }
 
@@ -129,6 +131,12 @@ impl Transaction {
     /// Enable/disable shell integration for non-root installs.
     pub fn set_shell_integration(&mut self, enabled: bool) {
         self.shell_integration = enabled;
+    }
+
+    /// Keep modified configuration files on remove/upgrade (default `true`;
+    /// `false` is `--nosave`).
+    pub fn set_save_configs(&mut self, enabled: bool) {
+        self.save_configs = enabled;
     }
 
     /// Add an install operation to the transaction.
@@ -149,6 +157,33 @@ impl Transaction {
             pkg_version,
             pkg_file,
             metadata: Box::new(None),
+        });
+
+        Ok(())
+    }
+
+    /// Add an upgrade operation: replace `old_version` with `new_version`
+    /// from `new_pkg_file`. Extracted files are written over the existing
+    /// tree; configuration handling and stale-file cleanup happen in the
+    /// hooks (see `hooks::FileExtractionHook`).
+    pub fn add_upgrade(
+        &mut self,
+        pkg_name: String,
+        old_version: String,
+        new_version: String,
+        new_pkg_file: PathBuf,
+    ) -> XpmResult<()> {
+        if self.state != TransactionState::Planning {
+            return Err(XpmError::Package(
+                "can only add operations during planning phase".to_string(),
+            ));
+        }
+
+        self.operations.push(TransactionOp::Upgrade {
+            pkg_name,
+            old_version,
+            new_version,
+            new_pkg_file,
         });
 
         Ok(())
@@ -238,11 +273,12 @@ impl Transaction {
                 }
                 TransactionOp::Upgrade {
                     pkg_name,
+                    old_version,
                     new_version,
                     new_pkg_file,
                     ..
                 } => {
-                    self.execute_upgrade(&pkg_name, &new_version, &new_pkg_file)?;
+                    self.execute_upgrade(&pkg_name, &old_version, &new_version, &new_pkg_file)?;
                 }
             }
         }
@@ -274,9 +310,11 @@ impl Transaction {
                 operation_type: OperationType::Install,
                 pkg_name: pkg_name.to_string(),
                 pkg_version: pkg_version.to_string(),
+                old_version: None,
                 pkg_file: Some(pkg_file.to_path_buf()),
                 root_dir: self.root_dir.clone(),
                 local_db_dir: self.local_db_dir.clone(),
+                save_configs: self.save_configs,
                 shell_integration: self.shell_integration,
             };
             hooks.run(&context)?;
@@ -303,9 +341,11 @@ impl Transaction {
                 operation_type: OperationType::Remove,
                 pkg_name: pkg_name.to_string(),
                 pkg_version: String::new(), // Not needed for remove
+                old_version: None,
                 pkg_file: None,
                 root_dir: self.root_dir.clone(),
                 local_db_dir: self.local_db_dir.clone(),
+                save_configs: self.save_configs,
                 shell_integration: self.shell_integration,
             };
             hooks.run(&context)?;
@@ -323,17 +363,43 @@ impl Transaction {
     }
 
     /// Upgrade a single package (internal - called by commit).
+    ///
+    /// Unlike an install, the old local-database entry stays in place while
+    /// the hooks run: extraction needs the previous manifest/hashes to decide
+    /// whether a configuration file was modified, and the local-db hook only
+    /// rewrites the version at the end.
     fn execute_upgrade(
         &self,
         pkg_name: &str,
+        old_version: &str,
         new_version: &str,
         new_pkg_file: &Path,
     ) -> XpmResult<()> {
-        // Remove old version
-        self.execute_remove(pkg_name)?;
+        if let Some(hooks) = &self.hooks_chain {
+            let context = HookContext {
+                operation_type: OperationType::Upgrade,
+                pkg_name: pkg_name.to_string(),
+                pkg_version: new_version.to_string(),
+                old_version: Some(old_version.to_string()),
+                pkg_file: Some(new_pkg_file.to_path_buf()),
+                root_dir: self.root_dir.clone(),
+                local_db_dir: self.local_db_dir.clone(),
+                save_configs: self.save_configs,
+                shell_integration: self.shell_integration,
+            };
+            hooks.run(&context)?;
+        } else {
+            // Without hooks there is no extraction; at least record the version.
+            let version_file = self.local_db_dir.join(pkg_name).join("version");
+            if version_file.exists() {
+                fs::write(&version_file, new_version)?;
+            }
+        }
 
-        // Install new version
-        self.execute_install(pkg_name, new_version, new_pkg_file)?;
+        self.log(&format!(
+            "upgraded {} {} -> {}",
+            pkg_name, old_version, new_version
+        ))?;
 
         Ok(())
     }

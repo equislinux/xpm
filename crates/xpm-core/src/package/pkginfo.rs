@@ -7,6 +7,18 @@
 use crate::error::XpmError;
 use crate::package::types::PackageMeta;
 
+// ── Helpers ───────────────────────────────────────────────────
+
+/// Normalizes a `backup` entry to the same relative form used by manifests:
+/// no leading `./` or `/`, forward slashes.
+fn normalize_backup_path(raw: &str) -> String {
+    let cleaned = raw.replace('\\', "/");
+    cleaned
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
 // ── Public API ────────────────────────────────────────────────
 
 /// Parse the raw bytes of a `.PKGINFO` file into a [`PackageMeta`].
@@ -56,6 +68,7 @@ pub fn parse_pkginfo(data: &[u8]) -> Result<PackageMeta, XpmError> {
             "provides" => meta.provides.push(value.to_string()),
             "conflict" => meta.conflicts.push(value.to_string()),
             "replaces" => meta.replaces.push(value.to_string()),
+            "backup" => meta.backup.push(normalize_backup_path(value)),
             other => {
                 meta.extra
                     .entry(other.to_string())
@@ -156,6 +169,16 @@ mod tests {
     fn empty_input_returns_error() {
         let result = parse_pkginfo(b"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_backup_entries_are_normalized() {
+        let data = "pkgname = test\nbackup = etc/foo.conf\nbackup = /usr/share/bar.conf\n";
+        let meta = parse_pkginfo(data.as_bytes()).unwrap();
+        assert_eq!(
+            meta.backup,
+            vec!["etc/foo.conf".to_string(), "usr/share/bar.conf".to_string()]
+        );
     }
 
     #[test]

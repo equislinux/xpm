@@ -19,7 +19,7 @@
 //! and `origin`/`version` as `None`; `depends` as `None` and `provides` as
 //! empty.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path};
 
@@ -36,6 +36,11 @@ pub const VERSION_FILE: &str = "version";
 pub const DEPENDS_FILE: &str = "depends";
 /// File name of the provided virtual names.
 pub const PROVIDES_FILE: &str = "provides";
+/// File name of the configuration-file list (`.PKGINFO` `backup` entries).
+pub const BACKUP_FILE: &str = "backup";
+/// File name of the raw `.MTREE` copy, kept for integrity and for deciding
+/// whether a configuration file was modified (`.pacnew`/`.pacsave`).
+pub const MTREE_FILE: &str = "mtree";
 /// First line of a pacman-compatible `files` manifest.
 pub const FILES_HEADER: &str = "%FILES%";
 
@@ -53,6 +58,9 @@ pub fn mtree_paths(entries: &[MtreeEntry]) -> Vec<String> {
         let Some(mut rel) = normalize_mtree_path(&entry.path.to_string_lossy()) else {
             continue;
         };
+        if is_package_metadata_path(&rel) {
+            continue;
+        }
         if entry.file_type == MtreeFileType::Dir && !rel.ends_with('/') {
             rel.push('/');
         }
@@ -62,6 +70,13 @@ pub fn mtree_paths(entries: &[MtreeEntry]) -> Vec<String> {
     }
 
     paths
+}
+
+/// Whether a normalized path is package metadata. Real Arch packages include
+/// `.PKGINFO`/`.BUILDINFO`/`.MTREE` themselves in the `.MTREE`, and these must
+/// never leak into the installed-file manifest (removal would target them).
+fn is_package_metadata_path(path: &str) -> bool {
+    matches!(path, ".PKGINFO" | ".BUILDINFO" | ".MTREE" | ".INSTALL")
 }
 
 fn normalize_mtree_path(raw: &str) -> Option<String> {
@@ -83,6 +98,59 @@ fn normalize_mtree_path(raw: &str) -> Option<String> {
     }
 
     Some(parts.join("/"))
+}
+
+/// Maps normalized paths to their recorded SHA-256 for regular files.
+///
+/// Used to answer "was this configuration file modified since install?" by
+/// comparing the on-disk hash with the one captured in the old `.MTREE`.
+pub fn mtree_hash_map(entries: &[MtreeEntry]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for entry in entries {
+        if entry.file_type != MtreeFileType::File {
+            continue;
+        }
+        let Some(path) = normalize_mtree_path(&entry.path.to_string_lossy()) else {
+            continue;
+        };
+        if is_package_metadata_path(&path) {
+            continue;
+        }
+        if let Some(hash) = &entry.sha256 {
+            map.insert(path, hash.clone());
+        }
+    }
+    map
+}
+
+// ── backup / mtree ────────────────────────────────────────────
+
+/// Writes the package's configuration-file list (`backup` entries).
+pub fn write_backup_list(local_db_dir: &Path, pkg: &str, paths: &[String]) -> XpmResult<()> {
+    write_list(local_db_dir, pkg, BACKUP_FILE, paths)
+}
+
+/// Reads the package's configuration-file list (empty for legacy installs).
+pub fn read_backup_list(local_db_dir: &Path, pkg: &str) -> XpmResult<Vec<String>> {
+    Ok(read_list(local_db_dir, pkg, BACKUP_FILE)?.unwrap_or_default())
+}
+
+/// Stores the raw `.MTREE` of the installed package (plain or gzip-wrapped,
+/// exactly as it was inside the archive).
+pub fn write_mtree(local_db_dir: &Path, pkg: &str, raw: &[u8]) -> XpmResult<()> {
+    let pkg_dir = local_db_dir.join(pkg);
+    fs::create_dir_all(&pkg_dir)?;
+    fs::write(pkg_dir.join(MTREE_FILE), raw)?;
+    Ok(())
+}
+
+/// Reads the stored `.MTREE` bytes, if any.
+pub fn read_mtree(local_db_dir: &Path, pkg: &str) -> XpmResult<Option<Vec<u8>>> {
+    match fs::read(local_db_dir.join(pkg).join(MTREE_FILE)) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ── files ─────────────────────────────────────────────────────
@@ -279,6 +347,69 @@ mod tests {
             raw,
             "%FILES%\nusr/\nusr/bin/\nusr/bin/hello\nusr/lib/libfoo.so\nusr/lib/libfoo.so.1\n"
         );
+    }
+
+    #[test]
+    fn backup_list_roundtrip_and_legacy_empty() {
+        let tmp = TempDir::new().expect("tmp");
+        let local_db = tmp.path().join("local");
+
+        assert!(read_backup_list(&local_db, "legacy")
+            .expect("legacy reads")
+            .is_empty());
+
+        let paths = vec!["etc/foo.conf".to_string(), "etc/bar.conf".to_string()];
+        write_backup_list(&local_db, "hello", &paths).expect("write backup");
+        assert_eq!(read_backup_list(&local_db, "hello").expect("read"), paths);
+    }
+
+    #[test]
+    fn mtree_roundtrip_and_legacy_none() {
+        let tmp = TempDir::new().expect("tmp");
+        let local_db = tmp.path().join("local");
+
+        assert_eq!(read_mtree(&local_db, "legacy").expect("read"), None);
+
+        let raw = b"#mtree\n./etc type=dir mode=0755 uid=0 gid=0\n";
+        write_mtree(&local_db, "hello", raw).expect("write mtree");
+        assert_eq!(
+            read_mtree(&local_db, "hello").expect("read").as_deref(),
+            Some(&raw[..])
+        );
+    }
+
+    #[test]
+    fn metadata_entries_are_never_part_of_the_manifest() {
+        // Real makepkg .MTREE files list .PKGINFO/.BUILDINFO/.MTREE too.
+        let entries = vec![
+            entry("./.PKGINFO", MtreeFileType::File),
+            entry("./.BUILDINFO", MtreeFileType::File),
+            entry("./.MTREE", MtreeFileType::File),
+            entry("./usr/bin/tool", MtreeFileType::File),
+        ];
+        let paths = mtree_paths(&entries);
+        assert_eq!(paths, vec!["usr/bin/tool"]);
+
+        let mut tool = entry("./usr/bin/tool", MtreeFileType::File);
+        tool.sha256 = Some("abc".into());
+        let mut pkginfo = entry("./.PKGINFO", MtreeFileType::File);
+        pkginfo.sha256 = Some("def".into());
+        let map = mtree_hash_map(&[pkginfo, tool]);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("usr/bin/tool"));
+    }
+
+    #[test]
+    fn hash_map_uses_normalized_paths_and_skips_dirs_and_links() {
+        let mut file = entry("./etc/foo.conf", MtreeFileType::File);
+        file.sha256 = Some("aaa".into());
+        let mut dir = entry("./etc", MtreeFileType::Dir);
+        dir.sha256 = Some("ignored".into());
+        let link = entry("./etc/link", MtreeFileType::Link);
+
+        let map = mtree_hash_map(&[file, dir, link]);
+        assert_eq!(map.get("etc/foo.conf").map(String::as_str), Some("aaa"));
+        assert_eq!(map.len(), 1);
     }
 
     #[test]

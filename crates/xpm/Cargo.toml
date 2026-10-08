@@ -17,3 +17,10 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 xpm-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tar = { workspace = true }
+zstd = { workspace = true }
+flate2 = { workspace = true }
+sha2 = { workspace = true }
