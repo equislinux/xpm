@@ -171,6 +171,20 @@ xpm Ql <PACKAGE>
 Implementation note: implemented; reads the `files` manifest recorded at install time (empty
 for legacy installs).
 
+### `history`, `rollback`, `diff` — Journal and generations
+
+- `xpm history [--json]` — recorded transactions, newest first. Finished entries link the
+  generation they produced (`gen:NNNN`, when the state directory is readable).
+- `xpm rollback [--last | --journal <ID>] [--dry-run]` — replay the inverse of a successful
+  transaction using the package cache; aborts before changing anything if an old package file
+  is missing.
+- `xpm diff <GENERATION> [--json]` — compare the installed packages against a generation's
+  `packages.tsv` (`current` resolves the default id).
+
+Configuration files declared with `backup` in `.PKGINFO` follow pacman semantics: `.pacnew` on
+install/upgrade and `.pacsave` on removal (disable with `--nosave`). Pacman-style ALPM hooks
+from `/usr/share/libalpm/hooks` and `/etc/pacman.d/hooks` run around every transaction.
+
 ### `repo` — Repository management
 
 Manages user-added (temporary) repositories. Predefined repositories come from `/etc/xpm.conf`;
@@ -238,7 +252,8 @@ installation root is not `/`, xpm enables shell integration and creates command 
 ## Environment variables and exit codes
 
 `RUST_LOG` is honoured through `tracing-subscriber`'s `EnvFilter` to control log verbosity.
-`docs/CLI.md` additionally documents `XPM_CONFIG`, `XPM_CACHE_DIR`, and `NO_COLOR`.
+`docs/CLI.md` additionally documents `XPM_CONFIG`, `XPM_CACHE_DIR`, `XPM_HOOKS_DIR`,
+`XPM_ALPM_HOOKS_DIRS`, `X_GEN_STATE`, and `NO_COLOR`.
 
 `docs/CLI.md` documents an exit-code matrix (0 success, 1 general error, 2 usage error, up to 7
 database locked). Note that this matrix is documented intent rather than an enforced contract in

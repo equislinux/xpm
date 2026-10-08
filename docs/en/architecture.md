@@ -163,18 +163,32 @@ Enforcement is controlled by `sig_level` from the config (per-repository overrid
 
 `hooks.rs` provides the `Hook` trait and a `HookChain`. The default chain runs, per operation:
 
-1. `MetadataLoadHook` — load package metadata for the operation.
+1. `MetadataLoadHook` — validate/load package metadata for the operation.
 2. `PreScriptletHook` — run `.INSTALL` pre-scriptlets (`pre_install`, `pre_upgrade`,
    `pre_remove`).
-3. `FileExtractionHook` — extract package files with correct ownership.
+3. `FileExtractionHook` — extract package files with correct ownership. Configuration files
+   (`backup` entries) are never silently overwritten: an existing file that differs is kept and
+   the new version is written as `<file>.pacnew`; on upgrades, files dropped by the new version
+   are removed, preserving modified configs as `<file>.pacsave`. The raw `.MTREE` of each
+   install (gzip-wrapped or plain) is stored in the local DB for the next comparison.
 4. `FileRemovalHook` — remove tracked files on uninstall (and prune empty directories outside
-   system root).
+   system root); modified `backup` files become `.pacsave` unless `--nosave`.
 5. `PostScriptletHook` — run `.INSTALL` post-scriptlets (`post_install`, `post_upgrade`,
    `post_remove`).
 6. `LocalDbHook` — register/remove the package in the local database.
 
 Scriptlets are sourced through `bash` with `XPM_ROOT_DIR`, `XPM_PKG_NAME`, and
 `XPM_PKG_VERSION` exported.
+
+Around the transaction, `alpm_hooks.rs` runs pacman-style `.hook` files
+(`/usr/share/libalpm/hooks`, `/etc/pacman.d/hooks`, override with
+`XPM_ALPM_HOOKS_DIRS`): `Operation`/`Type=Package` glob triggers, `Depends`,
+`AbortOnFail` and `NeedsTargets`; pre-hook failures abort when flagged.
+
+The generation integration lives in `journal.rs`/`generations.rs`/`rollback.rs`:
+journals link the generation current after the post hooks, `diff` reads a
+generation's `packages.tsv`, and `rollback` inverts a successful journal using
+the package cache (`cache.rs`).
 
 ## Configuration
 
@@ -207,9 +221,9 @@ Notes:
 
 - If the file does not exist, xpm falls back to built-in defaults (`XpmConfig::default`), whose
   single repository is `x` at `https://equislinux.github.io/x-repo/x/$arch`.
-- The example file and some README/help snippets differ on the GPG directory default: code uses
-  `/etc/pacman.d/gnupg/`, while README guidance uses `/etc/xpm/gnupg/`. This discrepancy is
-  worth reconciling before depending on it.
+- The GPG directory resolves through `effective_gpg_dir()`: the configured `gpg_dir` when it
+  exists, then `/etc/pacman.d/gnupg` (shared with pacman), then `/etc/xpm/gnupg`. The old
+  code/README discrepancy is gone.
 - Config validation rejects `parallel_downloads = 0`, empty repository names, and repositories
   without servers.
 - `sig_level` can be set globally or per repository; the per-repo value wins when present.

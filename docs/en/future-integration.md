@@ -26,8 +26,8 @@ Reasons that would pull xpm (and its companion xpkg) back into scope, per the wo
 - The distro needs the **native `.xp` repository** as the distribution channel (moving away from
   consuming the pacman layout for x packages).
 - The **native install path** is functional (resolver-backed `install` for repo names and local
-  `.xp` files, dependency-aware `upgrade`, `.files` database); remaining pieces are
-  rollback/diff and the native `.xp` repository rollout.
+  `.xp` files, dependency-aware `upgrade`, `.files` database, `rollback`/`diff`, `.pacnew`/
+  `.pacsave`); the remaining piece is the native `.xp` repository rollout.
 - Reproducible, linted packaging (xpkg) with OpenPGP signatures becomes a hard requirement of
   the payload pipeline.
 
@@ -36,21 +36,22 @@ should not add assumptions about xpm being installed.
 
 ## Preconditions before xpm becomes the active path
 
-Code-level gaps that must be addressed when the tool is re-activated (honest, from the repo's
-own roadmap and current `main.rs`):
+Code-level gaps tracked before re-activation. The recovery and hardening items are done
+(2026-10-08); only the production-readiness list below remains open:
 
-1. **Implement rollback and generation diffs.** `install` (repository or local `.xp`) and
-   dependency-aware `upgrade` are wired to the resolver; still pending are `rollback --last`,
-   `diff <generation>` and linking journal entries to generation ids.
-2. **Complete transaction hardening.** The repo roadmap lists open items: `.pacnew`/`.pacsave`
-   configuration-file management, alpm-hooks execution beyond `.INSTALL` scriptlets, upgrade
-   end-to-end test, conflict resolution and rollback tests.
-3. **Close production-readiness milestones** (repo ROADMAP Phase 8 and Phase 9): benchmarks vs
-   pacman, stress testing against a full repository, fuzzing, error-handling audit (partial
-   downloads, corrupt packages, disk full), and post-v1.0 goals (Python bindings, i18n, TUI,
-   smart mirror selection, configurable cache).
-4. **Reconcile config inconsistencies** such as the GPG keyring default
-   (`config.rs` uses `/etc/pacman.d/gnupg/` while README guidance uses `/etc/xpm/gnupg/`).
+1. ~~Implement rollback and generation diffs.~~ Done: `rollback --last/--journal` replays the
+   inverse from the package cache, `diff <generation>` compares against `packages.tsv`, and
+   journals link the generation they produced (`gen:NNNN`).
+2. ~~Complete transaction hardening.~~ Done: `.pacnew`/`.pacsave` by `backup` entries,
+   pacman-style ALPM hooks around transactions, upgrade end-to-end journey and rollback tests.
+3. **Close production-readiness milestones** (repo ROADMAP Phase 8 and Phase 9): scale/stress
+   tests against large repositories are in-suite; a direct benchmark vs pacman needs root and
+   stays manual. Remaining: fuzzing, deeper error-handling audit (partial downloads, corrupt
+   packages, disk full), and post-v1.0 goals (Python bindings, i18n, TUI, smart mirror
+   selection, configurable cache).
+4. ~~Reconcile config inconsistencies~~ (GPG keyring default): resolved via
+   `effective_gpg_dir()` — configured directory, then `/etc/pacman.d/gnupg`, then
+   `/etc/xpm/gnupg`.
 
 ## Integration with xpkg
 

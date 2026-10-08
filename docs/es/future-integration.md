@@ -28,8 +28,8 @@ workspace:
 - La distro necesita el **repositorio `.xp` nativo** como canal de distribución (dejar de
   consumir el layout pacman para los paquetes x).
 - El **camino de instalación nativo** ya es funcional (`install` con resolver para nombres de
-  repo y archivos `.xp` locales, `upgrade` con cierre de dependencias, base `.files`); quedan
-  rollback/diff y el despliegue del repositorio `.xp` nativo.
+  repo y archivos `.xp` locales, `upgrade` con cierre de dependencias, base `.files`,
+  `rollback`/`diff`, `.pacnew`/`.pacsave`); queda el despliegue del repositorio `.xp` nativo.
 - El empaquetado reproducible y con lint (xpkg) con firmas OpenPGP se convierte en un requisito
   duro del pipeline de payload.
 
@@ -38,24 +38,25 @@ no debe añadir suposiciones sobre xpm instalado.
 
 ## Condiciones previas antes de que xpm sea el camino activo
 
-Huecos a nivel de código que deben resolverse cuando la herramienta se reactive (honesto, del
-propio roadmap del repo y del `main.rs` actual):
+Huecos a nivel de código seguidos antes de la reactivación. Los ítems de recuperación y
+endurecimiento están hechos (2026-10-08); sólo queda abierta la lista de preparación para
+producción:
 
-1. **Implementar rollback y diffs de generaciones.** `install` (repo o `.xp` local) y `upgrade`
-   con cierre de dependencias ya usan el resolver; quedan `rollback --last`, `diff <generation>`
-   y enlazar las entradas del journal con ids de generación.
-2. **Completar el endurecimiento de transacciones.** El roadmap del repo lista pendientes:
-   gestión de archivos de configuración `.pacnew`/`.pacsave`, ejecución de alpm-hooks más allá de
-   los scriptlets de `.INSTALL`, test end-to-end de upgrade, y tests de resolución de conflictos
-   y rollback.
+1. ~~Implementar rollback y diffs de generaciones.~~ Hecho: `rollback --last/--journal` reaplica
+   la inversa desde la caché de paquetes, `diff <generation>` compara contra `packages.tsv` y el
+   journal enlaza la generación que produjo (`gen:NNNN`).
+2. ~~Completar el endurecimiento de transacciones.~~ Hecho: `.pacnew`/`.pacsave` por entradas
+   `backup`, alpm-hooks estilo pacman alrededor de las transacciones, journey end-to-end de
+   upgrade y tests de rollback.
 3. **Cerrar los hitos de preparación para producción** (Fase 8 y Fase 9 del ROADMAP del repo):
-   benchmarks frente a pacman, stress testing contra un repositorio completo, fuzzing, auditoría
-   de manejo de errores (descargas parciales, paquetes corruptos, disco lleno) y objetivos
+   los tests de escala/stress contra repositorios grandes ya están en la suite; un benchmark
+   directo contra pacman necesita root y queda manual. Pendiente: fuzzing, auditoría más
+   profunda de errores (descargas parciales, paquetes corruptos, disco lleno) y objetivos
    post-v1.0 (bindings de Python, i18n, TUI, selección inteligente de mirrors, caché
    configurable).
-4. **Reconciliar inconsistencias de configuración** como el default del keyring GPG
-   (`config.rs` usa `/etc/pacman.d/gnupg/` mientras que la guía del README usa
-   `/etc/xpm/gnupg/`).
+4. ~~Reconciliar inconsistencias de configuración~~ (default del keyring GPG): resuelto con
+   `effective_gpg_dir()` — directorio configurado, luego `/etc/pacman.d/gnupg`, luego
+   `/etc/xpm/gnupg`.
 
 ## Integración con xpkg
 

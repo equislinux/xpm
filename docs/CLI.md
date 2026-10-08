@@ -125,13 +125,19 @@ xpm upgrade --ignore pkg1 --ignore pkg2
 
 ### `history` — Transaction Journal
 
-Show the recorded transactions, newest first. Every `install`, `remove` and
-`upgrade` writes a JSON entry under `<db_path>/journal/<epoch>-<pid>.json`
-before touching the filesystem and finalizes it as `ok`/`failed` after the
-commit. `pre-transaction.d`/`post-transaction.d` hooks (default
+Show the recorded transactions, newest first. Every `install`, `remove`,
+`upgrade` and `rollback` writes a JSON entry under
+`<db_path>/journal/<epoch>-<pid>.json` before touching the filesystem and
+finalizes it as `ok`/`failed` after the commit. Each package entry records
+`repo`/`sha256`/`source` provenance, and finished transactions link the
+generation that was current when they ended (`generation`, shown as
+`gen:NNNN` in the summary; read from `<state>/current`, `X_GEN_STATE`
+override). `pre-transaction.d`/`post-transaction.d` hooks (default
 `/usr/lib/xpm/hooks`, override with `XPM_HOOKS_DIR`) run around it with
 `XPM_ROOT_DIR`, `XPM_ACTION`, `XPM_JOURNAL`, `XPM_PKG_NAMES` and
-`XPM_PKG_VERSIONS`. See `GENERATIONS.md`.
+`XPM_PKG_VERSIONS`; the pacman-style ALPM hooks under
+`/usr/share/libalpm/hooks` and `/etc/pacman.d/hooks` run as well. See
+`GENERATIONS.md`.
 
 ```bash
 xpm history [OPTIONS]
@@ -149,7 +155,63 @@ xpm history --json         # One JSON line per transaction
 ```
 
 Transactions left in `running` state (for example after a crash) stay in the
-journal as evidence; the generation layer (`x gen`) is the recovery path.
+journal as evidence; `rollback` handles the package-level recovery and the
+generation layer (`x gen rollback`) the whole-system one.
+
+---
+
+### `rollback` — Undo the Last Transaction
+
+Compute the inverse of the newest successful transaction and replay it using
+the local package cache: installs are undone with removals; removals and
+upgrades with reinstalls of the recorded old versions
+(`<cache_dir>/name-version-*.{xp,pkg.tar.zst}`). If any package file is no
+longer cached the plan aborts **before** changing anything and points to
+`xpm install name=version`. Package-level only: whole-system recovery remains
+`x gen rollback`.
+
+```bash
+xpm rollback [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--last` | Undo the newest successful transaction (default) |
+| `--journal <ID>` | Undo a specific journal id (see `xpm history`) |
+| `--dry-run` | Print the inverse plan without changing anything |
+
+**Examples:**
+
+```bash
+xpm rollback --dry-run            # Show what would be undone
+xpm rollback --last               # Undo the last transaction
+xpm rollback --journal 1727900000-1234
+```
+
+---
+
+### `diff` — Compare Against a Generation
+
+Compare the live local database against the `packages.tsv` capture of a
+generation (`<state>/generations/<id>/packages.tsv`) and report added,
+removed and changed packages. Use `current` for the default generation read
+from `<state>/current`. The state directory is `<root>/var/lib/x` unless
+`X_GEN_STATE` overrides it; unreadable root-only state produces a clear error.
+
+```bash
+xpm diff <GENERATION> [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Emit the diff as a single JSON object |
+
+**Examples:**
+
+```bash
+xpm diff 0003
+xpm diff current --json
+```
 
 ---
 
@@ -378,6 +440,12 @@ xpm usage repos                   # Repository help
 | `xpm files <pkg>` | `pacman -Ql <pkg>` | List files |
 | `xpm Ql <pkg>` | `pacman -Ql <pkg>` | Alias |
 
+xpm-only commands with no pacman equivalent: `history` (transaction journal),
+`rollback` (package-level undo from the cache) and `diff` (comparison against
+an X generation capture). Configuration-file handling follows pacman:
+`.PKGINFO` `backup` entries get `.pacnew` on install/upgrade and `.pacsave` on
+removal (`--nosave` disables the latter).
+
 ---
 
 ## Environment Variables
@@ -387,6 +455,8 @@ xpm usage repos                   # Repository help
 | `XPM_CONFIG` | Override default configuration file path |
 | `XPM_CACHE_DIR` | Override default cache directory |
 | `XPM_HOOKS_DIR` | Override the transaction-hook root (default `/usr/lib/xpm/hooks`) |
+| `XPM_ALPM_HOOKS_DIRS` | Colon-separated ALPM `.hook` directories (default `/usr/share/libalpm/hooks:/etc/pacman.d/hooks`) |
+| `X_GEN_STATE` | Generations state directory (default `<root>/var/lib/x`) used by `history`/`diff` |
 | `NO_COLOR` | Disable colored output (standard) |
 | `RUST_LOG` | Set logging verbosity (e.g., `debug`, `trace`) |
 

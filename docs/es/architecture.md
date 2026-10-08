@@ -169,18 +169,32 @@ plan/prepare/commit:
 
 `hooks.rs` ofrece el trait `Hook` y un `HookChain`. La cadena por defecto ejecuta, por operación:
 
-1. `MetadataLoadHook` — carga los metadatos del paquete para la operación.
+1. `MetadataLoadHook` — valida/carga los metadatos del paquete para la operación.
 2. `PreScriptletHook` — ejecuta los pre-scriptlets de `.INSTALL` (`pre_install`, `pre_upgrade`,
    `pre_remove`).
-3. `FileExtractionHook` — extrae los archivos del paquete con la propiedad correcta.
+3. `FileExtractionHook` — extrae los archivos del paquete con la propiedad correcta. Los
+   archivos de configuración (entradas `backup`) nunca se pisan en silencio: si el archivo
+   existente difiere se conserva y la versión nueva se escribe como `<file>.pacnew`; en
+   upgrades, los archivos que la versión nueva ya no trae se eliminan, preservando los configs
+   modificados como `<file>.pacsave`. El `.MTREE` crudo de cada instalación (gzip o plano) queda
+   guardado en la base local para la siguiente comparación.
 4. `FileRemovalHook` — elimina los archivos trackeados al desinstalar (y poda directorios vacíos
-   fuera de la raíz del sistema).
+   fuera de la raíz del sistema); los `backup` modificados pasan a `.pacsave` salvo `--nosave`.
 5. `PostScriptletHook` — ejecuta los post-scriptlets de `.INSTALL` (`post_install`,
    `post_upgrade`, `post_remove`).
 6. `LocalDbHook` — registra/elimina el paquete en la base de datos local.
 
 Los scriptlets se ejecutan vía `bash` con las variables `XPM_ROOT_DIR`, `XPM_PKG_NAME` y
 `XPM_PKG_VERSION` exportadas.
+
+Alrededor de la transacción, `alpm_hooks.rs` ejecuta los `.hook` estilo pacman
+(`/usr/share/libalpm/hooks`, `/etc/pacman.d/hooks`, override con
+`XPM_ALPM_HOOKS_DIRS`): triggers `Operation`/`Type=Package` con globs, `Depends`,
+`AbortOnFail` y `NeedsTargets`; un pre-hook fallido aborta cuando está marcado.
+
+La integración con generaciones vive en `journal.rs`/`generations.rs`/`rollback.rs`: el journal
+enlaza la generación vigente tras los post-hooks, `diff` lee el `packages.tsv` de una generación
+y `rollback` invierte un journal exitoso usando la caché de paquetes (`cache.rs`).
 
 ## Configuración
 
@@ -213,9 +227,9 @@ Notas:
 
 - Si el archivo no existe, xpm cae a los defaults integrados (`XpmConfig::default`), cuyo único
   repositorio es `x` en `https://equislinux.github.io/x-repo/x/$arch`.
-- El archivo de ejemplo y algunos fragmentos de README/help difieren en el default del
-  directorio GPG: el código usa `/etc/pacman.d/gnupg/`, mientras que la guía del README usa
-  `/etc/xpm/gnupg/`. Conviene reconciliar esta discrepancia antes de depender de ella.
+- El directorio GPG se resuelve con `effective_gpg_dir()`: el `gpg_dir` configurado si existe,
+  luego `/etc/pacman.d/gnupg` (compartido con pacman) y luego `/etc/xpm/gnupg`. La vieja
+  discrepancia código/README ya no existe.
 - La validación de config rechaza `parallel_downloads = 0`, nombres de repo vacíos y
   repositorios sin servidores.
 - `sig_level` puede definirse globalmente o por repositorio; el valor por repo gana si está

@@ -231,6 +231,12 @@ server = [
 
 <p>Optional additional repositories can be appended as extra <code>[[repo]]</code> blocks.</p>
 
+<p>The keyring directory resolves at runtime through <code>effective_gpg_dir()</code>:
+the configured <code>gpg_dir</code> wins when it exists, then the shared pacman keyring
+(<code>/etc/pacman.d/gnupg</code>), then <code>/etc/xpm/gnupg</code>. A dedicated xpm keyring
+(recommended for the signed <code>[x]</code> repository bootstrap below) is therefore just a
+matter of pointing <code>gpg_dir</code> at it and creating it; no duplicate default is required.</p>
+
 <h3 align="center" id="signed-repository-bootstrap">Signed Repository Bootstrap</h3>
 
 <p>To enforce signature verification from the official repository, install the published trusted keyring and switch the repository to <code>required</code> mode:</p>

@@ -174,6 +174,20 @@ xpm Ql <PACKAGE>
 Nota de implementación: implementado; lee el manifiesto `files` registrado al instalar (vacío
 para instalaciones legacy).
 
+### `history`, `rollback`, `diff` — Journal y generaciones
+
+- `xpm history [--json]` — transacciones registradas, la más nueva primero. Las terminadas
+  enlazan la generación que produjeron (`gen:NNNN`, si el directorio de estado es legible).
+- `xpm rollback [--last | --journal <ID>] [--dry-run]` — reaplica la inversa de una transacción
+  exitosa usando la caché de paquetes; aborta antes de tocar nada si falta un paquete viejo.
+- `xpm diff <GENERATION> [--json]` — compara los paquetes instalados contra el `packages.tsv`
+  de una generación (`current` resuelve el id por defecto).
+
+Los archivos de configuración declarados con `backup` en `.PKGINFO` siguen la semántica de
+pacman: `.pacnew` al instalar/actualizar y `.pacsave` al eliminar (se desactiva con `--nosave`).
+Los hooks estilo pacman de `/usr/share/libalpm/hooks` y `/etc/pacman.d/hooks` corren alrededor de
+cada transacción.
+
 ### `repo` — Gestión de repositorios
 
 Gestiona los repositorios añadidos por el usuario (temporales). Los predefinidos vienen de
@@ -241,8 +255,8 @@ raíz de instalación no es `/`, xpm activa la integración de shell y crea shim
 ## Variables de entorno y códigos de salida
 
 `RUST_LOG` se respeta a través del `EnvFilter` de `tracing-subscriber` para controlar la
-verbosidad de los logs. `docs/CLI.md` documenta además `XPM_CONFIG`, `XPM_CACHE_DIR` y
-`NO_COLOR`.
+verbosidad de los logs. `docs/CLI.md` documenta además `XPM_CONFIG`, `XPM_CACHE_DIR`,
+`XPM_HOOKS_DIR`, `XPM_ALPM_HOOKS_DIRS`, `X_GEN_STATE` y `NO_COLOR`.
 
 `docs/CLI.md` documenta una matriz de códigos de salida (0 éxito, 1 error general, 2 error de
 uso, hasta 7 base de datos bloqueada). Nota: esa matriz es intención documentada más que un
