@@ -3419,6 +3419,7 @@ dependencies = [
  "anyhow",
  "clap",
  "flate2",
+ "libc",
  "sha2",
  "tar",
  "tempfile",

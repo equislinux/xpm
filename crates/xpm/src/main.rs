@@ -37,6 +37,13 @@ use xpm_core::{HookChain, Transaction};
 use xpm_core::{XpmConfig, XpmError, XpmResult};
 
 fn main() -> Result<()> {
+    // Rust ignores SIGPIPE by default, so `xpm ... | head` panics with a
+    // broken-pipe error; restore the default handler like other CLIs.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     // ── Initialize logging ──────────────────────────────────────────────

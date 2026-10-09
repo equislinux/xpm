@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 xpm-core = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
