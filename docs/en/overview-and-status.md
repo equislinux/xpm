@@ -1,8 +1,8 @@
 # xpm — Overview and Status
 
-This document describes what `xpm` is, where it sits inside the X ecosystem, and its honest
-current status within the reboot initiative. It is based on the repository contents as they are
-today (README.md, ROADMAP.md, source code, tests, docs/), not on an intended future state.
+This document describes what `xpm` is, where it sits inside the X ecosystem, and its current
+status in the toolchain. It is based on the repository contents as they are today (README.md,
+ROADMAP.md, source code, tests, docs/), not on an intended future state.
 
 ---
 
@@ -25,42 +25,38 @@ It is designed as a native Rust replacement for `pacman` and `libalpm`:
 The project belongs to the `equislinux` organization. Packages are built by the companion builder
 tool `xpkg` (repo `equislinux/xpkg`); `xpm` consumes what `xpkg` produces.
 
-## Position in the x-lnux workspace
+## Where xpm sits
 
-The workspace `/home/x0z/Documents/repos/x-lnux` is not a single repository; each folder is an
-independent GitHub repo with its own origin. The relevant folders are:
+Each component lives in its own GitHub repository under `equislinux`:
 
 | Folder    | Repo             | Role |
 |-----------|------------------|------|
 | `x`       | `equislinux/x`        | The distro (archiso build of image/ISO and provisioning) |
-| `scripts` | `equislinux/scripts`  | System kickstart / provisioning scripts |
+| `scripts` | `equislinux/scripts`  | System provisioning payload and the `x` CLI |
 | `xpkg`    | `equislinux/xpkg`     | Rust packaging tool (builder) |
 | `xpm`     | `equislinux/xpm`      | Rust package manager (this repo) |
-| `x-repo`  | `equislinux/x-repo`   | Package repository and portal |
+| `x-repo`  | `equislinux/x-repo`   | Package repositories (pacman `[x]` and native `.xp`) and portals |
 
-This repo follows the shared conventions of the workspace: work for the reboot initiative lives
-on the `x/reboot` branch of each repo, commits stay local (no push), and messages carry no emojis
-or external-tool references.
+## Current status
 
-## Current status (honest)
+`xpm` is wired end to end, and the native `.xp` endpoint it serves is live:
 
-The repository exists, compiles, and carries a substantial test suite (unit tests across both
-crates plus integration tests under `tests/`). Within the reboot initiative, however, `xpm` is
-**de-prioritised**:
+- The SAT resolver runs inside `install` and `upgrade`: dependency closure, dependency order,
+  `name=version` requirements and unversioned `provides`.
+- Local `.xp` installs, package removal and dependency-aware upgrades work through the same
+  transaction engine; `sync`/`search` read the local and sync databases.
+- The endpoint at `https://equislinux.github.io/x-repo/x/$arch` (built by `x-repo`'s
+  `scripts/build-xp.sh`, separate from the pacman endpoint under `/repo/x86_64`) was validated
+  with `xpm sync/search/deps/install` against the published URL.
+- The system itself is still provisioned with **pacman + the signed `[x]` repository** —
+  `xpm` coexists as the native channel rather than replacing the production flow.
 
-- The workspace-level ROADMAP marks **Phase 4 "Tooling Rust (xpm/xpkg)" as postponed**
-  (`POSPUESTA`). By maintainer decision, xpm/xpkg is out of the current scope.
-- Today the distro payload is packaged as the `x-scripts` package using a **PKGBUILD + makepkg**
-  flow and is published to `x-repo` through the **pacman-compatible repository**. Consumption on
-  installed systems goes through pacman, not through xpm.
-- `xpm` is therefore **not yet the active path** in the reboot flow. It is a functioning
-  tooling codebase with its own internal roadmap, waiting to be revisited when the native `.xp`
-  repository is actually required (the SAT resolver is already wired into `install`).
+Known open issues (tracked in this repo):
 
-The repository still publishes its own binaries as `.xp` packages in the xpm-native tree (see the
-README for the key bootstrap and signature checklist), which is separate from the pacman path
-used in production today. The two layouts must not be confused: the xpm-native endpoint is
-`https://equislinux.github.io/x-repo/x/$arch`, not the pacman endpoint under `/repo/x86_64`.
+1. Resolver: `Unsolvable(Conflict)` for packages that depend on `gcc-libs` (dependency cycle)
+   even on a clean root.
+2. Extraction: hardlink extraction fails on some real Arch packages (`zoneinfo` files under
+   `usr/share/zoneinfo/`).
 
 ## Internal roadmap and milestones
 
@@ -89,7 +85,7 @@ The versioning convention in the repo roadmap is:
 | `v0.8.0` | Phases 6-7 complete (security + transactions) |
 | `v1.0.0` | Phase 8 complete (benchmarked, tested, production-ready) |
 
-The workspace `Cargo.toml` currently reports version `0.1.0`.
+The `Cargo.toml` currently reports version `0.1.0`.
 
 ## About the command state
 
