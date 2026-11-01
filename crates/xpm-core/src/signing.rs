@@ -41,6 +41,44 @@ pub fn verify_file(file_path: &Path, sig_path: &Path, certs: &[Cert]) -> XpmResu
     verify_detached(&data, &sig, certs)
 }
 
+/// Verify a detached signature with GnuPG against a binary keyring.
+///
+/// Sequoia's policy rejects some valid Arch packager keys ("no binding
+/// signature at time ..."), while GnuPG verifies them. pacman itself uses
+/// gpgme, so this is also the closest compatibility path.
+pub fn verify_with_gpg(
+    file_path: &Path,
+    sig_path: &Path,
+    keyring_path: &Path,
+) -> XpmResult<VerifyOutcome> {
+    let gpg = std::process::Command::new("gpg")
+        .args(["--batch", "--no-tty", "--no-default-keyring", "--keyring"])
+        .arg(keyring_path)
+        .arg("--verify")
+        .arg(sig_path)
+        .arg(file_path)
+        .output()
+        .map_err(|e| XpmError::SignatureError(format!("failed to run gpg: {e}")))?;
+
+    if gpg.status.success() {
+        return Ok(VerifyOutcome::Good {
+            key_id: "gpg".to_string(),
+        });
+    }
+
+    let stderr = String::from_utf8_lossy(&gpg.stderr);
+    if stderr.contains("NO_PUBKEY") || stderr.contains("Can't check signature") {
+        return Ok(VerifyOutcome::UnknownKey);
+    }
+    Ok(VerifyOutcome::Bad {
+        reason: stderr
+            .lines()
+            .next()
+            .unwrap_or("gpg verification failed")
+            .to_string(),
+    })
+}
+
 fn verify_detached(data: &[u8], sig_bytes: &[u8], certs: &[Cert]) -> XpmResult<VerifyOutcome> {
     let policy = StandardPolicy::new();
     let helper = VHelper::new(certs);

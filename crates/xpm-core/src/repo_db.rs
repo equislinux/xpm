@@ -29,6 +29,7 @@ pub struct RepoEntry {
     pub provides: Vec<String>,
     pub conflicts: Vec<String>,
     pub replaces: Vec<String>,
+    pub groups: Vec<String>,
     pub files: Vec<String>,
 }
 
@@ -260,11 +261,12 @@ fn repo_entry_from_sections(
         provides: values(sections, "PROVIDES"),
         conflicts: values(sections, "CONFLICTS"),
         replaces: values(sections, "REPLACES"),
+        groups: values(sections, "GROUPS"),
         files: Vec::new(),
     })
 }
 
-fn first_value(sections: &HashMap<String, Vec<String>>, key: &str) -> Option<String> {
+pub(crate) fn first_value(sections: &HashMap<String, Vec<String>>, key: &str) -> Option<String> {
     sections.get(key).and_then(|values| values.first()).cloned()
 }
 
@@ -272,7 +274,7 @@ fn values(sections: &HashMap<String, Vec<String>>, key: &str) -> Vec<String> {
     sections.get(key).cloned().unwrap_or_default()
 }
 
-fn parse_alpm_sections(input: &str) -> HashMap<String, Vec<String>> {
+pub(crate) fn parse_alpm_sections(input: &str) -> HashMap<String, Vec<String>> {
     let mut map = HashMap::<String, Vec<String>>::new();
     let mut current: Option<String> = None;
 

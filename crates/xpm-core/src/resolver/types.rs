@@ -3,7 +3,7 @@
 //! Provides the package pool that interns names, version sets, and solvables,
 //! and the bridge types between xpm's package model and resolvo's ID-based system.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use resolvo::{ArenaId, NameId, SolvableId, StringId, VersionSetId, VersionSetUnionId};
 
@@ -76,6 +76,10 @@ pub struct PackagePool {
     pub(crate) solvables: Vec<PackageCandidate>,
     /// package name → list of solvable ids
     pub(crate) name_to_solvables: HashMap<NameId, Vec<SolvableId>>,
+    /// NameId → preferred (installed) candidate for that name.
+    pub(crate) favored: HashMap<NameId, SolvableId>,
+    /// Solvables that represent already-installed packages.
+    pub(crate) installed: HashSet<SolvableId>,
 
     // ── Version sets ─────────────────────────────────────────
     /// VersionSetId → entry
@@ -100,6 +104,8 @@ impl PackagePool {
             id_to_name: Vec::new(),
             solvables: Vec::new(),
             name_to_solvables: HashMap::new(),
+            favored: HashMap::new(),
+            installed: HashSet::new(),
             version_sets: Vec::new(),
             version_set_unions: Vec::new(),
             strings: Vec::new(),
@@ -170,12 +176,33 @@ impl PackagePool {
         self.name_to_solvables.get(&name_id).map(|v| v.as_slice())
     }
 
+    /// Mark a solvable as representing an already-installed package.
+    pub fn mark_installed(&mut self, solvable: SolvableId) {
+        self.installed.insert(solvable);
+    }
+
+    /// Whether a solvable represents an already-installed package.
+    pub fn is_installed(&self, solvable: SolvableId) -> bool {
+        self.installed.contains(&solvable)
+    }
+
+    /// Prefer `solvable` for `name_id` when the solver can satisfy a
+    /// requirement with it (installed packages are kept when possible).
+    pub fn set_favored(&mut self, name_id: NameId, solvable: SolvableId) {
+        self.favored.entry(name_id).or_insert(solvable);
+    }
+
+    /// Preferred (installed) candidate for a name, if any.
+    pub fn favored_for(&self, name_id: NameId) -> Option<SolvableId> {
+        self.favored.get(&name_id).copied()
+    }
+
     /// Register a candidate under the names of the virtual packages it
     /// provides, so dependencies on those names can be satisfied.
     ///
-    /// Version constraints on versioned provides are matched against the
-    /// provider's own version (documented simplification until provides
-    /// carry their own version sets).
+    /// Version matching is done by [`super::XpmProvider::filter_candidates`],
+    /// which compares versioned dependencies against the provision's own
+    /// version (libalpm `provides` semantics), not the package version.
     pub fn add_provides(&mut self, solvable: SolvableId, provides: &[DepConstraint]) {
         for provide in provides {
             let name_id = self.intern_name(&provide.name);

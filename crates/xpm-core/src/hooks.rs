@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,6 +32,18 @@ pub trait Hook: Send + Sync {
 }
 
 /// Context passed to hooks during execution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptletMode {
+    /// Run when the target shell exists; skip with a warning otherwise.
+    #[default]
+    Auto,
+    /// Never run package scriptlets.
+    Skip,
+    /// Fail the transaction if a scriptlet cannot run or exits nonzero.
+    Require,
+}
+
 #[derive(Clone, Debug)]
 pub struct HookContext {
     pub operation_type: OperationType,
@@ -45,6 +58,7 @@ pub struct HookContext {
     /// Keep modified configuration files on remove/upgrade (`--nosave` disables).
     pub save_configs: bool,
     pub shell_integration: bool,
+    pub scriptlet_mode: ScriptletMode,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -119,24 +133,59 @@ impl Hook for FileExtractionHook {
         let mut installed_files: Vec<String> = Vec::new();
         let mut shell_shims: Vec<PathBuf> = Vec::new();
         let mut pacnew_files: Vec<String> = Vec::new();
+        let mut deferred_hardlinks: Vec<(PathBuf, PathBuf, EntryAttrs)> = Vec::new();
 
         for entry in archive.entries()? {
             let mut entry = entry?;
             let path = entry.path()?.to_path_buf();
             let normalized = normalize_archive_path(&path);
 
-            // Skip metadata files and directories.
-            if normalized.is_empty() || is_metadata_path(&normalized) || normalized.ends_with('/') {
+            if normalized.is_empty() || is_metadata_path(&normalized) {
                 continue;
             }
 
-            let is_regular_file = entry.header().entry_type().is_file();
-            let mode = entry.header().mode().unwrap_or(0);
-            let is_executable = mode & 0o111 != 0;
+            let entry_type = entry.header().entry_type();
+            let attrs = read_entry_attrs(&mut entry)?;
+
+            if entry_type.is_dir() {
+                let dir_path = context.root_dir.join(normalized.trim_end_matches('/'));
+                ensure_no_symlink_ancestors(&context.root_dir, &dir_path)?;
+                if let Ok(metadata) = fs::symlink_metadata(&dir_path) {
+                    if metadata.file_type().is_symlink() {
+                        return Err(XpmError::Package(format!(
+                            "refusing to replace symlink {} with a directory",
+                            dir_path.display()
+                        )));
+                    }
+                }
+                fs::create_dir_all(&dir_path)?;
+                apply_entry_attrs(&dir_path, &attrs, false)?;
+                let mut manifest_path = normalized.clone();
+                if !manifest_path.ends_with('/') {
+                    manifest_path.push('/');
+                }
+                installed_files.push(manifest_path);
+                continue;
+            }
+
+            let is_regular_file = entry_type.is_file();
+            let is_executable = attrs.mode & 0o111 != 0;
             let target = context.root_dir.join(&normalized);
 
+            ensure_no_symlink_ancestors(&context.root_dir, &target)?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
+            }
+
+            if entry_type.is_hard_link() {
+                let link = entry.link_name()?.ok_or_else(|| {
+                    XpmError::Package(format!("hardlink entry {} has no link target", normalized))
+                })?;
+                let link_normalized = normalize_archive_path(&link);
+                let link_target = context.root_dir.join(&link_normalized);
+                ensure_no_symlink_ancestors(&context.root_dir, &link_target)?;
+                deferred_hardlinks.push((target, link_target, attrs));
+                continue;
             }
 
             let write_pacnew = is_regular_file
@@ -151,11 +200,24 @@ impl Hook for FileExtractionHook {
             if write_pacnew {
                 let pacnew = append_suffix(&target, PACNEW_SUFFIX);
                 entry.unpack(&pacnew)?;
+                apply_entry_attrs(&pacnew, &attrs, entry_type.is_symlink())?;
                 pacnew_files.push(normalized.clone());
                 continue;
             }
 
+            if let Ok(metadata) = fs::symlink_metadata(&target) {
+                if metadata.file_type().is_symlink() {
+                    fs::remove_file(&target)?;
+                } else if metadata.is_dir() && !entry_type.is_dir() {
+                    return Err(XpmError::Package(format!(
+                        "not overwriting directory with file: {}",
+                        target.display()
+                    )));
+                }
+            }
+
             entry.unpack(&target)?;
+            apply_entry_attrs(&target, &attrs, entry_type.is_symlink())?;
             installed_files.push(normalized.clone());
 
             // For non-root installations, create shims in ~/.local/bin for
@@ -168,6 +230,20 @@ impl Hook for FileExtractionHook {
                 if let Some(shim) = ensure_shell_shim(&normalized, &target)? {
                     shell_shims.push(shim);
                 }
+            }
+        }
+
+        for (target, source, attrs) in deferred_hardlinks {
+            fs::hard_link(&source, &target).map_err(|err| {
+                XpmError::Package(format!(
+                    "failed to create hardlink {} -> {}: {err}",
+                    target.display(),
+                    source.display()
+                ))
+            })?;
+            apply_entry_attrs(&target, &attrs, false)?;
+            if let Ok(relative) = target.strip_prefix(&context.root_dir) {
+                installed_files.push(relative.to_string_lossy().into_owned());
             }
         }
 
@@ -277,19 +353,156 @@ fn open_package_archive(pkg_file: &Path) -> XpmResult<tar::Archive<Box<dyn Read>
 
 /// Normalizes an archive path to the manifest form (`etc/foo.conf`).
 /// A trailing `/` (directory entries) is preserved on purpose.
+fn ensure_no_symlink_ancestors(root: &Path, target: &Path) -> XpmResult<()> {
+    let relative = target.strip_prefix(root).map_err(|_| {
+        XpmError::Package(format!(
+            "target {} is outside the installation root {}",
+            target.display(),
+            root.display()
+        ))
+    })?;
+    let components: Vec<_> = relative.components().collect();
+    let mut current = root.to_path_buf();
+
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(XpmError::Package(format!(
+                    "refusing to extract through symlink {}",
+                    current.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(XpmError::Package(format!(
+                    "path component is not a directory: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(())
+}
+
+struct EntryAttrs {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: i64,
+    xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+fn read_entry_attrs<R: Read>(entry: &mut tar::Entry<R>) -> XpmResult<EntryAttrs> {
+    let header = entry.header();
+    let mode = header.mode().unwrap_or(0o644) & 0o7777;
+    let uid = header.uid().unwrap_or(0) as u32;
+    let gid = header.gid().unwrap_or(0) as u32;
+    let mtime = header.mtime().unwrap_or(0) as i64;
+    let mut xattrs = Vec::new();
+
+    if let Some(extensions) = entry.pax_extensions()? {
+        for extension in extensions {
+            let extension = extension?;
+            let key = extension.key_bytes();
+            if let Some(name) = key.strip_prefix(b"SCHILY.xattr.") {
+                if !name.is_empty() {
+                    xattrs.push((name.to_vec(), extension.value_bytes().to_vec()));
+                }
+            }
+        }
+    }
+
+    Ok(EntryAttrs {
+        mode,
+        uid,
+        gid,
+        mtime,
+        xattrs,
+    })
+}
+
+fn apply_entry_attrs(path: &Path, attrs: &EntryAttrs, symlink: bool) -> XpmResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| XpmError::Package(format!("path contains NUL: {}", path.display())))?;
+
+    // chown clears setuid/setgid bits, so ownership must be applied before the
+    // final mode. This is why sudo and other setuid binaries lost their bits.
+    if unsafe { libc::geteuid() } == 0 {
+        let rc = unsafe { libc::lchown(path_c.as_ptr(), attrs.uid, attrs.gid) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+
+    if !symlink {
+        fs::set_permissions(path, fs::Permissions::from_mode(attrs.mode))?;
+    }
+
+    let times = [
+        libc::timespec {
+            tv_sec: attrs.mtime as libc::time_t,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: attrs.mtime as libc::time_t,
+            tv_nsec: 0,
+        },
+    ];
+    let flags = if symlink {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), flags) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    for (name, value) in &attrs.xattrs {
+        let name_c = std::ffi::CString::new(name.as_slice()).map_err(|_| {
+            XpmError::Package(format!("xattr name contains NUL on {}", path.display()))
+        })?;
+        let rc = unsafe {
+            libc::lsetxattr(
+                path_c.as_ptr(),
+                name_c.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+
+    Ok(())
+}
+
 fn normalize_archive_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .to_string()
+    let raw = path.to_string_lossy();
+    let mut normalized = raw.as_ref();
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped;
+    }
+    normalized.to_string()
 }
 
 /// Whether the entry is package metadata rather than payload.
+///
+/// Only top-level metadata files are special; `usr/share/foo.PKGINFO` is a
+/// normal package file.
 fn is_metadata_path(normalized: &str) -> bool {
-    normalized.ends_with(".PKGINFO")
-        || normalized.ends_with(".BUILDINFO")
-        || normalized.ends_with(".MTREE")
-        || normalized.ends_with(".INSTALL")
+    matches!(
+        normalized,
+        ".PKGINFO" | ".BUILDINFO" | ".MTREE" | ".INSTALL"
+    )
 }
 
 /// Builds the `path -> sha256` map from raw `.MTREE` bytes.
@@ -495,56 +708,182 @@ fn load_install_script(context: &HookContext) -> XpmResult<Option<Vec<u8>>> {
     Ok(None)
 }
 
+fn script_defines_function(script_data: &[u8], function: &str) -> bool {
+    let text = String::from_utf8_lossy(script_data);
+    text.lines().any(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("function ").unwrap_or(line);
+        line.strip_prefix(function)
+            .map(|rest| rest.trim_start().starts_with("()"))
+            .unwrap_or(false)
+    })
+}
+
 fn run_scriptlet_functions(
     context: &HookContext,
     script_data: &[u8],
     functions: &[&str],
 ) -> XpmResult<()> {
-    let tmp_script = context
-        .local_db_dir
-        .join(format!(".{}.install.tmp", context.pkg_name));
-    fs::write(&tmp_script, script_data)?;
-
-    let shell = r#"set -euo pipefail
-script_path="$1"
-shift
-source "$script_path"
-for fn in "$@"; do
-  if declare -F "$fn" >/dev/null 2>&1; then
-    "$fn"
-  fi
-done
-"#;
-
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(shell)
-        .arg("xpm-scriptlet")
-        .arg(&tmp_script)
-        .args(functions)
-        .current_dir(&context.root_dir)
-        .env("XPM_ROOT_DIR", &context.root_dir)
-        .env("XPM_PKG_NAME", &context.pkg_name)
-        .env("XPM_PKG_VERSION", &context.pkg_version)
-        .status();
-
-    let _ = fs::remove_file(&tmp_script);
-
-    let status = status.map_err(|e| {
-        XpmError::Package(format!(
-            "failed to execute .INSTALL script for '{}': {}",
-            context.pkg_name, e
-        ))
-    })?;
-
-    if !status.success() {
-        return Err(XpmError::Package(format!(
-            ".INSTALL script failed for '{}' with status {}",
-            context.pkg_name, status
-        )));
+    let Some(function) = functions.first().copied() else {
+        return Ok(());
+    };
+    if !script_defines_function(script_data, function) {
+        return Ok(());
     }
 
-    Ok(())
+    if context.scriptlet_mode == ScriptletMode::Skip {
+        tracing::debug!(package = %context.pkg_name, "scriptlets disabled; skipping");
+        return Ok(());
+    }
+
+    let chrooted = context.root_dir != Path::new("/");
+    if chrooted && !context.root_dir.join("bin/sh").exists() {
+        let message = format!(
+            "target {} has no /bin/sh; cannot run .INSTALL scriptlet for {}",
+            context.root_dir.display(),
+            context.pkg_name
+        );
+        if context.scriptlet_mode == ScriptletMode::Require {
+            return Err(XpmError::Package(message));
+        }
+        tracing::warn!(
+            package = %context.pkg_name,
+            root = %context.root_dir.display(),
+            "skipping .INSTALL script: target has no /bin/sh (no host fallback)"
+        );
+        return Ok(());
+    }
+
+    let tmp_root = context.root_dir.join("tmp");
+    if !tmp_root.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o1777).recursive(true);
+        builder.create(&tmp_root)?;
+    }
+    let unique = format!(
+        ".xpm-scriptlet-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp_dir = tmp_root.join(&unique);
+    fs::create_dir(&tmp_dir)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let script_path = tmp_dir.join(".INSTALL");
+    fs::write(&script_path, script_data)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o644))?;
+    }
+
+    let inside_script = format!("/tmp/{unique}/.INSTALL");
+    let mut args = vec![context.pkg_version.clone()];
+    if function.contains("upgrade") {
+        args.push(context.old_version.clone().unwrap_or_default());
+    }
+    let quoted_args = args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = format!(
+        ". {script}; if [ -n \"$(command -v {function})\" ]; then {function} {args}; fi",
+        script = shell_quote(&inside_script),
+        function = shell_quote(function),
+        args = quoted_args,
+    );
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(&command);
+    cmd.env_clear()
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin")
+        .env("HOME", "/root")
+        .env("SHELL", "/bin/sh")
+        .env("LANG", "C")
+        .env("SHLVL", "1")
+        .env("XPM_ROOT_DIR", "/")
+        .env("XPM_PKG_NAME", &context.pkg_name)
+        .env("XPM_PKG_VERSION", &context.pkg_version);
+
+    if chrooted {
+        use std::ffi::CString;
+        use std::os::unix::process::CommandExt;
+        let root = CString::new(context.root_dir.as_os_str().as_bytes()).map_err(|_| {
+            XpmError::Package(format!(
+                "root path contains NUL: {}",
+                context.root_dir.display()
+            ))
+        })?;
+        let root_path = root.clone();
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::umask(0o022);
+                if libc::chroot(root_path.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::chdir(c"/".as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        cmd.current_dir("/");
+    }
+
+    let result = cmd.status();
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            if context.scriptlet_mode == ScriptletMode::Require {
+                return Err(XpmError::Package(format!(
+                    "package scriptlet for {} exited with {status}",
+                    context.pkg_name
+                )));
+            }
+            tracing::warn!(
+                package = %context.pkg_name,
+                status = %status,
+                "package scriptlet failed; continuing (pacman-compatible)"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            if context.scriptlet_mode == ScriptletMode::Require {
+                return Err(XpmError::Package(format!(
+                    "could not execute package scriptlet for {}: {error}",
+                    context.pkg_name
+                )));
+            }
+            tracing::warn!(
+                package = %context.pkg_name,
+                error = %error,
+                "could not execute package scriptlet; continuing (pacman-compatible)"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn ensure_shell_shim(relative_path: &str, target: &Path) -> XpmResult<Option<PathBuf>> {
@@ -638,6 +977,54 @@ impl Hook for LocalDbHook {
                     fs::remove_dir_all(pkg_dir)?;
                 }
                 Ok(())
+            }
+        }
+    }
+}
+
+/// Mirror package database changes into pacman's local database.
+///
+/// Added to the transaction only when a pacman database is configured; runs
+/// after [`LocalDbHook`] so xpm's metadata is available and before the ALPM
+/// post-transaction hooks, keeping generation captures consistent.
+pub struct PacmanDbHook {
+    pacman_local: PathBuf,
+    root_dir: PathBuf,
+}
+
+impl PacmanDbHook {
+    pub fn new(pacman_local: PathBuf, root_dir: PathBuf) -> Self {
+        Self {
+            pacman_local,
+            root_dir,
+        }
+    }
+}
+
+impl Hook for PacmanDbHook {
+    fn name(&self) -> &str {
+        "pacman-db"
+    }
+
+    fn run(&self, context: &HookContext) -> XpmResult<()> {
+        match context.operation_type {
+            OperationType::Install | OperationType::Upgrade => {
+                let reason = crate::install_reason::InstallReason::read(
+                    &context.local_db_dir,
+                    &context.pkg_name,
+                );
+                crate::pacman_db::mirror_entry(
+                    &self.pacman_local,
+                    &context.local_db_dir,
+                    &context.pkg_name,
+                    &context.pkg_version,
+                    reason,
+                    context.pkg_file.as_deref(),
+                    &self.root_dir,
+                )
+            }
+            OperationType::Remove => {
+                crate::pacman_db::remove_entry(&self.pacman_local, &context.pkg_name)
             }
         }
     }
@@ -909,6 +1296,7 @@ mod tests {
             local_db_dir: db_tmp.path().to_path_buf(),
             save_configs: true,
             shell_integration: false,
+            scriptlet_mode: ScriptletMode::Auto,
         };
 
         (root_tmp, db_tmp, ctx)
@@ -923,23 +1311,108 @@ mod tests {
 
     #[test]
     fn post_scriptlet_hook_runs_post_install() {
-        let (root, db_tmp, mut ctx) = test_context(OperationType::Install);
+        let (_root, db_tmp, mut ctx) = test_context(OperationType::Install);
         let hook = PostScriptletHook;
         ctx.pkg_file = None;
+        ctx.root_dir = PathBuf::from("/");
 
+        let marker = std::env::temp_dir().join(format!(
+            "xpm-scriptlet-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         let pkg_dir = db_tmp.path().join(&ctx.pkg_name);
         fs::create_dir_all(&pkg_dir).expect("create pkg dir");
         fs::write(
             pkg_dir.join("install"),
-            "post_install() { touch \"$XPM_ROOT_DIR/scriptlet-ok\"; }\n",
+            format!("post_install() {{ touch '{}'; }}\n", marker.display()),
         )
         .expect("write install script");
 
         hook.run(&ctx).expect("run scriptlet hook");
-        assert!(
-            root.path().join("scriptlet-ok").exists(),
-            "post_install should create marker file"
+        assert!(marker.exists(), "post_install should create marker file");
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn scriptlet_modes_handle_missing_target_shell() {
+        let (root, db_tmp, mut ctx) = test_context(OperationType::Install);
+        ctx.pkg_file = None;
+
+        let pkg_dir = db_tmp.path().join(&ctx.pkg_name);
+        fs::create_dir_all(&pkg_dir).expect("pkg dir");
+        fs::write(
+            pkg_dir.join("install"),
+            "post_install() { touch /should-not-run; }\n",
+        )
+        .expect("install script");
+
+        ctx.scriptlet_mode = ScriptletMode::Auto;
+        PostScriptletHook
+            .run(&ctx)
+            .expect("auto skips without shell");
+        assert!(!root.path().join("should-not-run").exists());
+
+        ctx.scriptlet_mode = ScriptletMode::Require;
+        let err = PostScriptletHook
+            .run(&ctx)
+            .expect_err("require fails without shell");
+        assert!(format!("{err}").contains("/bin/sh"));
+
+        ctx.scriptlet_mode = ScriptletMode::Skip;
+        PostScriptletHook.run(&ctx).expect("skip never runs");
+        assert!(!root.path().join("should-not-run").exists());
+    }
+
+    #[test]
+    fn missing_scriptlet_function_does_not_require_a_shell() {
+        let (_root, db_tmp, mut ctx) = test_context(OperationType::Install);
+        ctx.pkg_file = None;
+        ctx.scriptlet_mode = ScriptletMode::Require;
+
+        let pkg_dir = db_tmp.path().join(&ctx.pkg_name);
+        fs::create_dir_all(&pkg_dir).expect("pkg dir");
+        fs::write(
+            pkg_dir.join("install"),
+            "post_install() { touch /never; }\n",
+        )
+        .expect("install script");
+
+        PreScriptletHook
+            .run(&ctx)
+            .expect("pre_install is absent, so no shell is required");
+    }
+
+    #[test]
+    fn normalize_archive_path_preserves_dotfiles_and_backslashes() {
+        assert_eq!(
+            normalize_archive_path(Path::new("./usr/bin/foo")),
+            "usr/bin/foo"
         );
+        assert_eq!(normalize_archive_path(Path::new("./.hidden")), ".hidden");
+        assert_eq!(
+            normalize_archive_path(Path::new("usr/bin/a\\b")),
+            "usr/bin/a\\b"
+        );
+        assert!(!is_metadata_path("usr/share/foo.PKGINFO"));
+        assert!(is_metadata_path(".PKGINFO"));
+    }
+
+    #[test]
+    fn extraction_rejects_symlink_ancestors() {
+        let root = TempDir::new().expect("root");
+        fs::create_dir_all(root.path().join("usr")).expect("usr");
+        std::os::unix::fs::symlink("/tmp", root.path().join("usr/lib")).expect("symlink");
+
+        let err = ensure_no_symlink_ancestors(root.path(), &root.path().join("usr/lib/foo"))
+            .expect_err("must reject symlink ancestor");
+        assert!(format!("{err}").contains("symlink"));
+
+        ensure_no_symlink_ancestors(root.path(), &root.path().join("usr/bin/foo"))
+            .expect("regular ancestors are fine");
     }
 
     #[test]
@@ -1091,6 +1564,61 @@ mod tests {
         fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
+    fn write_setuid_package(dir: &Path) -> PathBuf {
+        let path = dir.join("setuid-1.0-1-x86_64.xp");
+        let pkginfo = "pkgname = setuid\npkgver = 1.0-1\npkgdesc = test\narch = x86_64\n";
+        let content = b"#!/bin/sh\n";
+        let mtree = format!(
+            "#mtree\n./usr/bin/setuid type=file mode=04755 size={} sha256digest={} uid=0 gid=0\n",
+            content.len(),
+            sha256_hex(content)
+        );
+        let mut raw_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw_tar);
+            for (entry, data) in [
+                (".PKGINFO", pkginfo.as_bytes()),
+                (".MTREE", mtree.as_bytes()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(entry).unwrap();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, data).unwrap();
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_path("usr/bin/setuid").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o4755);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        fs::write(&path, zstd::encode_all(&raw_tar[..], 1).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn extraction_preserves_setuid_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, db_tmp, mut ctx) = test_context(OperationType::Install);
+        ctx.pkg_name = "setuid".to_string();
+        ctx.pkg_file = Some(write_setuid_package(db_tmp.path()));
+
+        FileExtractionHook.run(&ctx).expect("extract");
+        let target = root.path().join("usr/bin/setuid");
+        let mode = fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o4755, "setuid bit must be preserved");
+    }
+
     #[test]
     fn install_keeps_existing_config_and_writes_pacnew() {
         let (root, db_tmp, mut ctx) = test_context(OperationType::Install);
@@ -1162,6 +1690,7 @@ mod tests {
             local_db_dir: db.to_path_buf(),
             save_configs: true,
             shell_integration: false,
+            scriptlet_mode: ScriptletMode::Auto,
         };
         FileExtractionHook.run(&ctx).expect("install v1");
     }
@@ -1177,6 +1706,7 @@ mod tests {
             local_db_dir: db.to_path_buf(),
             save_configs: true,
             shell_integration: false,
+            scriptlet_mode: ScriptletMode::Auto,
         }
     }
 
@@ -1302,6 +1832,7 @@ mod tests {
             local_db_dir: db.clone(),
             save_configs: true,
             shell_integration: false,
+            scriptlet_mode: ScriptletMode::Auto,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 
@@ -1336,6 +1867,7 @@ mod tests {
             local_db_dir: db.clone(),
             save_configs: false,
             shell_integration: false,
+            scriptlet_mode: ScriptletMode::Auto,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 
@@ -1369,6 +1901,7 @@ mod tests {
             local_db_dir: db.clone(),
             save_configs: true,
             shell_integration: false,
+            scriptlet_mode: ScriptletMode::Auto,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 

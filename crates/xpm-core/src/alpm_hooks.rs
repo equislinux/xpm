@@ -52,7 +52,7 @@ pub enum HookWhen {
 }
 
 /// Operation a trigger applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HookOperation {
     Install,
     Upgrade,
@@ -99,8 +99,9 @@ pub struct AlpmHook {
 pub struct HookTransaction<'a> {
     /// `(package name, operation)` pairs.
     pub packages: Vec<(&'a str, HookOperation)>,
-    /// File paths touched by the transaction (for `Path` triggers).
-    pub paths: Vec<String>,
+    /// File paths touched by the transaction and the operation that touched
+    /// them (for `Path` triggers).
+    pub paths: Vec<(String, HookOperation)>,
 }
 
 impl AlpmHook {
@@ -132,10 +133,10 @@ impl AlpmHook {
                         .iter()
                         .any(|(name, _)| glob_match(pattern, name))
                 }),
-                TriggerType::Path => trigger.targets.iter().any(|prefix| {
-                    tx.paths.iter().any(|path| {
-                        path.trim_start_matches('/')
-                            .starts_with(prefix.trim_start_matches('/'))
+                TriggerType::Path => trigger.targets.iter().any(|pattern| {
+                    tx.paths.iter().any(|(path, op)| {
+                        (trigger.operations.is_empty() || trigger.operations.contains(op))
+                            && glob_match(pattern, path.trim_start_matches('/'))
                     })
                 }),
             }
@@ -151,20 +152,38 @@ impl AlpmHook {
     pub fn matched_targets(&self, tx: &HookTransaction<'_>) -> Vec<String> {
         let mut out = Vec::new();
         for trigger in &self.triggers {
-            if trigger.trigger_type != TriggerType::Package {
-                continue;
-            }
-            for (name, _) in &tx.packages {
-                if trigger
-                    .targets
-                    .iter()
-                    .any(|pattern| glob_match(pattern, name))
-                    && !out.iter().any(|seen| seen == name)
-                {
-                    out.push((*name).to_string());
+            match trigger.trigger_type {
+                TriggerType::Package => {
+                    for (name, _) in &tx.packages {
+                        if trigger
+                            .targets
+                            .iter()
+                            .any(|pattern| glob_match(pattern, name))
+                            && !out.iter().any(|seen| seen == name)
+                        {
+                            out.push((*name).to_string());
+                        }
+                    }
+                }
+                TriggerType::Path => {
+                    for (path, op) in &tx.paths {
+                        if !(trigger.operations.is_empty() || trigger.operations.contains(op)) {
+                            continue;
+                        }
+                        let relative = path.trim_start_matches('/');
+                        if trigger
+                            .targets
+                            .iter()
+                            .any(|pattern| glob_match(pattern, relative))
+                            && !out.iter().any(|seen| seen == relative)
+                        {
+                            out.push(relative.to_string());
+                        }
+                    }
                 }
             }
         }
+        out.sort();
         out
     }
 }
@@ -374,6 +393,99 @@ pub fn hook_dirs() -> Vec<PathBuf> {
     }
 }
 
+/// Hook directories for a given installation root.
+///
+/// With `root == "/"` these are the pacman defaults. For an alternative root
+/// the system and user hook directories are resolved inside that root, and
+/// hook commands are executed chrooted (same policy as scriptlets).
+pub fn hook_dirs_for(root: &Path) -> Vec<PathBuf> {
+    if let Ok(value) = std::env::var(ENV_HOOK_DIRS) {
+        if !value.is_empty() {
+            return value.split(':').map(PathBuf::from).collect();
+        }
+    }
+    if root == Path::new("/") {
+        return DEFAULT_HOOK_DIRS.iter().map(PathBuf::from).collect();
+    }
+    vec![
+        root.join("usr/share/libalpm/hooks"),
+        root.join("etc/pacman.d/hooks"),
+    ]
+}
+
+/// Split a pacman hook `Exec` line into argv, honoring single/double quotes
+/// and backslash escapes. Hook commands are not run through a shell.
+fn split_exec(input: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escape = false;
+    let mut started = false;
+
+    for ch in input.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            started = true;
+            continue;
+        }
+        match quote {
+            Some('"') if ch == '\\' => escape = true,
+            Some('"') if ch == '"' => quote = None,
+            Some('\'') if ch == '\'' => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\\' => escape = true,
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                started = true;
+            }
+            None if ch.is_whitespace() => {
+                if started || !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            None => {
+                current.push(ch);
+                started = true;
+            }
+        }
+    }
+
+    if escape {
+        return Err("trailing backslash".to_string());
+    }
+    if quote.is_some() {
+        return Err("unterminated quote".to_string());
+    }
+    if started || !current.is_empty() {
+        args.push(current);
+    }
+    Ok(args)
+}
+
+fn chroot_command(command: &mut Command, root: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+
+    let root = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| "root path contains NUL".to_string())?;
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(0o022);
+            if libc::chroot(root.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(c"/".as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 /// Runs every hook that matches `tx` for `when`, in lexical order.
 ///
 /// `installed` answers whether a `Depends` package is present. Hook output is
@@ -383,6 +495,7 @@ pub fn run_hooks(
     hooks: &[AlpmHook],
     when: HookWhen,
     tx: &HookTransaction<'_>,
+    root: &Path,
     mut installed: impl FnMut(&str) -> bool,
 ) -> XpmResult<Vec<HookFailure>> {
     let mut failures = Vec::new();
@@ -392,11 +505,42 @@ pub fn run_hooks(
             continue;
         }
 
-        let mut command = Command::new(hook.exec.split_whitespace().next().unwrap_or(""));
-        for arg in hook.exec.split_whitespace().skip(1) {
-            command.arg(arg);
-        }
+        let argv = match split_exec(&hook.exec) {
+            Ok(argv) if !argv.is_empty() => argv,
+            Ok(_) => {
+                failures.push(HookFailure {
+                    name: hook.name.clone(),
+                    abort_on_fail: hook.abort_on_fail,
+                    error: "empty Exec".to_string(),
+                });
+                continue;
+            }
+            Err(error) => {
+                failures.push(HookFailure {
+                    name: hook.name.clone(),
+                    abort_on_fail: hook.abort_on_fail,
+                    error: format!("invalid Exec: {error}"),
+                });
+                continue;
+            }
+        };
+
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]);
         command.env("XPM_ALPM_HOOK", &hook.name);
+        command.current_dir("/");
+        let chroot =
+            root != Path::new("/") && std::env::var_os("XPM_ALPM_HOOKS_NO_CHROOT").is_none();
+        if chroot {
+            if let Err(error) = chroot_command(&mut command, root) {
+                failures.push(HookFailure {
+                    name: hook.name.clone(),
+                    abort_on_fail: hook.abort_on_fail,
+                    error,
+                });
+                continue;
+            }
+        }
 
         if hook.needs_targets {
             command.stdin(Stdio::piped());
@@ -627,7 +771,7 @@ NeedsTargets
 
     #[test]
     fn path_trigger_needs_matching_path() {
-        let content = "[Trigger]\nOperation = Upgrade\nType = Path\nTarget = usr/lib/modules\n\n[Action]\nExec = /bin/true\n";
+        let content = "[Trigger]\nOperation = Upgrade\nType = Path\nTarget = usr/lib/modules/*\n\n[Action]\nExec = /bin/true\n";
         let hook = parse_hook("modules.hook", content).expect("parse");
 
         let without_paths = HookTransaction {
@@ -638,9 +782,39 @@ NeedsTargets
 
         let with_paths = HookTransaction {
             packages: vec![("linux", HookOperation::Upgrade)],
-            paths: vec!["usr/lib/modules/6.12/vmlinuz".to_string()],
+            paths: vec![(
+                "usr/lib/modules/6.12/vmlinuz".to_string(),
+                HookOperation::Upgrade,
+            )],
         };
         assert!(hook.matches(&with_paths, |_| true));
+    }
+
+    #[test]
+    fn path_trigger_respects_operation_and_glob() {
+        let content = "[Trigger]\nOperation = Install\nType = Path\nTarget = usr/lib/modules/*/vmlinuz\n\n[Action]\nExec = /bin/true\nNeedsTargets\n";
+        let hook = parse_hook("modules-install.hook", content).expect("parse");
+        let upgrade_only = HookTransaction {
+            packages: vec![("linux", HookOperation::Upgrade)],
+            paths: vec![(
+                "usr/lib/modules/6.12/vmlinuz".to_string(),
+                HookOperation::Upgrade,
+            )],
+        };
+        assert!(!hook.matches(&upgrade_only, |_| true));
+
+        let install = HookTransaction {
+            packages: vec![("linux", HookOperation::Install)],
+            paths: vec![(
+                "usr/lib/modules/6.12/vmlinuz".to_string(),
+                HookOperation::Install,
+            )],
+        };
+        assert!(hook.matches(&install, |_| true));
+        assert_eq!(
+            hook.matched_targets(&install),
+            vec!["usr/lib/modules/6.12/vmlinuz".to_string()]
+        );
     }
 
     #[test]
@@ -702,9 +876,64 @@ NeedsTargets
             packages: vec![("kitty", HookOperation::Install)],
             paths: Vec::new(),
         };
-        let failures = run_hooks(&[hook], HookWhen::PreTransaction, &tx, |_| true).expect("run");
+        let failures = run_hooks(
+            &[hook],
+            HookWhen::PreTransaction,
+            &tx,
+            Path::new("/"),
+            |_| true,
+        )
+        .expect("run");
         assert!(failures.is_empty(), "unexpected failures: {failures:?}");
         assert_eq!(fs::read_to_string(&output).expect("targets"), "kitty\n");
+    }
+
+    #[test]
+    fn split_exec_handles_quotes_and_escapes() {
+        assert_eq!(
+            split_exec(r#"/bin/sh -c 'echo hello world'"#).unwrap(),
+            vec!["/bin/sh", "-c", "echo hello world"]
+        );
+        assert_eq!(
+            split_exec(r#"/bin/echo "a b" c\ d"#).unwrap(),
+            vec!["/bin/echo", "a b", "c d"]
+        );
+        assert!(split_exec("'/bin/sh").is_err());
+    }
+
+    #[test]
+    fn runs_hook_with_quoted_exec_arguments() {
+        let tmp = TempDir::new().expect("tmp");
+        let output = tmp.path().join("quoted.txt");
+        let content = format!(
+            "[Trigger]\nOperation = Install\nType = Package\nTarget = kitty\n\n[Action]\nWhen = PreTransaction\nExec = /bin/sh -c 'printf quoted > {}'\n",
+            output.display()
+        );
+        let hook = parse_hook("50-quoted.hook", &content).expect("parse");
+        let tx = HookTransaction {
+            packages: vec![("kitty", HookOperation::Install)],
+            paths: Vec::new(),
+        };
+        let failures = run_hooks(
+            &[hook],
+            HookWhen::PreTransaction,
+            &tx,
+            Path::new("/"),
+            |_| true,
+        )
+        .expect("run");
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+        assert_eq!(fs::read_to_string(&output).expect("output"), "quoted");
+    }
+
+    #[test]
+    fn hook_dirs_for_alternative_root_are_relative() {
+        let dirs = hook_dirs_for(Path::new("/mnt/target"));
+        assert_eq!(
+            dirs[0],
+            PathBuf::from("/mnt/target/usr/share/libalpm/hooks")
+        );
+        assert_eq!(dirs[1], PathBuf::from("/mnt/target/etc/pacman.d/hooks"));
     }
 
     #[test]

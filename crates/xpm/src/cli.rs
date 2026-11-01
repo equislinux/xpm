@@ -29,11 +29,11 @@ pub struct Cli {
     pub no_confirm: bool,
 
     /// Set an alternative installation root.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, short = 'r', global = true, value_name = "PATH")]
     pub root: Option<PathBuf>,
 
     /// Set an alternative database directory.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, short = 'b', global = true, value_name = "PATH")]
     pub dbpath: Option<PathBuf>,
 
     /// Set an alternative cache directory.
@@ -43,6 +43,26 @@ pub struct Cli {
     /// Disable colored output.
     #[arg(long, global = true)]
     pub no_color: bool,
+
+    /// Do not mirror transactions into pacman's local database.
+    #[arg(long, global = true)]
+    pub no_pacman_mirror: bool,
+
+    /// Enable ~/.local/bin shims and rc edits for non-root installs.
+    #[arg(long, global = true)]
+    pub shell_integration: bool,
+
+    /// Disable shell integration (default; accepted for compatibility).
+    #[arg(long, global = true)]
+    pub no_shell_integration: bool,
+
+    /// Scriptlet policy: auto, skip, or require.
+    #[arg(long, global = true, value_name = "MODE", value_parser = ["auto", "skip", "require"])]
+    pub scriptlets: Option<String>,
+
+    /// Skip package .INSTALL scriptlets (alias for --scriptlets skip).
+    #[arg(long, global = true)]
+    pub noscriptlet: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -94,6 +114,29 @@ pub enum Command {
     /// Compare the installed packages against a generation capture.
     Diff(DiffArgs),
 
+    /// Import installed packages from pacman's local database.
+    #[command(name = "import-pacman")]
+    ImportPacman(ImportArgs),
+
+    /// Rewrite pacman's local database from xpm's database.
+    #[command(name = "sync-pacman-db")]
+    SyncPacmanDb(SyncPacmanDbArgs),
+
+    /// Verify installed files against the local database [-Qk/-Qkk].
+    #[command(visible_alias = "Qk")]
+    Check(CheckArgs),
+
+    /// Change the install reason of installed packages [-D].
+    #[command(visible_alias = "D")]
+    Mark(MarkArgs),
+
+    /// Test dependency specifications against installed packages [-T].
+    #[command(visible_alias = "T")]
+    Deptest(DeptestArgs),
+
+    /// List package groups (sync or local).
+    Groups(GroupsArgs),
+
     /// Display detailed usage information and guides.
     Usage(HelpArgs),
 }
@@ -128,6 +171,18 @@ pub struct InstallArgs {
     /// Do not install optional dependencies.
     #[arg(long)]
     pub no_optional: bool,
+
+    /// Skip packages that are already installed at the same version.
+    #[arg(long)]
+    pub needed: bool,
+
+    /// Print the resolved packages without downloading or installing them.
+    #[arg(long, short = 'p')]
+    pub print: bool,
+
+    /// Overwrite conflicting files matching PATTERN (repeatable; `!` negates).
+    #[arg(long, value_name = "PATTERN")]
+    pub overwrite: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -136,13 +191,21 @@ pub struct RemoveArgs {
     #[arg(required = true)]
     pub packages: Vec<String>,
 
-    /// Remove also unneeded dependencies (recursive).
-    #[arg(long, short = 's')]
-    pub recursive: bool,
+    /// Remove unneeded dependencies; repeat (-Rss) to include explicit ones.
+    #[arg(long, short = 's', action = clap::ArgAction::Count)]
+    pub recursive: u8,
 
-    /// Skip dependency checks.
-    #[arg(long, short = 'd')]
-    pub no_deps: bool,
+    /// Ignore dependency versions (-d) or all dependency checks (-dd).
+    #[arg(long = "nodeps", alias = "no-deps", short = 'd', action = clap::ArgAction::Count)]
+    pub no_deps: u8,
+
+    /// Remove packages that depend on the targets (pacman -Rc).
+    #[arg(long)]
+    pub cascade: bool,
+
+    /// Keep targets that are still required by another package (-Ru).
+    #[arg(long, short = 'u')]
+    pub unneeded: bool,
 
     /// Remove configuration files as well (purge).
     #[arg(long, short = 'n')]
@@ -158,6 +221,14 @@ pub struct UpgradeArgs {
     /// Ignore specific packages during upgrade.
     #[arg(long, value_name = "PKG")]
     pub ignore: Vec<String>,
+
+    /// Print the upgrade plan without downloading or installing anything.
+    #[arg(long, short = 'p')]
+    pub print: bool,
+
+    /// Overwrite conflicting files matching PATTERN (repeatable; `!` negates).
+    #[arg(long, value_name = "PATTERN")]
+    pub overwrite: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -174,8 +245,28 @@ pub struct QueryArgs {
     #[arg(long, short = 'd')]
     pub deps: bool,
 
-    /// Filter by package name (optional).
+    /// Exact package name to query (substring with --search).
     pub filter: Option<String>,
+
+    /// Treat FILTER as a substring instead of an exact package name.
+    #[arg(long)]
+    pub search: bool,
+
+    /// Print only package names.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
+    /// Find the installed package that owns PATH.
+    #[arg(long, value_name = "PATH")]
+    pub owner: Option<String>,
+
+    /// List packages that are not present in any configured sync database.
+    #[arg(long, short = 'm')]
+    pub foreign: bool,
+
+    /// List packages that no other installed package directly requires.
+    #[arg(long)]
+    pub unrequired: bool,
 
     /// List orphan packages (no longer required).
     #[arg(long, short = 't')]
@@ -184,6 +275,37 @@ pub struct QueryArgs {
     /// Check for packages that are outdated.
     #[arg(long, short = 'u')]
     pub upgrades: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CheckArgs {
+    /// Also verify the stored .MTREE hashes, modes and symlink targets.
+    #[arg(long)]
+    pub full: bool,
+
+    /// Installed packages to check (default: all).
+    pub packages: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct MarkArgs {
+    /// Mark packages as dependencies.
+    #[arg(long)]
+    pub as_deps: bool,
+
+    /// Mark packages as explicitly installed.
+    #[arg(long)]
+    pub as_explicit: bool,
+
+    /// Installed package names to mark.
+    #[arg(required = true)]
+    pub packages: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct DeptestArgs {
+    /// Dependency specifications to test (e.g. glibc>=2.39).
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -283,6 +405,38 @@ pub struct DiffArgs {
     /// Emit the diff as a single JSON object.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct GroupsArgs {
+    /// List local groups instead of sync repository groups.
+    #[arg(long)]
+    pub local: bool,
+
+    /// Print only package names.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
+    /// Restrict output to one group.
+    pub group: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ImportArgs {
+    /// pacman local database directory.
+    #[arg(long, value_name = "PATH", default_value = "/var/lib/pacman/local")]
+    pub from: PathBuf,
+
+    /// Overwrite entries that already exist in the xpm database.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SyncPacmanDbArgs {
+    /// pacman database directory (default: configured or auto-detected).
+    #[arg(long, value_name = "PATH")]
+    pub pacman_db: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]

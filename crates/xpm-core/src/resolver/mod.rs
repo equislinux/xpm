@@ -19,7 +19,7 @@ mod version;
 mod tests;
 
 pub use dependency::{DepConstraint, Operator};
-pub use plan::{resolve_closure, Requirement};
+pub use plan::{resolve_closure, resolve_closure_with_installed, Requirement};
 pub use provider::XpmProvider;
 pub use types::{PackageCandidate, PackageDependency, PackagePool, VersionReq};
 pub use version::Version;

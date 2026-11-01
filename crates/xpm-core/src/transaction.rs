@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::error::{XpmError, XpmResult};
-use crate::hooks::{HookChain, HookContext, OperationType};
+use crate::hooks::{HookChain, HookContext, OperationType, ScriptletMode};
 use crate::package::PackageMeta;
 
 /// A filesystem-based lock to prevent concurrent xpm operations.
@@ -21,23 +21,81 @@ pub struct FileLock {
     _guard: Option<File>,
 }
 
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return true;
+    };
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .map(|age| age.as_secs())
+        .unwrap_or(0);
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let pid = raw.trim();
+
+    if let Ok(pid) = pid.parse::<u32>() {
+        return !Path::new(&format!("/proc/{pid}")).exists();
+    }
+
+    // Legacy/empty lock: only reclaim it after a short grace period so a
+    // concurrent creator that has not written its PID yet is not preempted.
+    pid.is_empty() && age > 5
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        self._guard = None;
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl FileLock {
     /// Acquire an exclusive lock at the given path.
     /// Other processes will wait or fail if already locked.
     pub fn acquire(path: &Path) -> XpmResult<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("/")))?;
 
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| XpmError::Package(format!("failed to acquire lock: {}", e)))?;
+        for attempt in 0..2 {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    let _ = file.flush();
+                    return Ok(FileLock {
+                        path: path.to_path_buf(),
+                        _guard: Some(file),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                    if lock_is_stale(path) {
+                        let _ = fs::remove_file(path);
+                        continue;
+                    }
+                    return Err(XpmError::Transaction(format!(
+                        "unable to lock database: {} exists (another package manager may be running)",
+                        path.display()
+                    )));
+                }
+                Err(e) => {
+                    return Err(XpmError::Transaction(format!(
+                        "failed to acquire lock {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
 
-        Ok(FileLock {
-            path: path.to_path_buf(),
-            _guard: Some(file),
-        })
+        Err(XpmError::Transaction(format!(
+            "unable to lock database: {}",
+            path.display()
+        )))
     }
 
     /// Release the lock by dropping the file handle.
@@ -96,15 +154,19 @@ pub struct Transaction {
     hooks_chain: Option<HookChain>,
     shell_integration: bool,
     save_configs: bool,
+    scriptlet_mode: ScriptletMode,
 }
 
 impl Transaction {
     /// Create a new transaction with default root and database directories.
     pub fn new(root_dir: PathBuf, local_db_dir: PathBuf) -> XpmResult<Self> {
-        let lock_path = local_db_dir.join("transaction.lock");
+        let lock_path = local_db_dir
+            .parent()
+            .unwrap_or(local_db_dir.as_path())
+            .join("transaction.lock");
         let log_file = root_dir.join("var/log/xpm.log");
 
-        let lock = FileLock::acquire(&lock_path).ok();
+        let lock = Some(FileLock::acquire(&lock_path)?);
 
         fs::create_dir_all(&local_db_dir)?;
         fs::create_dir_all(log_file.parent().unwrap_or_else(|| Path::new("/")))?;
@@ -120,6 +182,7 @@ impl Transaction {
             hooks_chain: None,
             shell_integration: false,
             save_configs: true,
+            scriptlet_mode: ScriptletMode::Auto,
         })
     }
 
@@ -137,6 +200,10 @@ impl Transaction {
     /// `false` is `--nosave`).
     pub fn set_save_configs(&mut self, enabled: bool) {
         self.save_configs = enabled;
+    }
+
+    pub fn set_scriptlet_mode(&mut self, mode: ScriptletMode) {
+        self.scriptlet_mode = mode;
     }
 
     /// Add an install operation to the transaction.
@@ -316,6 +383,7 @@ impl Transaction {
                 local_db_dir: self.local_db_dir.clone(),
                 save_configs: self.save_configs,
                 shell_integration: self.shell_integration,
+                scriptlet_mode: self.scriptlet_mode,
             };
             hooks.run(&context)?;
         }
@@ -347,6 +415,7 @@ impl Transaction {
                 local_db_dir: self.local_db_dir.clone(),
                 save_configs: self.save_configs,
                 shell_integration: self.shell_integration,
+                scriptlet_mode: self.scriptlet_mode,
             };
             hooks.run(&context)?;
         }
@@ -386,6 +455,7 @@ impl Transaction {
                 local_db_dir: self.local_db_dir.clone(),
                 save_configs: self.save_configs,
                 shell_integration: self.shell_integration,
+                scriptlet_mode: self.scriptlet_mode,
             };
             hooks.run(&context)?;
         } else {
@@ -465,6 +535,17 @@ mod tests {
         let root = tmpdir.path().to_path_buf();
         let local_db = root.join("var/lib/xpm/local");
         (tmpdir, root, local_db)
+    }
+
+    #[test]
+    fn lock_is_exclusive_and_released_on_drop() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("transaction.lock");
+
+        let lock = FileLock::acquire(&path).expect("first lock");
+        assert!(FileLock::acquire(&path).is_err(), "second lock must fail");
+        drop(lock);
+        FileLock::acquire(&path).expect("lock is released on drop");
     }
 
     #[test]
@@ -740,6 +821,7 @@ mod tests {
         assert!(test_file.exists(), "file should exist after install");
 
         // Now remove the package (without hooks for now)
+        drop(tx);
         let mut tx2 =
             Transaction::new(root.clone(), local_db.clone()).expect("create remove transaction");
         // Don't set hooks to isolate removal logic

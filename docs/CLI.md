@@ -62,6 +62,8 @@ xpm S <PACKAGES>... [OPTIONS]    # pacman-style alias
 | `--as-deps` | — | Mark packages as dependencies |
 | `--as-explicit` | — | Mark packages as explicitly installed |
 | `--no-optional` | — | Skip optional dependencies |
+| `--print` | `-p` | Print the resolved plan without downloading or installing |
+| `--overwrite` | — | Allow conflicting files matching PATTERN (repeatable, `!` negates) |
 
 **Examples:**
 
@@ -85,8 +87,10 @@ xpm R <PACKAGES>... [OPTIONS]    # pacman-style alias
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--recursive` | `-s` | Also remove unneeded dependencies |
-| `--no-deps` | `-d` | Skip dependency checks |
+| `--recursive` | `-s` | Remove unneeded dependencies; repeat (`-ss`) to include explicit ones |
+| `--nodeps` | `-d` | Ignore dependency versions (`-d`) or all dependency checks (`-dd`) |
+| `--cascade` | — | Remove packages that depend on the targets (`-Rc`) |
+| `--unneeded` | `-u` | Keep targets still required by another package (`-Ru`) |
 | `--nosave` | `-n` | Remove configuration files (purge) |
 
 **Examples:**
@@ -112,6 +116,8 @@ xpm Su [OPTIONS]          # pacman-style alias
 |------|-------|-------------|
 | `--force` | — | Force reinstall of up-to-date packages |
 | `--ignore` | — | Skip specific packages (repeatable) |
+| `--print` | `-p` | Print the upgrade plan without downloading or installing |
+| `--overwrite` | — | Allow conflicting files matching PATTERN (repeatable, `!` negates) |
 
 **Examples:**
 
@@ -120,6 +126,37 @@ xpm upgrade                       # Full system upgrade
 xpm Su --ignore linux             # Upgrade, skip linux
 xpm upgrade --ignore pkg1 --ignore pkg2
 ```
+
+---
+
+### `import-pacman` — Adopt pacman's Local Database
+
+Import installed packages from pacman's local database into the xpm local
+database. Pacman's database is not modified.
+
+```bash
+xpm import-pacman [--from /var/lib/pacman/local] [--force]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--from PATH` | pacman local database directory (default `/var/lib/pacman/local`) |
+| `--force` | Overwrite entries that already exist |
+
+### `sync-pacman-db` — Mirror xpm into pacman
+
+Write pacman-compatible local database entries for packages managed by xpm, so
+`pacman -Q`, the generation hooks and other pacman-based tooling see them.
+Existing entries with the same version are skipped (repair mode).
+
+```bash
+xpm sync-pacman-db [--pacman-db /var/lib/pacman]
+```
+
+The mirror is also performed automatically after install, upgrade and remove
+when `/var/lib/pacman` exists and `root_dir` is `/`. Disable it with
+`--no-pacman-mirror`, or configure `pacman_db` / `mirror_pacman` in
+`/etc/xpm.conf`.
 
 ---
 

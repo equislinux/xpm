@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
+use crate::hooks::ScriptletMode;
 
 // ── Default paths ───────────────────────────────────────────────────────────
 
@@ -40,8 +41,10 @@ pub struct Repository {
     /// Mirror URLs for this repository.
     #[serde(default)]
     pub server: Vec<String>,
-    /// Signature verification level override for this repo.
+    /// Package signature verification level override for this repo.
     pub sig_level: Option<SigLevel>,
+    /// Database signature verification level override for this repo.
+    pub database_sig_level: Option<SigLevel>,
 }
 
 /// General options for the package manager.
@@ -66,14 +69,29 @@ pub struct GeneralOptions {
     pub ignore_group: Vec<String>,
     /// System architecture.
     pub architecture: Option<String>,
-    /// Default signature verification level.
+    /// Default package signature verification level.
     pub sig_level: SigLevel,
+    /// Default database signature verification level (falls back to `sig_level`).
+    pub database_sig_level: Option<SigLevel>,
     /// Use color in output.
     pub color: bool,
     /// Perform operations in parallel (number of threads).
     pub parallel_downloads: u32,
     /// Check available disk space before installing.
     pub check_space: bool,
+    /// pacman database directory used for the compatibility mirror.
+    ///
+    /// When unset and `root_dir` is `/`, `/var/lib/pacman` is used if it
+    /// exists. Set to a path to mirror into a different database, or disable
+    /// the mirror with `mirror_pacman = false`.
+    pub pacman_db: Option<PathBuf>,
+    /// Mirror xpm transactions into pacman's local database.
+    pub mirror_pacman: bool,
+    /// Create `~/.local/bin` shims and edit shell rc files for non-root roots.
+    /// Disabled by default; requiring it is opt-in for development roots.
+    pub shell_integration: bool,
+    /// Whether package `.INSTALL` scriptlets run (auto/skip/require).
+    pub scriptlet_mode: ScriptletMode,
 }
 
 impl GeneralOptions {
@@ -96,9 +114,20 @@ impl GeneralOptions {
         self.gpg_dir.clone()
     }
 
-    /// Path of the trusted-keys file inside [`Self::effective_gpg_dir`].
+    /// Path of the keyring file inside [`Self::effective_gpg_dir`].
+    ///
+    /// pacman's keyring may be a legacy `trustedkeys.gpg` file or GnuPG's
+    /// `pubring.gpg`; prefer whichever exists so xpm can use the same trust
+    /// store as pacman without a separate initialization step.
     pub fn keyring_path(&self) -> PathBuf {
-        self.effective_gpg_dir().join("trustedkeys.gpg")
+        let dir = self.effective_gpg_dir();
+        for candidate in ["trustedkeys.gpg", "pubring.gpg"] {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return path;
+            }
+        }
+        dir.join("trustedkeys.gpg")
     }
 }
 
@@ -115,9 +144,14 @@ impl Default for GeneralOptions {
             ignore_group: Vec::new(),
             architecture: None,
             sig_level: SigLevel::Optional,
+            database_sig_level: None,
             color: true,
             parallel_downloads: 5,
             check_space: true,
+            pacman_db: None,
+            mirror_pacman: true,
+            shell_integration: false,
+            scriptlet_mode: ScriptletMode::Auto,
         }
     }
 }
@@ -141,6 +175,7 @@ impl Default for XpmConfig {
                 name: "x".to_string(),
                 server: vec!["https://equislinux.github.io/x-repo/x/$arch".into()],
                 sig_level: None,
+                database_sig_level: None,
             }],
         }
     }
@@ -233,6 +268,78 @@ impl XpmConfig {
     }
 }
 
+// ── pacman.conf lowering ───────────────────────────────────────────────────
+
+fn sig_check_to_level(check: crate::pacman_conf::SigCheck) -> SigLevel {
+    match check {
+        crate::pacman_conf::SigCheck::Never => SigLevel::Never,
+        crate::pacman_conf::SigCheck::Optional => SigLevel::Optional,
+        crate::pacman_conf::SigCheck::Required => SigLevel::Required,
+    }
+}
+
+impl XpmConfig {
+    /// Build an xpm configuration from a parsed pacman.conf.
+    ///
+    /// xpm keeps its own local database (`/var/lib/xpm`) and mirrors into the
+    /// pacman database from `pacman_db`; repositories, trust policy, cache,
+    /// keyring and architecture come from pacman.
+    pub fn from_pacman(pacman: crate::pacman_conf::PacmanConfig) -> Self {
+        let global = pacman.options.sig_level;
+        let database_level = sig_check_to_level(global.database_check());
+        let options = GeneralOptions {
+            root_dir: pacman.options.root_dir.clone(),
+            db_path: PathBuf::from("/var/lib/xpm/"),
+            cache_dir: pacman
+                .options
+                .cache_dirs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("/var/cache/xpm/pkg/")),
+            log_file: pacman.options.log_file.clone(),
+            gpg_dir: pacman.options.gpg_dir.clone(),
+            hold_pkg: pacman.options.hold_pkg.clone(),
+            ignore_pkg: pacman.options.ignore_pkg.clone(),
+            ignore_group: pacman.options.ignore_group.clone(),
+            architecture: pacman.options.architectures.first().map(|arch| {
+                if arch == "auto" {
+                    std::env::consts::ARCH.to_string()
+                } else {
+                    arch.clone()
+                }
+            }),
+            sig_level: sig_check_to_level(global.package_check()),
+            database_sig_level: Some(database_level),
+            color: matches!(pacman.options.color, crate::pacman_conf::ColorMode::Always),
+            parallel_downloads: pacman.options.parallel_downloads.max(1),
+            check_space: pacman.options.check_space,
+            pacman_db: Some(pacman.options.db_path.clone()),
+            mirror_pacman: true,
+            shell_integration: false,
+            scriptlet_mode: ScriptletMode::Auto,
+        };
+
+        let repositories = pacman
+            .repositories
+            .into_iter()
+            .map(|repo| {
+                let effective = repo.effective_sig_level(&global);
+                Repository {
+                    name: repo.name,
+                    server: repo.servers,
+                    sig_level: Some(sig_check_to_level(effective.package_check())),
+                    database_sig_level: Some(sig_check_to_level(effective.database_check())),
+                }
+            })
+            .collect();
+
+        XpmConfig {
+            options,
+            repositories,
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -262,6 +369,14 @@ gpg_dir = "/etc/pacman.d/gnupg/"
 color = true
 parallel_downloads = 3
 check_space = true
+
+# Mirror xpm transactions into pacman's local database so pacman -Q and the
+# generation tooling keep seeing xpm-managed packages. Auto-detected at
+# /var/lib/pacman when root_dir is "/" unless set here.
+# pacman_db = "/var/lib/pacman"
+# mirror_pacman = true
+# shell_integration = false
+# scriptlet_mode = "auto"   # auto | skip | require
 
 [[repo]]
 name = "core"
@@ -311,6 +426,47 @@ server = ["https://mirror.example.com/archlinux/extra/os/x86_64"]
     }
 
     #[test]
+    fn from_pacman_maps_repositories_and_split_siglevels() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("pacman.conf");
+        std::fs::write(
+            &path,
+            "[options]\nArchitecture = x86_64\nSigLevel = Required DatabaseOptional\nParallelDownloads = 3\nIgnorePkg = foo\n\n[x]\nSigLevel = Required\nServer = https://example/$repo/$arch\n\n[core]\nServer = https://mirror/$repo/os/$arch\n",
+        )
+        .unwrap();
+
+        let pacman = crate::pacman_conf::parse_pacman_conf(&path).expect("parse pacman.conf");
+        let config = XpmConfig::from_pacman(pacman);
+
+        assert_eq!(config.options.sig_level, SigLevel::Required);
+        assert_eq!(config.options.database_sig_level, Some(SigLevel::Optional));
+        assert_eq!(config.options.architecture.as_deref(), Some("x86_64"));
+        assert_eq!(config.options.parallel_downloads, 3);
+        assert_eq!(config.options.ignore_pkg, vec!["foo".to_string()]);
+        assert_eq!(
+            config.options.pacman_db.as_deref(),
+            Some(Path::new("/var/lib/pacman/"))
+        );
+        assert_eq!(config.repositories.len(), 2);
+        assert_eq!(config.repositories[0].name, "x");
+        assert_eq!(config.repositories[0].sig_level, Some(SigLevel::Required));
+        assert_eq!(
+            config.repositories[0].database_sig_level,
+            Some(SigLevel::Required)
+        );
+        assert_eq!(
+            config.repositories[0].server,
+            vec!["https://example/$repo/$arch"]
+        );
+        assert_eq!(config.repositories[1].name, "core");
+        assert_eq!(config.repositories[1].sig_level, Some(SigLevel::Required));
+        assert_eq!(
+            config.repositories[1].database_sig_level,
+            Some(SigLevel::Optional)
+        );
+    }
+
+    #[test]
     fn keyring_path_prefers_existing_configured_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         let options = GeneralOptions {
@@ -322,6 +478,18 @@ server = ["https://mirror.example.com/archlinux/extra/os/x86_64"]
         assert_eq!(options.keyring_path(), tmp.path().join("trustedkeys.gpg"));
         assert_eq!(DEFAULT_GPG_DIR, "/etc/pacman.d/gnupg/");
         assert_eq!(XPM_GPG_DIR, "/etc/xpm/gnupg/");
+    }
+
+    #[test]
+    fn keyring_path_falls_back_to_pubring_gpg() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let options = GeneralOptions {
+            gpg_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        std::fs::write(tmp.path().join("pubring.gpg"), b"not parsed here").unwrap();
+        assert_eq!(options.keyring_path(), tmp.path().join("pubring.gpg"));
     }
 
     #[test]
