@@ -4,6 +4,7 @@
 //! logging initialization, and dispatching to the appropriate subcommand handler.
 
 mod cli;
+mod pacman_compat;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -50,7 +51,8 @@ fn main() -> Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
-    let cli = Cli::parse();
+    let argv = pacman_compat::rewrite_args(std::env::args_os());
+    let cli = Cli::parse_from(argv);
 
     // ── Initialize logging ──────────────────────────────────────────────
     let log_level = match cli.verbose {
