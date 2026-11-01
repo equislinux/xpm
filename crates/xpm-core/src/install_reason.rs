@@ -70,6 +70,29 @@ impl InstallReason {
     }
 }
 
+/// Marks every package in `packages` with `reason` (`pacman -D --asdeps` /
+/// `--asexplicit`). Every package is validated before any file is written, so
+/// an unknown name leaves the local database untouched.
+pub fn mark_packages(
+    local_db_dir: &Path,
+    packages: &[String],
+    reason: InstallReason,
+) -> XpmResult<usize> {
+    for package in packages {
+        if crate::local_db::read_version(local_db_dir, package).is_none() {
+            return Err(crate::XpmError::PackageNotFound {
+                name: package.clone(),
+            });
+        }
+    }
+
+    for package in packages {
+        reason.write(local_db_dir, package)?;
+    }
+
+    Ok(packages.len())
+}
+
 /// Keeps only the packages whose recorded reason matches `wanted`.
 pub fn retain_by_reason(
     local_db_dir: &Path,
@@ -130,6 +153,48 @@ mod tests {
         assert_eq!(
             InstallReason::read(local_db, "legacy"),
             InstallReason::Explicit
+        );
+    }
+
+    #[test]
+    fn mark_packages_changes_real_entries_and_rejects_unknown_names() {
+        let tmp = TempDir::new().expect("tmp");
+        let local_db = tmp.path().join("local");
+
+        for name in ["alpha", "beta"] {
+            let dir = local_db.join(name);
+            fs::create_dir_all(&dir).expect("pkg dir");
+            fs::write(dir.join(crate::local_db::VERSION_FILE), "1.0-1").expect("version");
+        }
+
+        let count = mark_packages(
+            &local_db,
+            &["alpha".to_string(), "beta".to_string()],
+            InstallReason::Dep,
+        )
+        .expect("mark deps");
+        assert_eq!(count, 2);
+        assert_eq!(InstallReason::read(&local_db, "alpha"), InstallReason::Dep);
+        assert_eq!(InstallReason::read(&local_db, "beta"), InstallReason::Dep);
+
+        mark_packages(&local_db, &["beta".to_string()], InstallReason::Explicit)
+            .expect("mark explicit");
+        assert_eq!(
+            InstallReason::read(&local_db, "beta"),
+            InstallReason::Explicit
+        );
+
+        let err = mark_packages(
+            &local_db,
+            &["alpha".to_string(), "missing".to_string()],
+            InstallReason::Explicit,
+        )
+        .expect_err("unknown package must fail");
+        assert!(err.to_string().contains("missing"));
+        assert_eq!(
+            InstallReason::read(&local_db, "alpha"),
+            InstallReason::Dep,
+            "validation must happen before writing"
         );
     }
 

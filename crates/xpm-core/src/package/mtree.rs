@@ -31,22 +31,23 @@ pub fn parse_mtree(data: &[u8]) -> Result<Vec<MtreeEntry>, XpmError> {
         .map_err(|e| XpmError::Package(format!("invalid UTF-8 in .MTREE: {e}")))?;
 
     let mut entries = Vec::new();
+    let mut defaults = MtreeDefaults::default();
 
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // mtree defaults and unset directives are not package entries.
-        if line == "/set"
-            || line.starts_with("/set ")
-            || line == "/unset"
-            || line.starts_with("/unset ")
-        {
+        if line == "/set" || line.starts_with("/set ") {
+            apply_mtree_set(&mut defaults, line);
+            continue;
+        }
+        if line == "/unset" || line.starts_with("/unset ") {
+            apply_mtree_unset(&mut defaults, line);
             continue;
         }
 
-        let entry = parse_mtree_line(line)?;
+        let entry = parse_mtree_line(line, &defaults)?;
         entries.push(entry);
     }
 
@@ -100,7 +101,70 @@ fn unescape_mtree_bytes(raw: &str) -> Vec<u8> {
 
 // ── Line parser ───────────────────────────────────────────────
 
-fn parse_mtree_line(line: &str) -> Result<MtreeEntry, XpmError> {
+#[derive(Clone, Copy)]
+struct MtreeDefaults {
+    file_type: MtreeFileType,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl Default for MtreeDefaults {
+    fn default() -> Self {
+        Self {
+            file_type: MtreeFileType::File,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+}
+
+fn parse_default_attr(defaults: &mut MtreeDefaults, key: &str, value: &str) {
+    match key {
+        "type" => {
+            if let Ok(file_type) = parse_mtree_type(value) {
+                defaults.file_type = file_type;
+            }
+        }
+        "mode" => defaults.mode = u32::from_str_radix(value, 8).unwrap_or(defaults.mode),
+        "uid" => defaults.uid = value.parse().unwrap_or(defaults.uid),
+        "gid" => defaults.gid = value.parse().unwrap_or(defaults.gid),
+        _ => {}
+    }
+}
+
+fn apply_mtree_set(defaults: &mut MtreeDefaults, line: &str) {
+    for attr in line.split_whitespace().skip(1) {
+        if let Some((key, value)) = attr.split_once('=') {
+            parse_default_attr(defaults, key, value);
+        }
+    }
+}
+
+fn apply_mtree_unset(defaults: &mut MtreeDefaults, line: &str) {
+    for key in line.split_whitespace().skip(1) {
+        match key {
+            "all" => *defaults = MtreeDefaults::default(),
+            "type" => defaults.file_type = MtreeFileType::File,
+            "mode" => defaults.mode = 0o644,
+            "uid" => defaults.uid = 0,
+            "gid" => defaults.gid = 0,
+            _ => {}
+        }
+    }
+}
+
+fn parse_mtree_type(value: &str) -> Result<MtreeFileType, XpmError> {
+    match value {
+        "dir" => Ok(MtreeFileType::Dir),
+        "file" => Ok(MtreeFileType::File),
+        "link" => Ok(MtreeFileType::Link),
+        other => Err(XpmError::Package(format!("unknown .MTREE type: {other}"))),
+    }
+}
+
+fn parse_mtree_line(line: &str, defaults: &MtreeDefaults) -> Result<MtreeEntry, XpmError> {
     let mut parts = line.split_whitespace();
 
     let path_str = parts
@@ -108,10 +172,10 @@ fn parse_mtree_line(line: &str) -> Result<MtreeEntry, XpmError> {
         .ok_or_else(|| XpmError::Package("empty .MTREE line".into()))?;
     let path = PathBuf::from(OsString::from_vec(unescape_mtree_bytes(path_str)));
 
-    let mut file_type = MtreeFileType::File;
-    let mut mode: u32 = 0o644;
-    let mut uid: u32 = 0;
-    let mut gid: u32 = 0;
+    let mut file_type = defaults.file_type;
+    let mut mode: u32 = defaults.mode;
+    let mut uid: u32 = defaults.uid;
+    let mut gid: u32 = defaults.gid;
     let mut size: u64 = 0;
     let mut sha256: Option<String> = None;
     let mut link_target: Option<String> = None;
@@ -123,16 +187,7 @@ fn parse_mtree_line(line: &str) -> Result<MtreeEntry, XpmError> {
         };
 
         match key {
-            "type" => {
-                file_type = match value {
-                    "dir" => MtreeFileType::Dir,
-                    "file" => MtreeFileType::File,
-                    "link" => MtreeFileType::Link,
-                    other => {
-                        return Err(XpmError::Package(format!("unknown .MTREE type: {other}")));
-                    }
-                };
-            }
+            "type" => file_type = parse_mtree_type(value)?,
             "mode" => {
                 mode = u32::from_str_radix(value, 8).unwrap_or(0o644);
             }
@@ -254,6 +309,20 @@ mod tests {
         let entries = parse_mtree(&gz).expect("gzip mtree must parse");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sha256.as_deref(), Some("aa"));
+    }
+
+    #[test]
+    fn parse_applies_set_defaults_to_subsequent_entries() {
+        let data = "#mtree\n/set type=file uid=0 gid=0 mode=644\n/set mode=755\n./usr type=dir\n./usr/bin/acpi\n/set mode=644\n./usr/share/man/man1/acpi.1.gz\n/set type=dir\n./var type=dir\n";
+        let entries = parse_mtree(data.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].file_type, MtreeFileType::Dir);
+        assert_eq!(entries[0].mode, 0o755);
+        assert_eq!(entries[1].file_type, MtreeFileType::File);
+        assert_eq!(entries[1].mode, 0o755);
+        assert_eq!(entries[2].mode, 0o644);
+        assert_eq!(entries[3].file_type, MtreeFileType::Dir);
+        assert_eq!(entries[3].mode, 0o644);
     }
 
     #[test]

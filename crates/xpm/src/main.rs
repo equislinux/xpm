@@ -18,16 +18,19 @@ use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
 use xpm_core::alpm_hooks::{self, HookOperation, HookTransaction, HookWhen};
+use xpm_core::check;
 use xpm_core::config::Repository;
 use xpm_core::conflict;
 use xpm_core::depcheck;
+use xpm_core::deptest::{self, InstalledDependency};
 use xpm_core::generations;
 use xpm_core::groups;
-use xpm_core::install_reason::{retain_by_reason, InstallReason};
+use xpm_core::install_reason::{mark_packages, retain_by_reason, InstallReason};
 use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::local_db;
 use xpm_core::orphans::{find_orphans, InstalledPackage};
 use xpm_core::package::{read_metadata, PackageMeta};
+use xpm_core::query;
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db, RepoEntry};
 use xpm_core::repo_sync::{
@@ -176,6 +179,9 @@ fn main() -> Result<()> {
         Command::Diff(args) => cmd_diff(&config, args),
         Command::ImportPacman(args) => cmd_import_pacman(&config, args),
         Command::SyncPacmanDb(args) => cmd_sync_pacman_db(&config, args),
+        Command::Check(args) => cmd_check(&config, args),
+        Command::Mark(args) => cmd_mark(&config, args),
+        Command::Deptest(args) => cmd_deptest(&config, args),
         Command::Groups(args) => cmd_groups(&config, args),
         Command::Usage(args) => cmd_help(args),
     }
@@ -2039,11 +2045,60 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
 
 fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
     let local_db_dir = config.options.db_path.join("local");
-    let installed = read_installed_versions(&local_db_dir)?;
-    let mut packages: Vec<(String, String)> = installed.into_iter().collect();
+    let local = query::load_local_packages(&local_db_dir)?;
+
+    if let Some(owner_path) = args.owner.as_deref() {
+        if args.filter.is_some() {
+            anyhow::bail!(
+                "xpm query: --owner takes one path and cannot be combined with a name filter"
+            );
+        }
+
+        let owners = query::find_owners(&local, &config.options.root_dir, owner_path);
+        if owners.is_empty() {
+            eprintln!("error: no package owns {owner_path}");
+            exit_with(1);
+        }
+        for owner in owners {
+            println!("{owner_path} is owned by {} {}", owner.name, owner.version);
+        }
+        return Ok(());
+    }
+
+    if args.explicit && args.deps {
+        anyhow::bail!("xpm query: --explicit and --deps are mutually exclusive");
+    }
 
     if let Some(filter) = args.filter.as_deref() {
-        packages.retain(|(name, _)| name.contains(filter));
+        if !args.search {
+            let installed = local.iter().any(|package| package.name == filter);
+            if !installed {
+                eprintln!("error: package '{filter}' was not found");
+                exit_with(1);
+            }
+        }
+    }
+
+    let mut packages: Vec<(String, String)> = local
+        .iter()
+        .map(|package| (package.name.clone(), package.version.clone()))
+        .collect();
+
+    if args.foreign {
+        let sync_dir = config.options.db_path.join("sync");
+        let sync_names = read_sync_package_names(config, &sync_dir)?;
+        let foreign: HashSet<String> = query::find_foreign(&local, &sync_names)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        packages.retain(|(name, _)| foreign.contains(name));
+    }
+
+    if args.unrequired {
+        let unrequired: HashSet<String> = query::find_unrequired(&local, args.deps)
+            .into_iter()
+            .collect();
+        packages.retain(|(name, _)| unrequired.contains(name));
     }
 
     if args.upgrades {
@@ -2069,13 +2124,8 @@ fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
                 provides: local_db::read_provides(&local_db_dir, name)?,
             });
         }
-        let orphans: std::collections::HashSet<String> =
-            find_orphans(&installed_packages).into_iter().collect();
+        let orphans: HashSet<String> = find_orphans(&installed_packages).into_iter().collect();
         packages.retain(|(name, _)| orphans.contains(name));
-    }
-
-    if args.explicit && args.deps {
-        anyhow::bail!("xpm query: --explicit and --deps are mutually exclusive");
     }
 
     if args.explicit || args.deps {
@@ -2087,14 +2137,155 @@ fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
         retain_by_reason(&local_db_dir, &mut packages, wanted);
     }
 
+    if let Some(filter) = args.filter.as_deref() {
+        if args.search {
+            packages.retain(|(name, _)| name.contains(filter));
+        } else {
+            packages.retain(|(name, _)| name == filter);
+        }
+    }
+
     packages.sort();
     for (name, version) in &packages {
-        match args.format.as_str() {
-            "tsv" => println!("{name}\t{version}"),
-            _ => println!("{name} {version}"),
+        if args.quiet {
+            println!("{name}");
+        } else {
+            match args.format.as_str() {
+                "tsv" => println!("{name}\t{version}"),
+                _ => println!("{name} {version}"),
+            }
         }
     }
     Ok(())
+}
+
+fn read_sync_package_names(config: &XpmConfig, sync_dir: &Path) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+
+    for repo in &config.repositories {
+        let db_path = sync_dir.join(format!("{}.db", repo.name));
+        if !db_path.exists() {
+            continue;
+        }
+        let db = parse_sync_db(&db_path, &repo.name)
+            .with_context(|| format!("failed to parse sync db {}", db_path.display()))?;
+        names.extend(db.entries.into_iter().map(|entry| entry.name));
+    }
+
+    Ok(names)
+}
+
+fn cmd_check(config: &XpmConfig, args: &cli::CheckArgs) -> Result<()> {
+    let local_db_dir = config.options.db_path.join("local");
+    let installed = read_installed_versions(&local_db_dir)?;
+
+    let targets = if args.packages.is_empty() {
+        let mut names: Vec<String> = installed.keys().cloned().collect();
+        names.sort();
+        names
+    } else {
+        let mut names = Vec::new();
+        for name in &args.packages {
+            if !installed.contains_key(name) {
+                return Err(XpmError::PackageNotFound { name: name.clone() }.into());
+            }
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    };
+
+    let mut failed = false;
+    for name in &targets {
+        match check::check_package(&config.options.root_dir, &local_db_dir, name, args.full) {
+            Ok(report) => {
+                for path in &report.missing {
+                    println!("warning: {name}: {path} (missing)");
+                }
+                if args.full {
+                    for path in &report.altered {
+                        println!("warning: {name}: {path} (altered)");
+                    }
+                    for path in &report.metadata_issues {
+                        println!("warning: {name}: {path} (missing metadata)");
+                    }
+                    if report.metadata_missing {
+                        println!("warning: {name}: no stored mtree; full check unavailable");
+                    }
+                    println!(
+                        "{name}: {} total files, {} altered files",
+                        report.total,
+                        report.altered.len()
+                    );
+                } else {
+                    println!(
+                        "{name}: {} total files, {} missing files",
+                        report.total,
+                        report.missing.len()
+                    );
+                }
+                if !report.is_ok(args.full) {
+                    failed = true;
+                }
+            }
+            Err(err) => {
+                eprintln!("error: {name}: {err:#}");
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        exit_with(1);
+    }
+    Ok(())
+}
+
+fn cmd_mark(config: &XpmConfig, args: &cli::MarkArgs) -> Result<()> {
+    if args.as_deps == args.as_explicit {
+        anyhow::bail!("xpm mark: exactly one of --as-deps or --as-explicit is required");
+    }
+
+    let reason = if args.as_deps {
+        InstallReason::Dep
+    } else {
+        InstallReason::Explicit
+    };
+    let local_db_dir = config.options.db_path.join("local");
+    let count = mark_packages(&local_db_dir, &args.packages, reason)?;
+    let label = if args.as_deps {
+        "installed as dependencies"
+    } else {
+        "explicitly installed"
+    };
+    println!(":: Marked {count} package(s) as {label}.");
+    Ok(())
+}
+
+fn cmd_deptest(config: &XpmConfig, args: &cli::DeptestArgs) -> Result<()> {
+    let local_db_dir = config.options.db_path.join("local");
+    let installed = query::load_local_packages(&local_db_dir)?;
+    let candidates: Vec<InstalledDependency> = installed
+        .iter()
+        .map(query::LocalPackage::dependency_view)
+        .collect();
+
+    let unmet = deptest::unmet_dependencies(&args.dependencies, &candidates);
+    for spec in &unmet {
+        println!("{spec}");
+    }
+
+    if !unmet.is_empty() {
+        exit_with(127);
+    }
+    Ok(())
+}
+
+fn exit_with(code: i32) -> ! {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    std::process::exit(code);
 }
 
 fn cmd_search(config: &XpmConfig, args: &cli::SearchArgs) -> Result<()> {
@@ -2638,6 +2829,7 @@ GLOBAL FLAGS:
 PACMAN ALIASES:
     Sy → sync     S → install    R → remove     Su → upgrade
     Q  → query    Ss → search    Si → info      Ql → files
+    Qk → check    D → mark       T → deptest
 
 DOCUMENTATION:
     Full CLI reference: docs/CLI.md
@@ -2662,9 +2854,14 @@ QUERIES:
     search      Search for packages in sync databases
     info        Display detailed package information
     files       List files owned by a package
+    check       Verify installed files against the local database
+    deptest     Test dependency specifications against installed packages
     history     Show the transaction journal
     rollback    Undo the last transaction (package level, from the cache)
     diff        Compare installed packages against a generation capture
+
+DATABASE MAINTENANCE:
+    mark        Change install reasons without reinstalling
 
 REPOSITORY MANAGEMENT:
     repo add    Add a temporary repository
@@ -2872,22 +3069,83 @@ USAGE:
     xpm Q [FILTER] [OPTIONS]
 
 DESCRIPTION:
-    Query the local package database for installed packages.
+    Query the local package database for installed packages. FILTER matches
+    the package name exactly; use --search for a substring match.
 
 ARGUMENTS:
-    [FILTER]        Optional package name filter
+    [FILTER]        Exact package name to query
 
 OPTIONS:
     -e, --explicit      List only explicitly installed packages
     -d, --deps          List only packages installed as dependencies
     -t, --orphans       List orphan packages (no longer required)
     -u, --upgrades      List packages with available updates
+    -q, --quiet         Print only package names
+        --search        Treat FILTER as a substring
+        --owner PATH    Show which package owns PATH
+    -m, --foreign       List packages absent from all sync databases
+        --unrequired    List packages no other package directly requires
 
 EXAMPLES:
     xpm query               # List all installed
     xpm Q -e                # Explicit packages only
     xpm query --orphans     # Find orphans
+    xpm query --unrequired --deps  # Unneeded dependency packages
+    xpm query --owner /usr/bin/vim
+    xpm query --foreign
     xpm Q -u                # List upgradeable
+"#
+        ),
+        "check" | "Qk" => println!(
+            r#"xpm check — Verify Installed Files
+
+USAGE:
+    xpm check [--full] [PACKAGES]...
+    xpm Qk [--full] [PACKAGES]...
+
+DESCRIPTION:
+    Verify the files recorded in each installed package's local-database
+    manifest. Fast mode checks existence and file/directory type. --full also
+    verifies the stored .MTREE SHA-256 digests, symlink targets and modes.
+
+OPTIONS:
+    --full          Verify hashes, symlinks and modes (-Qkk)
+
+EXAMPLES:
+    xpm check
+    xpm check --full
+    xpm check hello
+"#
+        ),
+        "mark" | "D" => println!(
+            r#"xpm mark — Change Install Reason
+
+USAGE:
+    xpm mark --as-deps <PACKAGES>...
+    xpm mark --as-explicit <PACKAGES>...
+
+DESCRIPTION:
+    Change the recorded install reason without reinstalling the package.
+
+OPTIONS:
+    --as-deps       Mark as installed as a dependency
+    --as-explicit   Mark as explicitly installed
+"#
+        ),
+        "deptest" | "T" => println!(
+            r#"xpm deptest — Test Dependencies
+
+USAGE:
+    xpm deptest <DEPENDENCIES>...
+
+DESCRIPTION:
+    Test dependency specifications against the installed packages, including
+    versioned provides. Unmet specifications are printed one per line and the
+    command exits with status 127.
+
+EXAMPLES:
+    xpm deptest glibc bash
+    xpm deptest 'python>=3.12'
 "#
         ),
         "search" | "Ss" => println!(

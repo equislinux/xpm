@@ -122,6 +122,18 @@ pub enum Command {
     #[command(name = "sync-pacman-db")]
     SyncPacmanDb(SyncPacmanDbArgs),
 
+    /// Verify installed files against the local database [-Qk/-Qkk].
+    #[command(visible_alias = "Qk")]
+    Check(CheckArgs),
+
+    /// Change the install reason of installed packages [-D].
+    #[command(visible_alias = "D")]
+    Mark(MarkArgs),
+
+    /// Test dependency specifications against installed packages [-T].
+    #[command(visible_alias = "T")]
+    Deptest(DeptestArgs),
+
     /// List package groups (sync or local).
     Groups(GroupsArgs),
 
@@ -233,8 +245,28 @@ pub struct QueryArgs {
     #[arg(long, short = 'd')]
     pub deps: bool,
 
-    /// Filter by package name (optional).
+    /// Exact package name to query (substring with --search).
     pub filter: Option<String>,
+
+    /// Treat FILTER as a substring instead of an exact package name.
+    #[arg(long)]
+    pub search: bool,
+
+    /// Print only package names.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
+    /// Find the installed package that owns PATH.
+    #[arg(long, value_name = "PATH")]
+    pub owner: Option<String>,
+
+    /// List packages that are not present in any configured sync database.
+    #[arg(long, short = 'm')]
+    pub foreign: bool,
+
+    /// List packages that no other installed package directly requires.
+    #[arg(long)]
+    pub unrequired: bool,
 
     /// List orphan packages (no longer required).
     #[arg(long, short = 't')]
@@ -243,6 +275,37 @@ pub struct QueryArgs {
     /// Check for packages that are outdated.
     #[arg(long, short = 'u')]
     pub upgrades: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CheckArgs {
+    /// Also verify the stored .MTREE hashes, modes and symlink targets.
+    #[arg(long)]
+    pub full: bool,
+
+    /// Installed packages to check (default: all).
+    pub packages: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct MarkArgs {
+    /// Mark packages as dependencies.
+    #[arg(long)]
+    pub as_deps: bool,
+
+    /// Mark packages as explicitly installed.
+    #[arg(long)]
+    pub as_explicit: bool,
+
+    /// Installed package names to mark.
+    #[arg(required = true)]
+    pub packages: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct DeptestArgs {
+    /// Dependency specifications to test (e.g. glibc>=2.39).
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]

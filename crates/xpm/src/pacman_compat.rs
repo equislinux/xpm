@@ -7,12 +7,12 @@
 //!
 //! The rewriter is pure and deterministic. Unsupported pacman operations or
 //! flags are returned unchanged so clap can report them instead of silently
-//! dropping meaning. In particular `-Qo` (owner lookup), `-Qm`, `-Qg`, `-Qt`,
-//! `-Qk`, `-D`, `-T`, and `-F` are not implemented yet.
+//! dropping meaning. Implemented query/repair operations include `-Qo`,
+//! `-Qm`, `-Qq`, `-Qt`/`-Qdt`, `-Qg`, `-Qk`/`-Qkk`, `-D --asdeps`,
+//! `-D --asexplicit` and `-T`; `-F` remains deliberately unimplemented.
 //!
-//! `-Qq` is accepted, but xpm query has no quiet mode yet, so it degrades to
-//! `query`. `--color never` maps to `--no-color`; other color modes are left
-//! for clap to reject.
+//! `--color never` maps to `--no-color`; other color modes are left for clap
+//! to reject.
 
 use std::ffi::{OsStr, OsString};
 
@@ -32,6 +32,9 @@ const NATIVE_TOKENS: &[&str] = &[
     "diff",
     "import-pacman",
     "sync-pacman-db",
+    "check",
+    "mark",
+    "deptest",
     "groups",
     "usage",
     "Sy",
@@ -511,9 +514,45 @@ fn build_command(operation: char, modifiers: &[char], flags: &Flags) -> Option<V
             }
             Some(vec![OsString::from("--version")])
         }
-        // -D, -T and -F are deliberately unimplemented.
+        'D' => build_mark_command(modifiers, flags),
+        'T' => build_deptest_command(modifiers, flags),
+        // -F is deliberately unimplemented.
         _ => None,
     }
+}
+
+fn build_mark_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>> {
+    if !modifiers.is_empty()
+        || flags.needed
+        || flags.print
+        || !flags.overwrite.is_empty()
+        || flags.download_only
+        || !flags.ignore.is_empty()
+        || flags.nodeps
+    {
+        return None;
+    }
+
+    match (flags.as_deps, flags.as_explicit) {
+        (true, false) => Some(vec![OsString::from("mark"), OsString::from("--as-deps")]),
+        (false, true) => Some(vec![
+            OsString::from("mark"),
+            OsString::from("--as-explicit"),
+        ]),
+        _ => None,
+    }
+}
+
+fn build_deptest_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>> {
+    if !modifiers.is_empty()
+        || has_install_flags(flags)
+        || has_upgrade_flags(flags)
+        || has_remove_flags(flags)
+    {
+        return None;
+    }
+
+    Some(vec![OsString::from("deptest")])
 }
 
 fn build_sync_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>> {
@@ -630,10 +669,12 @@ fn build_install_command(flags: &Flags) -> Option<Vec<OsString>> {
 }
 
 fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>> {
-    if modifiers
-        .iter()
-        .any(|c| !matches!(c, 'e' | 'd' | 'l' | 'i' | 'q' | 'u'))
-    {
+    if modifiers.iter().any(|c| {
+        !matches!(
+            c,
+            'e' | 'd' | 'l' | 'i' | 'q' | 'u' | 't' | 'o' | 'k' | 'g' | 'm'
+        )
+    }) {
         return None;
     }
 
@@ -645,20 +686,84 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
     let d = count(modifiers, 'd');
     let l = count(modifiers, 'l');
     let i = count(modifiers, 'i');
+    let q = count(modifiers, 'q');
     let u = count(modifiers, 'u');
+    let t = count(modifiers, 't');
+    let o = count(modifiers, 'o');
+    let k = count(modifiers, 'k');
+    let g = count(modifiers, 'g');
+    let m = count(modifiers, 'm');
+
+    if o > 0 {
+        if o > 1 || e + d + l + i + q + u + t + k + g + m > 0 {
+            return None;
+        }
+        return Some(vec![OsString::from("query"), OsString::from("--owner")]);
+    }
+
+    if k > 0 {
+        if k > 2 || e + d + l + i + q + u + t + o + g + m > 0 {
+            return None;
+        }
+        let mut command = vec![OsString::from("check")];
+        if k == 2 {
+            command.push(OsString::from("--full"));
+        }
+        return Some(command);
+    }
+
+    if g > 0 {
+        if g > 1 || e + d + l + i + u + t + o + k + m > 0 {
+            return None;
+        }
+        let mut command = vec![OsString::from("groups"), OsString::from("--local")];
+        if q > 0 {
+            command.push(OsString::from("--quiet"));
+        }
+        return Some(command);
+    }
 
     if l > 0 {
-        if l > 1 || e > 0 || d > 0 || i > 0 || u > 0 {
+        if l > 1 || e > 0 || d > 0 || i > 0 || u > 0 || t > 0 || q > 0 || m > 0 {
             return None;
         }
         return Some(vec![OsString::from("files")]);
     }
 
     if i > 0 {
-        if i > 1 || e > 0 || d > 0 || u > 0 {
+        if i > 1 || e > 0 || d > 0 || u > 0 || t > 0 || q > 0 || m > 0 {
             return None;
         }
         return Some(vec![OsString::from("info")]);
+    }
+
+    if u > 0 && (t > 0 || m > 0) {
+        return None;
+    }
+
+    if t > 0 {
+        if t > 1 {
+            return None;
+        }
+        let mut command = vec![OsString::from("query")];
+        if m > 0 {
+            command.push(OsString::from("--foreign"));
+        }
+        command.push(OsString::from("--unrequired"));
+        if d > 0 {
+            command.push(OsString::from("--deps"));
+        }
+        if e > 0 {
+            command.push(OsString::from("--explicit"));
+        }
+        if q > 0 {
+            command.push(OsString::from("--quiet"));
+        }
+        return Some(command);
+    }
+
+    if m > 1 {
+        return None;
     }
 
     let mut command = vec![OsString::from("query")];
@@ -668,11 +773,15 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
     if d > 0 {
         command.push(OsString::from("--deps"));
     }
+    if m > 0 {
+        command.push(OsString::from("--foreign"));
+    }
     if u > 0 {
         command.push(OsString::from("--upgrades"));
     }
-    // `-Qq` is accepted but xpm query has no --quiet yet; the command degrades
-    // to the normal query output.
+    if q > 0 {
+        command.push(OsString::from("--quiet"));
+    }
     Some(command)
 }
 
@@ -800,9 +909,52 @@ mod tests {
     fn rewrites_query_variants() {
         assert_rewrite(&["xpm", "-Qe"], &["xpm", "query", "--explicit"]);
         assert_rewrite(&["xpm", "-Qd"], &["xpm", "query", "--deps"]);
-        assert_rewrite(&["xpm", "-Qq"], &["xpm", "query"]);
+        assert_rewrite(&["xpm", "-Qq"], &["xpm", "query", "--quiet"]);
         assert_rewrite(&["xpm", "-Qi", "pkg"], &["xpm", "info", "pkg"]);
         assert_rewrite(&["xpm", "-Ql", "pkg"], &["xpm", "files", "pkg"]);
+    }
+
+    #[test]
+    fn rewrites_query_repair_and_database_operations() {
+        assert_rewrite(
+            &["xpm", "-Qo", "/usr/bin/foo"],
+            &["xpm", "query", "--owner", "/usr/bin/foo"],
+        );
+        assert_rewrite(&["xpm", "-Qm"], &["xpm", "query", "--foreign"]);
+        assert_rewrite(&["xpm", "-Qmq"], &["xpm", "query", "--foreign", "--quiet"]);
+        assert_rewrite(&["xpm", "-Qt"], &["xpm", "query", "--unrequired"]);
+        assert_rewrite(
+            &["xpm", "-Qdt"],
+            &["xpm", "query", "--unrequired", "--deps"],
+        );
+        assert_rewrite(
+            &["xpm", "-Qtd"],
+            &["xpm", "query", "--unrequired", "--deps"],
+        );
+        assert_rewrite(
+            &["xpm", "-Qteq"],
+            &["xpm", "query", "--unrequired", "--explicit", "--quiet"],
+        );
+        assert_rewrite(&["xpm", "-Qg"], &["xpm", "groups", "--local"]);
+        assert_rewrite(&["xpm", "-Qqg"], &["xpm", "groups", "--local", "--quiet"]);
+        assert_rewrite(&["xpm", "-Qk"], &["xpm", "check"]);
+        assert_rewrite(&["xpm", "-Qkk"], &["xpm", "check", "--full"]);
+        assert_rewrite(
+            &["xpm", "-Qkk", "hello"],
+            &["xpm", "check", "--full", "hello"],
+        );
+        assert_rewrite(
+            &["xpm", "-D", "--asdeps", "hello"],
+            &["xpm", "mark", "--as-deps", "hello"],
+        );
+        assert_rewrite(
+            &["xpm", "-D", "--asexplicit", "hello"],
+            &["xpm", "mark", "--as-explicit", "hello"],
+        );
+        assert_rewrite(
+            &["xpm", "-T", "glibc>=2.39", "bash"],
+            &["xpm", "deptest", "glibc>=2.39", "bash"],
+        );
     }
 
     #[test]
@@ -823,14 +975,12 @@ mod tests {
     #[test]
     fn leaves_unsupported_operations_unchanged() {
         for args in [
-            vec!["xpm", "-Qo", "/usr/bin/foo"],
-            vec!["xpm", "-Qdt"],
-            vec!["xpm", "-Qm"],
-            vec!["xpm", "-Qg"],
-            vec!["xpm", "-Qk"],
-            vec!["xpm", "-Qkk"],
-            vec!["xpm", "-D", "--asdeps", "pkg"],
-            vec!["xpm", "-T"],
+            vec!["xpm", "-Qkkk"],
+            vec!["xpm", "-Qo", "-Qm"],
+            vec!["xpm", "-Qgl"],
+            vec!["xpm", "-D", "pkg"],
+            vec!["xpm", "-D", "--asdeps", "--asexplicit", "pkg"],
+            vec!["xpm", "-T", "--needed", "pkg"],
             vec!["xpm", "-F"],
             vec!["xpm", "--gpgdir", "/tmp/gnupg", "-Syu"],
         ] {
@@ -903,6 +1053,20 @@ mod tests {
             vec!["xpm", "-Qe"],
             vec!["xpm", "-Qd"],
             vec!["xpm", "-Qq"],
+            vec!["xpm", "-Qo", "/usr/bin/foo"],
+            vec!["xpm", "-Qm"],
+            vec!["xpm", "-Qmq"],
+            vec!["xpm", "-Qt"],
+            vec!["xpm", "-Qdt"],
+            vec!["xpm", "-Qg"],
+            vec!["xpm", "-Qqg"],
+            vec!["xpm", "-Qk"],
+            vec!["xpm", "-Qkk"],
+            vec!["xpm", "-Qkk", "hello"],
+            vec!["xpm", "-D", "--asdeps", "hello"],
+            vec!["xpm", "-D", "--asexplicit", "hello"],
+            vec!["xpm", "-T", "glibc>=2.39"],
+            vec!["xpm", "-T"],
             vec!["xpm", "-Qi", "pkg"],
             vec!["xpm", "-Ql", "pkg"],
             vec!["xpm", "-Ss", "query"],

@@ -5,9 +5,11 @@
 
 pub mod alpm_hooks;
 pub mod cache;
+pub mod check;
 pub mod config;
 pub mod conflict;
 pub mod depcheck;
+pub mod deptest;
 pub mod error;
 pub mod generations;
 pub mod groups;
@@ -20,6 +22,7 @@ pub mod orphans;
 pub mod package;
 pub mod pacman_conf;
 pub mod pacman_db;
+pub mod query;
 pub mod replace;
 pub mod repo;
 pub mod repo_db;
