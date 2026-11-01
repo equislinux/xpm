@@ -481,6 +481,43 @@ mod install_checks {
     }
 
     #[test]
+    fn upgrade_that_breaks_reverse_dependency_is_reported() {
+        let mut app = installed("app", "1-1", &[]);
+        app.depends = vec![DepConstraint::parse("lib=1")];
+        let mut lib = installed("lib", "1-1", &[]);
+        lib.provides = vec![];
+        let new_lib = InstalledPkg {
+            name: "lib".to_string(),
+            version: Version::parse("2-1"),
+            depends: vec![],
+            provides: vec![],
+            reason: InstallReason::Explicit,
+        };
+
+        let err = check_installed_closure(&[app, lib], &["lib".to_string()], &[new_lib])
+            .expect_err("lib=1 is no longer satisfied");
+        assert!(matches!(err, XpmError::DependencyConflict(_)));
+        assert!(format!("{err}").contains("removing lib breaks dependency 'lib=1' required by app"));
+    }
+
+    #[test]
+    fn replacement_providing_old_name_satisfies_reverse_dependency() {
+        let mut app = installed("app", "1-1", &[]);
+        app.depends = vec![DepConstraint::parse("old")];
+        let old = installed("old", "1-1", &[]);
+        let new = InstalledPkg {
+            name: "new".to_string(),
+            version: Version::parse("1-1"),
+            depends: vec![],
+            provides: vec![DepConstraint::parse("old")],
+            reason: InstallReason::Explicit,
+        };
+
+        check_installed_closure(&[app, old], &["old".to_string()], &[new])
+            .expect("new provides old");
+    }
+
+    #[test]
     fn self_provide_conflict_is_ignored() {
         check_install(&[], &[target("udev", "1-1", &[], &["udev"], &["udev"])])
             .expect("a package does not conflict with itself");
@@ -989,6 +1026,58 @@ pub fn check_install(installed: &[InstalledPkg], targets: &[InstallTarget]) -> X
                         target.name, other.name, conflict
                     ));
                 }
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+    problems.sort();
+    problems.dedup();
+    Err(XpmError::DependencyConflict(problems.join("\n")))
+}
+
+/// Verify that every package remaining after `removed` (plus `added`) has all
+/// of its dependencies satisfied by the resulting set.
+///
+/// This catches reverse-dependency breakage during upgrades and replacements,
+/// not just the dependencies of the transaction targets.
+pub fn check_installed_closure(
+    installed: &[InstalledPkg],
+    removed: &[String],
+    added: &[InstalledPkg],
+) -> XpmResult<()> {
+    let removed: HashSet<&str> = removed.iter().map(String::as_str).collect();
+    let live: Vec<&InstalledPkg> = installed
+        .iter()
+        .filter(|package| !removed.contains(package.name.as_str()))
+        .collect();
+    let candidates: Vec<&InstalledPkg> = live.iter().copied().chain(added.iter()).collect();
+
+    let mut problems = Vec::new();
+    for package in &candidates {
+        for dependency in &package.depends {
+            if candidates
+                .iter()
+                .any(|candidate| satisfies(candidate, dependency, false))
+            {
+                continue;
+            }
+
+            let causing = installed.iter().find(|candidate| {
+                removed.contains(candidate.name.as_str()) && satisfies(candidate, dependency, false)
+            });
+
+            match causing {
+                Some(causing) => problems.push(format!(
+                    "removing {} breaks dependency '{}' required by {}",
+                    causing.name, dependency, package.name
+                )),
+                None => problems.push(format!(
+                    "unable to satisfy dependency '{}' required by {}",
+                    dependency, package.name
+                )),
             }
         }
     }

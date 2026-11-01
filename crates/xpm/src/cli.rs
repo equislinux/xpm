@@ -122,6 +122,9 @@ pub enum Command {
     #[command(name = "sync-pacman-db")]
     SyncPacmanDb(SyncPacmanDbArgs),
 
+    /// List package groups (sync or local).
+    Groups(GroupsArgs),
+
     /// Display detailed usage information and guides.
     Usage(HelpArgs),
 }
@@ -339,6 +342,20 @@ pub struct DiffArgs {
     /// Emit the diff as a single JSON object.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct GroupsArgs {
+    /// List local groups instead of sync repository groups.
+    #[arg(long)]
+    pub local: bool,
+
+    /// Print only package names.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
+    /// Restrict output to one group.
+    pub group: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

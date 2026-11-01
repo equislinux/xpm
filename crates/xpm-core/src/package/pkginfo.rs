@@ -67,6 +67,7 @@ pub fn parse_pkginfo(data: &[u8]) -> Result<PackageMeta, XpmError> {
             "optdepend" => meta.optdepends.push(value.to_string()),
             "provides" => meta.provides.push(value.to_string()),
             "conflict" => meta.conflicts.push(value.to_string()),
+            "group" => meta.groups.push(value.to_string()),
             "replaces" => meta.replaces.push(value.to_string()),
             "backup" => meta.backup.push(normalize_backup_path(value)),
             other => {

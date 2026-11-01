@@ -29,6 +29,7 @@ pub struct RepoEntry {
     pub provides: Vec<String>,
     pub conflicts: Vec<String>,
     pub replaces: Vec<String>,
+    pub groups: Vec<String>,
     pub files: Vec<String>,
 }
 
@@ -260,6 +261,7 @@ fn repo_entry_from_sections(
         provides: values(sections, "PROVIDES"),
         conflicts: values(sections, "CONFLICTS"),
         replaces: values(sections, "REPLACES"),
+        groups: values(sections, "GROUPS"),
         files: Vec::new(),
     })
 }

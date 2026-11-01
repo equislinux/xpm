@@ -126,6 +126,11 @@ fn import_one(dir: &Path, dest_local: &Path, force: bool) -> XpmResult<Option<()
             &name,
             &sections.get("PROVIDES").cloned().unwrap_or_default(),
         )?;
+        local_db::write_groups(
+            &staging_root,
+            &name,
+            &sections.get("GROUPS").cloned().unwrap_or_default(),
+        )?;
         fs::write(staging.join(local_db::VERSION_FILE), &version)?;
 
         let reason = match first_value(&sections, "REASON").as_deref() {

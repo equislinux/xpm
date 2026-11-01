@@ -21,6 +21,7 @@ use xpm_core::config::Repository;
 use xpm_core::conflict;
 use xpm_core::depcheck;
 use xpm_core::generations;
+use xpm_core::groups;
 use xpm_core::install_reason::{retain_by_reason, InstallReason};
 use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::local_db;
@@ -173,6 +174,7 @@ fn main() -> Result<()> {
         Command::Diff(args) => cmd_diff(&config, args),
         Command::ImportPacman(args) => cmd_import_pacman(&config, args),
         Command::SyncPacmanDb(args) => cmd_sync_pacman_db(&config, args),
+        Command::Groups(args) => cmd_groups(&config, args),
         Command::Usage(args) => cmd_help(args),
     }
 }
@@ -288,6 +290,25 @@ fn cmd_sync(config: &XpmConfig, args: &cli::SyncArgs) -> Result<()> {
     Ok(())
 }
 
+fn read_all_sync_entries(
+    config: &XpmConfig,
+    sync_dir: &Path,
+) -> Result<Vec<(Repository, RepoEntry)>> {
+    let mut entries = Vec::new();
+    for repo in &config.repositories {
+        let db_path = sync_dir.join(format!("{}.db", repo.name));
+        if !db_path.exists() {
+            continue;
+        }
+        let db = parse_sync_db(&db_path, &repo.name)
+            .with_context(|| format!("failed to parse sync db {}", display_rel_or_abs(&db_path)))?;
+        for entry in db.entries {
+            entries.push((repo.clone(), entry));
+        }
+    }
+    Ok(entries)
+}
+
 fn display_rel_or_abs(path: &Path) -> String {
     std::env::current_dir()
         .ok()
@@ -382,6 +403,26 @@ fn confirm_action(prompt: &str, no_confirm: bool) -> Result<()> {
     }
 }
 
+fn confirm_replace(old: &str, repo: &str, new: &str, no_confirm: bool) -> Result<bool> {
+    if no_confirm || !io::stdin().is_terminal() {
+        return Ok(true);
+    }
+
+    loop {
+        print!("Replace {old} with {repo}/{new}? [Y/n] ");
+        io::stdout().flush().context("failed to flush prompt")?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("failed to read replacement answer")?;
+        match input.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => continue,
+        }
+    }
+}
+
 /// Build a resolver candidate from a sync database entry.
 fn resolver_candidate(entry: &RepoEntry) -> PackageCandidate {
     PackageCandidate {
@@ -407,12 +448,21 @@ fn resolver_candidate(entry: &RepoEntry) -> PackageCandidate {
 }
 
 /// Local-database metadata recorded for every package installed in a run.
+struct UpgradePlanItem {
+    repo: Repository,
+    entry: RepoEntry,
+    local_version: String,
+    is_new: bool,
+    replaced: Option<(String, String, InstallReason)>,
+}
+
 struct InstalledRecord {
     name: String,
     version: String,
     repo: String,
     depends: Vec<String>,
     provides: Vec<String>,
+    groups: Vec<String>,
     reason: InstallReason,
     pkg_file: PathBuf,
 }
@@ -462,7 +512,49 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             }
         }
 
-        let requirements = package_names
+        let mut group_index = groups::GroupIndex::new();
+        for (repo, entry) in &sync_entries {
+            group_index.add(groups::GroupPackage {
+                name: entry.name.clone(),
+                version: Version::parse(&entry.version),
+                repo: Some(repo.name.clone()),
+                groups: entry.groups.clone(),
+            });
+        }
+        let package_name_set: HashSet<String> = sync_entries
+            .iter()
+            .map(|(_, entry)| entry.name.clone())
+            .collect();
+        let provider_set: HashSet<String> = sync_entries
+            .iter()
+            .flat_map(|(_, entry)| {
+                entry
+                    .provides
+                    .iter()
+                    .map(|provide| DepConstraint::parse(provide).name)
+            })
+            .collect();
+
+        let mut expanded_names = Vec::new();
+        for name in &package_names {
+            if name.contains('/') {
+                expanded_names.push((*name).clone());
+                continue;
+            }
+            match group_index.resolve_target(name, &package_name_set, &provider_set) {
+                groups::TargetResolution::Group(members) => {
+                    println!(":: Group {}: {} member(s)", name, members.len());
+                    for member in members {
+                        if !expanded_names.contains(&member.name) {
+                            expanded_names.push(member.name);
+                        }
+                    }
+                }
+                _ => expanded_names.push((*name).clone()),
+            }
+        }
+
+        let requirements = expanded_names
             .iter()
             .map(|spec| Requirement::parse(spec))
             .collect::<XpmResult<Vec<_>>>()?;
@@ -471,11 +563,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             .with_context(|| {
                 format!(
                     "failed to resolve dependencies for: {}",
-                    package_names
-                        .iter()
-                        .map(|spec| spec.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    expanded_names.join(", ")
                 )
             })?;
 
@@ -633,6 +721,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             repo: "local".to_string(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
+            groups: metadata.meta.groups.clone(),
             reason: pkg_reason,
             pkg_file: path.to_path_buf(),
         });
@@ -724,6 +813,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             repo: repo.name.clone(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
+            groups: metadata.meta.groups.clone(),
             reason: pkg_reason,
             pkg_file: dest.clone(),
         });
@@ -765,7 +855,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     let installed_pkgs = load_installed_pkgs(&local_db_dir)?;
     depcheck::check_install(&installed_pkgs, &target_pkgs)
         .context("installation dependency check failed")?;
-    check_transaction_file_conflicts(config, &local_db_dir, &target_manifests, &overwrite)?;
+    check_transaction_file_conflicts(config, &local_db_dir, &target_manifests, &[], &overwrite)?;
 
     // Phase 2/3: prepare, commit, hooks and journal.
     commit_transaction(
@@ -787,6 +877,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             .with_context(|| format!("failed to record dependencies for '{}'", record.name))?;
         local_db::write_provides(&local_db_dir, &record.name, &record.provides)
             .with_context(|| format!("failed to record provides for '{}'", record.name))?;
+        local_db::write_groups(&local_db_dir, &record.name, &record.groups)
+            .with_context(|| format!("failed to record groups for '{}'", record.name))?;
     }
 
     mirror_pacman_records(config, &installed)?;
@@ -811,7 +903,38 @@ fn cmd_remove(config: &XpmConfig, args: &cli::RemoveArgs, no_confirm: bool) -> R
         ignore_versions: args.no_deps == 1,
         skip_deps: args.no_deps >= 2,
     };
-    let plan = depcheck::plan_removal(&installed, &args.packages, &options)
+
+    let mut local_groups = groups::GroupIndex::new();
+    let package_names: HashSet<String> = installed.iter().map(|pkg| pkg.name.clone()).collect();
+    let providers: HashSet<String> = installed
+        .iter()
+        .flat_map(|pkg| pkg.provides.iter().map(|provide| provide.name.clone()))
+        .collect();
+    for pkg in &installed {
+        local_groups.add(groups::GroupPackage {
+            name: pkg.name.clone(),
+            version: pkg.version.clone(),
+            repo: None,
+            groups: local_db::read_groups(&local_db_dir, &pkg.name)?,
+        });
+    }
+
+    let mut expanded_targets = Vec::new();
+    for target in &args.packages {
+        match local_groups.resolve_target(target, &package_names, &providers) {
+            groups::TargetResolution::Group(members) => {
+                println!(":: Group {}: {} member(s)", target, members.len());
+                for member in members {
+                    if !expanded_targets.contains(&member.name) {
+                        expanded_targets.push(member.name);
+                    }
+                }
+            }
+            _ => expanded_targets.push(target.clone()),
+        }
+    }
+
+    let plan = depcheck::plan_removal(&installed, &expanded_targets, &options)
         .context("failed to plan removal")?;
 
     if plan.is_empty() {
@@ -895,9 +1018,101 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
 
     let remote_latest = read_latest_remote_entries(config, &sync_dir)?;
 
+    // Sysupgrade replacements: scan repositories in priority order before the
+    // normal same-name upgrade pass.
+    let all_sync_entries = read_all_sync_entries(config, &sync_dir)?;
+    let repo_ranks: HashMap<String, usize> = config
+        .repositories
+        .iter()
+        .enumerate()
+        .map(|(rank, repo)| (repo.name.clone(), rank))
+        .collect();
+    let replacement_candidates: Vec<xpm_core::replace::ReplacementCandidate> = all_sync_entries
+        .iter()
+        .filter_map(|(repo, entry)| {
+            let rank = *repo_ranks.get(&repo.name)?;
+            Some(xpm_core::replace::ReplacementCandidate {
+                name: entry.name.clone(),
+                version: Version::parse(&entry.version),
+                repo_rank: rank,
+                replaces: entry
+                    .replaces
+                    .iter()
+                    .map(|replace| DepConstraint::parse(replace))
+                    .collect(),
+                provides: entry
+                    .provides
+                    .iter()
+                    .map(|provide| DepConstraint::parse(provide))
+                    .collect(),
+                conflicts: entry
+                    .conflicts
+                    .iter()
+                    .map(|conflict| DepConstraint::parse(conflict))
+                    .collect(),
+            })
+        })
+        .collect();
+    let installed_replacements: Vec<xpm_core::replace::InstalledReplacement> = installed
+        .iter()
+        .map(|(name, version)| xpm_core::replace::InstalledReplacement {
+            name: name.clone(),
+            version: Version::parse(version),
+            reason: InstallReason::read_optional(&local_db_dir, name)
+                .unwrap_or(InstallReason::Explicit),
+            groups: Vec::new(),
+        })
+        .collect();
+    let mut ignore_patterns = args.ignore.clone();
+    ignore_patterns.extend(config.options.ignore_pkg.iter().cloned());
+    let found_replacements = xpm_core::replace::find_replacements(
+        &installed_replacements,
+        &replacement_candidates,
+        &ignore_patterns,
+        &config.options.ignore_group,
+    );
+
+    let mut replacement_new: HashMap<String, xpm_core::replace::Replacement> = HashMap::new();
+    let mut replacement_old_names: HashSet<String> = HashSet::new();
+    let mut replacement_entries: HashMap<String, (Repository, RepoEntry)> = HashMap::new();
+    for replacement in found_replacements {
+        let repo_name = config
+            .repositories
+            .get(replacement.repo_rank)
+            .map(|repo| repo.name.clone())
+            .unwrap_or_default();
+        if !confirm_replace(
+            &replacement.old_name,
+            &repo_name,
+            &replacement.new_name,
+            no_confirm || args.print,
+        )? {
+            continue;
+        }
+
+        let selected = all_sync_entries
+            .iter()
+            .find(|(repo, entry)| {
+                repo.name == repo_name
+                    && entry.name == replacement.new_name
+                    && Version::parse(&entry.version) == replacement.new_version
+            })
+            .cloned();
+        let Some((repo, entry)) = selected else {
+            continue;
+        };
+
+        replacement_old_names.insert(replacement.old_name.clone());
+        replacement_entries.insert(replacement.new_name.clone(), (repo, entry));
+        replacement_new.insert(replacement.new_name.clone(), replacement);
+    }
+
     let mut planned = Vec::new();
     for (pkg_name, local_version) in &installed {
-        if args.ignore.iter().any(|i| i == pkg_name) {
+        if args.ignore.iter().any(|i| i == pkg_name)
+            || config.options.ignore_pkg.iter().any(|i| i == pkg_name)
+            || replacement_old_names.contains(pkg_name)
+        {
             continue;
         }
 
@@ -911,17 +1126,18 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         }
     }
 
-    if planned.is_empty() {
+    if planned.is_empty() && replacement_new.is_empty() {
         println!(":: Nothing to do. System is up to date.");
         return Ok(());
     }
 
     // Include the transitive closure of the upgraded packages so new or
     // newly-required dependencies are installed in the same run.
-    let planned_names: HashSet<String> = planned
+    let mut planned_names: HashSet<String> = planned
         .iter()
         .map(|(_, entry, _)| entry.name.clone())
         .collect();
+    planned_names.extend(replacement_new.keys().cloned());
     let mut candidates = Vec::new();
     for (_, entry) in remote_latest.values() {
         candidates.push(resolver_candidate(entry));
@@ -940,8 +1156,30 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         )
     })?;
 
-    let mut plan: Vec<(Repository, RepoEntry, String, bool)> = Vec::new();
+    let mut plan: Vec<UpgradePlanItem> = Vec::new();
+    let mut planned_replacements: HashSet<String> = HashSet::new();
     for (candidate, _explicit) in closure {
+        if let Some(replacement) = replacement_new.get(&candidate.name) {
+            if let Some((repo, entry)) = replacement_entries.get(&candidate.name) {
+                plan.push(UpgradePlanItem {
+                    repo: repo.clone(),
+                    entry: entry.clone(),
+                    local_version: String::new(),
+                    is_new: true,
+                    replaced: Some((
+                        replacement.old_name.clone(),
+                        replacement.old_version.to_string(),
+                        replacement.old_reason,
+                    )),
+                });
+                planned_replacements.insert(candidate.name.clone());
+            }
+            continue;
+        }
+        if replacement_old_names.contains(&candidate.name) {
+            continue;
+        }
+
         let Some((repo, entry)) = remote_latest.get(&candidate.name) else {
             continue;
         };
@@ -953,25 +1191,89 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
                 let ordering = Version::cmp_versions(&entry.version, local);
                 let requested = planned_names.contains(&candidate.name);
                 if ordering.is_gt() || (args.force && ordering.is_eq() && requested) {
-                    plan.push((repo.clone(), entry.clone(), local.clone(), false));
+                    plan.push(UpgradePlanItem {
+                        repo: repo.clone(),
+                        entry: entry.clone(),
+                        local_version: local.clone(),
+                        is_new: false,
+                        replaced: None,
+                    });
                 }
             }
-            None => plan.push((repo.clone(), entry.clone(), String::new(), true)),
+            None => plan.push(UpgradePlanItem {
+                repo: repo.clone(),
+                entry: entry.clone(),
+                local_version: String::new(),
+                is_new: true,
+                replaced: None,
+            }),
         }
     }
 
-    let upgrade_count = plan.iter().filter(|(_, _, _, is_new)| !*is_new).count();
-    let new_dep_count = plan.iter().filter(|(_, _, _, is_new)| *is_new).count();
-    if new_dep_count > 0 {
+    for (name, replacement) in &replacement_new {
+        if planned_replacements.contains(name) {
+            continue;
+        }
+        let Some((repo, entry)) = replacement_entries.get(name) else {
+            continue;
+        };
+        plan.push(UpgradePlanItem {
+            repo: repo.clone(),
+            entry: entry.clone(),
+            local_version: String::new(),
+            is_new: true,
+            replaced: Some((
+                replacement.old_name.clone(),
+                replacement.old_version.to_string(),
+                replacement.old_reason,
+            )),
+        });
+    }
+
+    let mut removed_upgrade_names: Vec<String> = plan
+        .iter()
+        .filter(|item| !item.is_new)
+        .map(|item| item.entry.name.clone())
+        .collect();
+    removed_upgrade_names.extend(
+        plan.iter()
+            .filter_map(|item| item.replaced.as_ref().map(|(old, _, _)| old.clone())),
+    );
+    removed_upgrade_names.sort();
+    removed_upgrade_names.dedup();
+
+    let replacement_count = plan.iter().filter(|item| item.replaced.is_some()).count();
+    let upgrade_count = plan
+        .iter()
+        .filter(|item| !item.is_new && item.replaced.is_none())
+        .count();
+    let new_dep_count = plan
+        .iter()
+        .filter(|item| item.is_new && item.replaced.is_none())
+        .count();
+    if replacement_count > 0 {
+        println!(
+            ":: Packages to upgrade: {upgrade_count} (+{new_dep_count} new dependency/ies, {replacement_count} replacement(s))"
+        );
+    } else if new_dep_count > 0 {
         println!(":: Packages to upgrade: {upgrade_count} (+{new_dep_count} new dependency/ies)");
     } else {
         println!(":: Packages to upgrade: {upgrade_count}");
     }
-    for (_, entry, local_version, is_new) in &plan {
-        if *is_new {
+    for item in &plan {
+        let entry = &item.entry;
+        if let Some((old_name, old_version, _)) = &item.replaced {
+            println!(
+                "   {} {} -> {} {} (replaces {})",
+                old_name, old_version, entry.name, entry.version, old_name
+            );
+        } else if item.is_new {
             println!("   {} {} (new dependency)", entry.name, entry.version);
         } else {
-            println!("   {} {} -> {}", entry.name, local_version, entry.version);
+            println!(
+                "   {} {} -> {}",
+                entry.name, item.local_version, entry.version
+            );
         }
     }
 
@@ -993,11 +1295,15 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
     let mut journal_pkgs = Vec::new();
     let mut installed_records: Vec<InstalledRecord> = Vec::new();
 
-    for (repo, entry, local_version, is_new) in plan {
+    for item in plan {
+        let repo = &item.repo;
+        let entry = &item.entry;
+        let local_version = &item.local_version;
+        let is_new = item.is_new;
         let filename = entry.resolved_filename(&arch);
 
         let dest = cache_dir.join(&filename);
-        let urls = package_download_candidates(&repo, &arch, &entry);
+        let urls = package_download_candidates(repo, &arch, entry);
         let mirror = download_first_available(&urls, &dest, 3).with_context(|| {
             format!(
                 "failed to download '{}' from repo '{}'",
@@ -1031,11 +1337,16 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         )?);
         target_pkgs.push(install_target(&metadata.meta, &entry.version));
 
-        // New dependency: plain install. Upgrade of an existing package: a
-        // single `Upgrade` operation, so hooks can compare the old and new
-        // manifests (config files, stale files) before the local-db entry is
-        // rewritten.
-        let mut journal_pkg = if is_new {
+        // Replacements remove the old package first; the new package is a
+        // fresh install that inherits the old reason.
+        let mut journal_pkg = if let Some((old_name, old_version, _)) = &item.replaced {
+            tx.add_remove(old_name.clone())
+                .context("failed to add replacement removal to transaction")?;
+            journal_pkgs.push(JournalPackage::remove(old_name, old_version));
+            tx.add_install(entry.name.clone(), entry.version.clone(), dest.clone())
+                .context("failed to add replacement install to transaction")?;
+            JournalPackage::install(&entry.name, &entry.version)
+        } else if is_new {
             tx.add_install(entry.name.clone(), entry.version.clone(), dest.clone())
                 .context("failed to add install op to transaction")?;
             JournalPackage::install(&entry.name, &entry.version)
@@ -1047,7 +1358,7 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
                 dest.clone(),
             )
             .context("failed to add upgrade op to transaction")?;
-            JournalPackage::upgrade(&entry.name, &local_version, &entry.version)
+            JournalPackage::upgrade(&entry.name, local_version, &entry.version)
         };
         journal_pkg = journal_pkg.with_repo(&repo.name).with_source(&mirror);
         if let Some(sum) = entry.sha256sum.as_deref() {
@@ -1055,7 +1366,9 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         }
         journal_pkgs.push(journal_pkg);
 
-        let record_reason = if is_new {
+        let record_reason = if let Some((_, _, old_reason)) = &item.replaced {
+            *old_reason
+        } else if is_new {
             InstallReason::Dep
         } else {
             InstallReason::read_optional(&local_db_dir, &entry.name)
@@ -1068,15 +1381,34 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             repo: repo.name.clone(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
+            groups: metadata.meta.groups.clone(),
             reason: record_reason,
             pkg_file: dest.clone(),
         });
     }
 
     let installed_pkgs = load_installed_pkgs(&local_db_dir)?;
+    let added_pkgs: Vec<depcheck::InstalledPkg> = target_pkgs
+        .iter()
+        .map(|target| depcheck::InstalledPkg {
+            name: target.name.clone(),
+            version: target.version.clone(),
+            depends: target.depends.clone(),
+            provides: target.provides.clone(),
+            reason: InstallReason::Explicit,
+        })
+        .collect();
+    depcheck::check_installed_closure(&installed_pkgs, &removed_upgrade_names, &added_pkgs)
+        .context("upgrade reverse-dependency check failed")?;
     depcheck::check_install(&installed_pkgs, &target_pkgs)
         .context("upgrade dependency check failed")?;
-    check_transaction_file_conflicts(config, &local_db_dir, &target_manifests, &overwrite)?;
+    check_transaction_file_conflicts(
+        config,
+        &local_db_dir,
+        &target_manifests,
+        &removed_upgrade_names,
+        &overwrite,
+    )?;
 
     commit_transaction(
         config,
@@ -1097,6 +1429,8 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             .with_context(|| format!("failed to record dependencies for '{}'", record.name))?;
         local_db::write_provides(&local_db_dir, &record.name, &record.provides)
             .with_context(|| format!("failed to record provides for '{}'", record.name))?;
+        local_db::write_groups(&local_db_dir, &record.name, &record.groups)
+            .with_context(|| format!("failed to record groups for '{}'", record.name))?;
     }
 
     mirror_pacman_records(config, &installed_records)?;
@@ -1670,6 +2004,7 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
                     repo: "cache".to_string(),
                     depends: metadata.meta.depends.clone(),
                     provides: metadata.meta.provides.clone(),
+                    groups: metadata.meta.groups.clone(),
                     reason,
                     pkg_file: file.clone(),
                 });
@@ -1690,6 +2025,8 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
             .with_context(|| format!("failed to record dependencies for '{}'", record.name))?;
         local_db::write_provides(&local_db_dir, &record.name, &record.provides)
             .with_context(|| format!("failed to record provides for '{}'", record.name))?;
+        local_db::write_groups(&local_db_dir, &record.name, &record.groups)
+            .with_context(|| format!("failed to record groups for '{}'", record.name))?;
     }
 
     mirror_pacman_records(config, &reinstall_records)?;
@@ -2031,12 +2368,17 @@ fn check_transaction_file_conflicts(
     config: &XpmConfig,
     local_db_dir: &Path,
     targets: &[conflict::TargetManifest],
+    removed: &[String],
     overwrite: &conflict::OverwritePatterns,
 ) -> Result<()> {
     if targets.is_empty() {
         return Ok(());
     }
-    let installed = load_installed_manifests(local_db_dir)?;
+    let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
+    let installed: Vec<conflict::InstalledManifest> = load_installed_manifests(local_db_dir)?
+        .into_iter()
+        .filter(|manifest| !removed.contains(manifest.name.as_str()))
+        .collect();
     let conflicts =
         conflict::check_file_conflicts(&config.options.root_dir, &installed, targets, overwrite)
             .context("failed to check file conflicts")?;
@@ -2129,6 +2471,63 @@ fn mirror_pacman_records(config: &XpmConfig, records: &[InstalledRecord]) -> Res
             "the xpm transaction succeeded but mirroring into pacman's database failed: {}\nRun `xpm sync-pacman-db` to repair it.",
             failures.join("; ")
         );
+    }
+    Ok(())
+}
+
+fn cmd_groups(config: &XpmConfig, args: &cli::GroupsArgs) -> Result<()> {
+    let mut index = groups::GroupIndex::new();
+
+    if args.local {
+        let local_db_dir = config.options.db_path.join("local");
+        for (name, version) in read_installed_versions(&local_db_dir)? {
+            index.add(groups::GroupPackage {
+                name: name.clone(),
+                version: Version::parse(&version),
+                repo: None,
+                groups: local_db::read_groups(&local_db_dir, &name)?,
+            });
+        }
+    } else {
+        let sync_dir = config.options.db_path.join("sync");
+        for repo in &config.repositories {
+            let db_path = sync_dir.join(format!("{}.db", repo.name));
+            if !db_path.exists() {
+                continue;
+            }
+            let db = parse_sync_db(&db_path, &repo.name).with_context(|| {
+                format!("failed to parse sync db {}", display_rel_or_abs(&db_path))
+            })?;
+            for entry in db.entries {
+                index.add(groups::GroupPackage {
+                    name: entry.name.clone(),
+                    version: Version::parse(&entry.version),
+                    repo: Some(repo.name.clone()),
+                    groups: entry.groups,
+                });
+            }
+        }
+    }
+
+    let pairs = if let Some(group) = &args.group {
+        let members = index.group_members_pairs(group);
+        if members.is_empty() {
+            if args.local {
+                anyhow::bail!("group '{group}' was not found");
+            }
+            anyhow::bail!("package group '{group}' was not found");
+        }
+        members
+    } else {
+        index.group_pairs()
+    };
+
+    for (group, package) in pairs {
+        if args.quiet {
+            println!("{package}");
+        } else {
+            println!("{group} {package}");
+        }
     }
     Ok(())
 }

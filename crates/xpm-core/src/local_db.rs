@@ -36,6 +36,8 @@ pub const VERSION_FILE: &str = "version";
 pub const DEPENDS_FILE: &str = "depends";
 /// File name of the provided virtual names.
 pub const PROVIDES_FILE: &str = "provides";
+/// File name of the package groups.
+pub const GROUPS_FILE: &str = "groups";
 /// File name of the configuration-file list (`.PKGINFO` `backup` entries).
 pub const BACKUP_FILE: &str = "backup";
 /// File name of the raw `.MTREE` copy, kept for integrity and for deciding
@@ -267,6 +269,16 @@ pub fn read_depends(local_db_dir: &Path, pkg: &str) -> XpmResult<Option<Vec<Stri
 /// Writes the virtual names the package provides.
 pub fn write_provides(local_db_dir: &Path, pkg: &str, provides: &[String]) -> XpmResult<()> {
     write_list(local_db_dir, pkg, PROVIDES_FILE, provides)
+}
+
+/// Writes the package groups.
+pub fn write_groups(local_db_dir: &Path, pkg: &str, groups: &[String]) -> XpmResult<()> {
+    write_list(local_db_dir, pkg, GROUPS_FILE, groups)
+}
+
+/// Reads the package groups (empty for legacy installs).
+pub fn read_groups(local_db_dir: &Path, pkg: &str) -> XpmResult<Vec<String>> {
+    Ok(read_list(local_db_dir, pkg, GROUPS_FILE)?.unwrap_or_default())
 }
 
 /// Reads the provided virtual names (empty for legacy installs).

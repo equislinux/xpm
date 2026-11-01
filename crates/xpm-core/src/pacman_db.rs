@@ -323,7 +323,9 @@ fn render_desc(
     if let Some(meta) = meta {
         push_section(&mut desc, "CONFLICTS", &meta.conflicts);
         push_section(&mut desc, "REPLACES", &meta.replaces);
-        if let Some(groups) = meta.extra.get("group") {
+        if !meta.groups.is_empty() {
+            push_section(&mut desc, "GROUPS", &meta.groups);
+        } else if let Some(groups) = meta.extra.get("group") {
             push_section(&mut desc, "GROUPS", groups);
         }
     }

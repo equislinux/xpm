@@ -23,6 +23,8 @@ pub struct PackageMeta {
     pub optdepends: Vec<String>,
     pub provides: Vec<String>,
     pub conflicts: Vec<String>,
+    /// Package groups (`group =` in .PKGINFO, `%GROUPS%` in pacman DBs).
+    pub groups: Vec<String>,
     pub replaces: Vec<String>,
     /// Configuration files (`backup = etc/foo.conf`). These get `.pacnew`
     /// handling on install/upgrade and `.pacsave` handling on removal.
