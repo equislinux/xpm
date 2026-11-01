@@ -78,7 +78,7 @@
 
 <p>Example:</p>
 
-<pre><code class="language-bash">INSTALL_PREFIX=/usr XPM_PKG_URL="https://equislinux.github.io/x-repo/x/x86_64/xpm-0.1.0-3-x86_64.xp" \
+<pre><code class="language-bash">INSTALL_PREFIX=/usr XPM_PKG_URL="https://equislinux.github.io/x-repo/x/x86_64/xpm-0.1.0-4-x86_64.xp" \
 curl -fsSL https://raw.githubusercontent.com/equislinux/xpm/main/install.sh | bash
 </code></pre>
 
