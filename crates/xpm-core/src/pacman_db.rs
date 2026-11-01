@@ -444,10 +444,7 @@ fn backup_md5(path: &str, pkg_file: Option<&Path>, root_dir: &Path) -> XpmResult
     let on_disk = root_dir.join(path);
     match fs::read(&on_disk) {
         Ok(bytes) => Ok(format!("{:x}", Md5::digest(&bytes))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(XpmError::Database(format!(
-            "cannot hash backup file '{path}': not in package archive and missing at {}",
-            on_disk.display()
-        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok("(null)".to_string()),
         Err(err) => Err(XpmError::Database(format!(
             "cannot read backup file {}: {err}",
             on_disk.display()
@@ -1092,6 +1089,49 @@ mod tests {
     }
 
     #[test]
+    fn missing_backup_files_are_recorded_as_null() {
+        let tmp = TempDir::new().expect("tmp");
+        let pacman_local = tmp.path().join("pacman").join("local");
+        let xpm_local = tmp.path().join("xpm").join("local");
+        let cache = tmp.path().join("cache");
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&cache).expect("cache");
+
+        let pkginfo = b"pkgname = ghost\npkgver = 1.0-1\nbackup = etc/ghost.conf\n";
+        write_package(
+            &cache,
+            "ghost-1.0-1-x86_64.pkg.tar.zst",
+            &[(".PKGINFO", pkginfo)],
+        );
+        write_xpm_entry(
+            &xpm_local,
+            "ghost",
+            "1.0-1",
+            InstallReason::Explicit,
+            &["usr/bin/ghost"],
+            &["etc/ghost.conf"],
+            None,
+            None,
+        );
+
+        let pkg = cache.join("ghost-1.0-1-x86_64.pkg.tar.zst");
+        mirror_entry(
+            &pacman_local,
+            &xpm_local,
+            "ghost",
+            "1.0-1",
+            InstallReason::Explicit,
+            Some(&pkg),
+            &root,
+        )
+        .expect("mirror missing backup");
+
+        let files =
+            fs::read_to_string(pacman_local.join("ghost-1.0-1").join("files")).expect("files");
+        assert!(files.contains("etc/ghost.conf\t(null)\n"), "{files}");
+    }
+
+    #[test]
     fn reason_maps_explicit_and_dep() {
         let tmp = TempDir::new().expect("tmp");
         let pacman_local = tmp.path().join("pacman").join("local");
@@ -1359,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_hash_prefers_packaged_bytes_falls_back_and_errors_when_missing() {
+    fn backup_hash_prefers_packaged_bytes_falls_back_and_nulls_when_missing() {
         let tmp = TempDir::new().expect("tmp");
         let pacman_local = tmp.path().join("pacman").join("local");
         let xpm_local = tmp.path().join("xpm").join("local");
@@ -1417,7 +1457,7 @@ mod tests {
             fs::read_to_string(pacman_local.join("cache-1.0-1").join("files")).expect("files");
         assert!(files.contains(&format!("etc/cache.conf\t{}\n", md5_hex(live))));
 
-        let err = mirror_entry(
+        mirror_entry(
             &pacman_local,
             &xpm_local,
             "cache",
@@ -1426,8 +1466,10 @@ mod tests {
             None,
             &tmp.path().join("missing-root"),
         )
-        .expect_err("missing fallback must fail");
-        assert!(format!("{err}").contains("backup"));
+        .expect("missing backup recorded");
+        let files =
+            fs::read_to_string(pacman_local.join("cache-1.0-1").join("files")).expect("files");
+        assert!(files.contains("etc/cache.conf\t(null)\n"), "{files}");
     }
 
     #[test]
