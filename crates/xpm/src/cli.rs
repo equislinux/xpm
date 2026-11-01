@@ -29,11 +29,11 @@ pub struct Cli {
     pub no_confirm: bool,
 
     /// Set an alternative installation root.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, short = 'r', global = true, value_name = "PATH")]
     pub root: Option<PathBuf>,
 
     /// Set an alternative database directory.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, short = 'b', global = true, value_name = "PATH")]
     pub dbpath: Option<PathBuf>,
 
     /// Set an alternative cache directory.
@@ -47,6 +47,22 @@ pub struct Cli {
     /// Do not mirror transactions into pacman's local database.
     #[arg(long, global = true)]
     pub no_pacman_mirror: bool,
+
+    /// Enable ~/.local/bin shims and rc edits for non-root installs.
+    #[arg(long, global = true)]
+    pub shell_integration: bool,
+
+    /// Disable shell integration (default; accepted for compatibility).
+    #[arg(long, global = true)]
+    pub no_shell_integration: bool,
+
+    /// Scriptlet policy: auto, skip, or require.
+    #[arg(long, global = true, value_name = "MODE", value_parser = ["auto", "skip", "require"])]
+    pub scriptlets: Option<String>,
+
+    /// Skip package .INSTALL scriptlets (alias for --scriptlets skip).
+    #[arg(long, global = true)]
+    pub noscriptlet: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -140,6 +156,10 @@ pub struct InstallArgs {
     /// Do not install optional dependencies.
     #[arg(long)]
     pub no_optional: bool,
+
+    /// Skip packages that are already installed at the same version.
+    #[arg(long)]
+    pub needed: bool,
 
     /// Print the resolved packages without downloading or installing them.
     #[arg(long, short = 'p')]

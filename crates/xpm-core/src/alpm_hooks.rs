@@ -52,7 +52,7 @@ pub enum HookWhen {
 }
 
 /// Operation a trigger applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HookOperation {
     Install,
     Upgrade,
@@ -99,8 +99,9 @@ pub struct AlpmHook {
 pub struct HookTransaction<'a> {
     /// `(package name, operation)` pairs.
     pub packages: Vec<(&'a str, HookOperation)>,
-    /// File paths touched by the transaction (for `Path` triggers).
-    pub paths: Vec<String>,
+    /// File paths touched by the transaction and the operation that touched
+    /// them (for `Path` triggers).
+    pub paths: Vec<(String, HookOperation)>,
 }
 
 impl AlpmHook {
@@ -132,10 +133,10 @@ impl AlpmHook {
                         .iter()
                         .any(|(name, _)| glob_match(pattern, name))
                 }),
-                TriggerType::Path => trigger.targets.iter().any(|prefix| {
-                    tx.paths.iter().any(|path| {
-                        path.trim_start_matches('/')
-                            .starts_with(prefix.trim_start_matches('/'))
+                TriggerType::Path => trigger.targets.iter().any(|pattern| {
+                    tx.paths.iter().any(|(path, op)| {
+                        (trigger.operations.is_empty() || trigger.operations.contains(op))
+                            && glob_match(pattern, path.trim_start_matches('/'))
                     })
                 }),
             }
@@ -151,20 +152,38 @@ impl AlpmHook {
     pub fn matched_targets(&self, tx: &HookTransaction<'_>) -> Vec<String> {
         let mut out = Vec::new();
         for trigger in &self.triggers {
-            if trigger.trigger_type != TriggerType::Package {
-                continue;
-            }
-            for (name, _) in &tx.packages {
-                if trigger
-                    .targets
-                    .iter()
-                    .any(|pattern| glob_match(pattern, name))
-                    && !out.iter().any(|seen| seen == name)
-                {
-                    out.push((*name).to_string());
+            match trigger.trigger_type {
+                TriggerType::Package => {
+                    for (name, _) in &tx.packages {
+                        if trigger
+                            .targets
+                            .iter()
+                            .any(|pattern| glob_match(pattern, name))
+                            && !out.iter().any(|seen| seen == name)
+                        {
+                            out.push((*name).to_string());
+                        }
+                    }
+                }
+                TriggerType::Path => {
+                    for (path, op) in &tx.paths {
+                        if !(trigger.operations.is_empty() || trigger.operations.contains(op)) {
+                            continue;
+                        }
+                        let relative = path.trim_start_matches('/');
+                        if trigger
+                            .targets
+                            .iter()
+                            .any(|pattern| glob_match(pattern, relative))
+                            && !out.iter().any(|seen| seen == relative)
+                        {
+                            out.push(relative.to_string());
+                        }
+                    }
                 }
             }
         }
+        out.sort();
         out
     }
 }
@@ -752,7 +771,7 @@ NeedsTargets
 
     #[test]
     fn path_trigger_needs_matching_path() {
-        let content = "[Trigger]\nOperation = Upgrade\nType = Path\nTarget = usr/lib/modules\n\n[Action]\nExec = /bin/true\n";
+        let content = "[Trigger]\nOperation = Upgrade\nType = Path\nTarget = usr/lib/modules/*\n\n[Action]\nExec = /bin/true\n";
         let hook = parse_hook("modules.hook", content).expect("parse");
 
         let without_paths = HookTransaction {
@@ -763,9 +782,39 @@ NeedsTargets
 
         let with_paths = HookTransaction {
             packages: vec![("linux", HookOperation::Upgrade)],
-            paths: vec!["usr/lib/modules/6.12/vmlinuz".to_string()],
+            paths: vec![(
+                "usr/lib/modules/6.12/vmlinuz".to_string(),
+                HookOperation::Upgrade,
+            )],
         };
         assert!(hook.matches(&with_paths, |_| true));
+    }
+
+    #[test]
+    fn path_trigger_respects_operation_and_glob() {
+        let content = "[Trigger]\nOperation = Install\nType = Path\nTarget = usr/lib/modules/*/vmlinuz\n\n[Action]\nExec = /bin/true\nNeedsTargets\n";
+        let hook = parse_hook("modules-install.hook", content).expect("parse");
+        let upgrade_only = HookTransaction {
+            packages: vec![("linux", HookOperation::Upgrade)],
+            paths: vec![(
+                "usr/lib/modules/6.12/vmlinuz".to_string(),
+                HookOperation::Upgrade,
+            )],
+        };
+        assert!(!hook.matches(&upgrade_only, |_| true));
+
+        let install = HookTransaction {
+            packages: vec![("linux", HookOperation::Install)],
+            paths: vec![(
+                "usr/lib/modules/6.12/vmlinuz".to_string(),
+                HookOperation::Install,
+            )],
+        };
+        assert!(hook.matches(&install, |_| true));
+        assert_eq!(
+            hook.matched_targets(&install),
+            vec!["usr/lib/modules/6.12/vmlinuz".to_string()]
+        );
     }
 
     #[test]
