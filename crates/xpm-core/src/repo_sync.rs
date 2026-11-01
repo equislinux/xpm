@@ -185,18 +185,25 @@ pub fn verify_remote_signature(
     }
 
     let outcome = match verify_file(artifact_path, &sig_dest, &certs) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            if sig_level == SigLevel::Required {
-                return Err(err);
+        Ok(VerifyOutcome::Good { key_id }) => VerifyOutcome::Good { key_id },
+        Ok(VerifyOutcome::UnknownKey) | Ok(VerifyOutcome::Bad { .. }) | Err(_) => {
+            // Sequoia's policy is stricter than gpgme for some valid packager
+            // keys. Fall back to GnuPG against the same keyring before
+            // declaring the signature invalid or unknown.
+            match crate::signing::verify_with_gpg(artifact_path, &sig_dest, keyring_path) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    if sig_level == SigLevel::Required {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        artifact = %artifact_path.display(),
+                        error = %err,
+                        "signature check failed in optional mode; continuing"
+                    );
+                    return Ok(());
+                }
             }
-
-            tracing::warn!(
-                artifact = %artifact_path.display(),
-                error = %err,
-                "signature check failed in optional mode; continuing"
-            );
-            return Ok(());
         }
     };
 

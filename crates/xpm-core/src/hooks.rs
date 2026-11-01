@@ -428,18 +428,20 @@ fn read_entry_attrs<R: Read>(entry: &mut tar::Entry<R>) -> XpmResult<EntryAttrs>
 fn apply_entry_attrs(path: &Path, attrs: &EntryAttrs, symlink: bool) -> XpmResult<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if !symlink {
-        fs::set_permissions(path, fs::Permissions::from_mode(attrs.mode))?;
-    }
-
     let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| XpmError::Package(format!("path contains NUL: {}", path.display())))?;
 
+    // chown clears setuid/setgid bits, so ownership must be applied before the
+    // final mode. This is why sudo and other setuid binaries lost their bits.
     if unsafe { libc::geteuid() } == 0 {
         let rc = unsafe { libc::lchown(path_c.as_ptr(), attrs.uid, attrs.gid) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+    }
+
+    if !symlink {
+        fs::set_permissions(path, fs::Permissions::from_mode(attrs.mode))?;
     }
 
     let times = [
@@ -1560,6 +1562,61 @@ mod tests {
 
     fn read(path: &Path) -> String {
         fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn write_setuid_package(dir: &Path) -> PathBuf {
+        let path = dir.join("setuid-1.0-1-x86_64.xp");
+        let pkginfo = "pkgname = setuid\npkgver = 1.0-1\npkgdesc = test\narch = x86_64\n";
+        let content = b"#!/bin/sh\n";
+        let mtree = format!(
+            "#mtree\n./usr/bin/setuid type=file mode=04755 size={} sha256digest={} uid=0 gid=0\n",
+            content.len(),
+            sha256_hex(content)
+        );
+        let mut raw_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw_tar);
+            for (entry, data) in [
+                (".PKGINFO", pkginfo.as_bytes()),
+                (".MTREE", mtree.as_bytes()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(entry).unwrap();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, data).unwrap();
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_path("usr/bin/setuid").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o4755);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        fs::write(&path, zstd::encode_all(&raw_tar[..], 1).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn extraction_preserves_setuid_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, db_tmp, mut ctx) = test_context(OperationType::Install);
+        ctx.pkg_name = "setuid".to_string();
+        ctx.pkg_file = Some(write_setuid_package(db_tmp.path()));
+
+        FileExtractionHook.run(&ctx).expect("extract");
+        let target = root.path().join("usr/bin/setuid");
+        let mode = fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o4755, "setuid bit must be preserved");
     }
 
     #[test]
