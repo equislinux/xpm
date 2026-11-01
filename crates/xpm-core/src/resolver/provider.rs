@@ -13,7 +13,7 @@ use resolvo::{
 };
 
 use crate::resolver::dependency::DepConstraint;
-use crate::resolver::types::PackagePool;
+use crate::resolver::types::{PackageCandidate, PackagePool, VersionSetEntry};
 
 /// xpm's dependency provider for the resolvo SAT solver.
 ///
@@ -103,7 +103,7 @@ impl DependencyProvider for XpmProvider {
             .copied()
             .filter(|&sid| {
                 let candidate = self.pool.candidate(sid);
-                let raw_match = entry.constraint.matches(&candidate.version);
+                let raw_match = self.candidate_satisfies(candidate, entry);
                 // For conflict version sets the match is negated so that
                 // resolvo's "non-matching → forbidden" logic correctly
                 // forbids the right candidates.
@@ -125,7 +125,7 @@ impl DependencyProvider for XpmProvider {
 
         Some(Candidates {
             candidates: solvable_ids.to_vec(),
-            favored: None,
+            favored: self.pool.favored_for(name),
             locked: None,
             hint_dependencies_available: HintDependenciesAvailable::All,
             excluded: Vec::new(),
@@ -133,11 +133,14 @@ impl DependencyProvider for XpmProvider {
     }
 
     async fn sort_candidates(&self, _solver: &SolverCache<Self>, solvables: &mut [SolvableId]) {
-        // Sort highest version first — the solver tries the first candidate
+        // Highest version first. On equal versions, prefer repository
+        // candidates over installed ones so an explicit request can reinstall
+        // from the repository; dependencies still use `favored`.
         solvables.sort_by(|&a, &b| {
             let va = &self.pool.candidate(a).version;
             let vb = &self.pool.candidate(b).version;
-            vb.cmp(va) // descending
+            vb.cmp(va)
+                .then_with(|| self.pool.is_installed(a).cmp(&self.pool.is_installed(b)))
         });
     }
 
@@ -159,10 +162,19 @@ impl DependencyProvider for XpmProvider {
             // as unsolvable by the solver when no candidates are found).
         }
 
-        // Add conflicts as constrains (using negated version sets)
+        // Add conflicts as constrains (using negated version sets).
+        //
+        // A package never conflicts with itself: canonical providers such as
+        // systemd declare `provides = udev` and `conflicts = udev` at the
+        // same time. The constraint is name-based, so adding it would forbid
+        // the very provider that owns the name. Self-satisfied conflicts are
+        // therefore skipped (ALPM implicitly excludes the package itself).
         for conflict in &candidate.conflicts {
             if let Some(&conflict_name_id) = self.pool.name_to_id.get(&conflict.name) {
                 if let Some(vs_id) = self.find_conflict_version_set(conflict_name_id, conflict) {
+                    if self.candidate_satisfies(candidate, self.pool.version_set(vs_id)) {
+                        continue;
+                    }
                     known.constrains.push(vs_id);
                 }
             }
@@ -177,6 +189,35 @@ impl DependencyProvider for XpmProvider {
 }
 
 impl XpmProvider {
+    /// Whether `candidate` satisfies the constraint behind `entry`.
+    ///
+    /// Mirrors libalpm's `_alpm_depcmp`: the package name is checked first
+    /// (with the package version), then the `provides` list. An unversioned
+    /// dependency accepts any provision with a matching name; a versioned
+    /// dependency requires a versioned provision whose version satisfies it.
+    fn candidate_satisfies(&self, candidate: &PackageCandidate, entry: &VersionSetEntry) -> bool {
+        let target = self.pool.name_str(entry.name_id);
+
+        if candidate.name == target && entry.constraint.matches(&candidate.version) {
+            return true;
+        }
+
+        candidate.provides.iter().any(|provide| {
+            if provide.name != target {
+                return false;
+            }
+            match &entry.constraint.version {
+                // Unversioned dependency: any provision with the name works.
+                None => true,
+                // Versioned dependency: only versioned provisions match.
+                Some(_) => provide
+                    .version
+                    .as_ref()
+                    .is_some_and(|version| entry.constraint.matches(version)),
+            }
+        })
+    }
+
     /// Find a normal (non-negated) version set matching the given constraint.
     fn find_version_set(
         &self,

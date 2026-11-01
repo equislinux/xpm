@@ -18,19 +18,24 @@ use tracing_subscriber::EnvFilter;
 use cli::{Cli, Command};
 use xpm_core::alpm_hooks::{self, HookOperation, HookTransaction, HookWhen};
 use xpm_core::config::Repository;
+use xpm_core::conflict;
+use xpm_core::depcheck;
 use xpm_core::generations;
 use xpm_core::install_reason::{retain_by_reason, InstallReason};
 use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::local_db;
 use xpm_core::orphans::{find_orphans, InstalledPackage};
-use xpm_core::package::read_metadata;
+use xpm_core::package::{read_metadata, PackageMeta};
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db, RepoEntry};
 use xpm_core::repo_sync::{
     download_first_available, package_download_candidates, sync_repo_databases,
     verify_remote_signature, verify_sha256,
 };
-use xpm_core::resolver::{resolve_closure, DepConstraint, PackageCandidate, Requirement, Version};
+use xpm_core::resolver::{
+    resolve_closure, resolve_closure_with_installed, DepConstraint, PackageCandidate, Requirement,
+    Version,
+};
 use xpm_core::rollback::{last_rollback_candidate, RollbackOp, RollbackPlan};
 use xpm_core::txhooks::run_transaction_hooks;
 use xpm_core::{HookChain, Transaction};
@@ -81,6 +86,9 @@ fn main() -> Result<()> {
     if cli.no_color {
         config.options.color = false;
     }
+    if cli.no_pacman_mirror {
+        config.options.mirror_pacman = false;
+    }
 
     tracing::info!(
         root = %config.options.root_dir.display(),
@@ -103,6 +111,8 @@ fn main() -> Result<()> {
         Command::History(args) => cmd_history(&config, args),
         Command::Rollback(args) => cmd_rollback(&config, args, cli.no_confirm),
         Command::Diff(args) => cmd_diff(&config, args),
+        Command::ImportPacman(args) => cmd_import_pacman(&config, args),
+        Command::SyncPacmanDb(args) => cmd_sync_pacman_db(&config, args),
         Command::Usage(args) => cmd_help(args),
     }
 }
@@ -322,10 +332,12 @@ fn resolver_candidate(entry: &RepoEntry) -> PackageCandidate {
 /// Local-database metadata recorded for every package installed in a run.
 struct InstalledRecord {
     name: String,
+    version: String,
     repo: String,
     depends: Vec<String>,
     provides: Vec<String>,
     reason: InstallReason,
+    pkg_file: PathBuf,
 }
 
 fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) -> Result<()> {
@@ -377,19 +389,33 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             .iter()
             .map(|spec| Requirement::parse(spec))
             .collect::<XpmResult<Vec<_>>>()?;
-        let plan = resolve_closure(candidates, &requirements).with_context(|| {
-            format!(
-                "failed to resolve dependencies for: {}",
-                package_names
-                    .iter()
-                    .map(|spec| spec.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
+        let installed_candidates = load_installed_candidates(&local_db_dir)?;
+        let plan = resolve_closure_with_installed(candidates, installed_candidates, &requirements)
+            .with_context(|| {
+                format!(
+                    "failed to resolve dependencies for: {}",
+                    package_names
+                        .iter()
+                        .map(|spec| spec.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
 
+        let mut already_satisfied = 0usize;
         // Map solved candidates back to their repository entry (exact version).
-        for (candidate, explicit) in plan {
+        for (candidate, explicit, is_installed) in plan {
+            if is_installed {
+                already_satisfied += 1;
+                if explicit {
+                    println!(
+                        "   {} {} (already installed)",
+                        candidate.name, candidate.version
+                    );
+                }
+                continue;
+            }
+
             let selected = sync_entries
                 .iter()
                 .find(|(_, entry)| {
@@ -408,11 +434,27 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
         let explicit_count = resolved.iter().filter(|(_, _, explicit)| *explicit).count();
         println!(
-            ":: Resolved {} package(s): {} explicit, {} as dependencies",
+            ":: Resolved {} package(s): {} explicit, {} as dependencies, {} already satisfied",
             resolved.len(),
             explicit_count,
-            resolved.len() - explicit_count
+            resolved.len() - explicit_count,
+            already_satisfied
         );
+    }
+
+    if args.print {
+        for (_, entry, _) in &resolved {
+            println!("{} {}", entry.name, entry.version);
+        }
+        for spec in &local_files {
+            println!("{spec}");
+        }
+        return Ok(());
+    }
+
+    if resolved.is_empty() && local_files.is_empty() {
+        println!(":: Nothing to do.");
+        return Ok(());
     }
 
     // Create transaction
@@ -420,12 +462,15 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         .context("failed to create transaction")?;
 
     // Setup hooks chain
-    let hooks = HookChain::default();
+    let hooks = transaction_hooks(config);
     tx.set_hooks(hooks);
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
     let mut journal_pkgs = Vec::new();
     let mut installed: Vec<InstalledRecord> = Vec::new();
+    let overwrite = conflict::OverwritePatterns::parse(&args.overwrite);
+    let mut target_manifests: Vec<conflict::TargetManifest> = Vec::new();
+    let mut target_pkgs: Vec<depcheck::InstallTarget> = Vec::new();
 
     // Phase 1a: local package files (already "downloaded")
     for spec in &local_files {
@@ -453,14 +498,23 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         };
 
         println!("   local: {} ({} {})", path.display(), pkg_name, version);
+        target_manifests.push(target_manifest(
+            &local_db_dir,
+            &pkg_name,
+            path,
+            &metadata.meta.backup,
+        )?);
+        target_pkgs.push(install_target(&metadata.meta, &version));
 
         journal_pkgs.push(JournalPackage::install(&pkg_name, &version));
         installed.push(InstalledRecord {
             name: pkg_name.clone(),
+            version: version.clone(),
             repo: "local".to_string(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
             reason: pkg_reason,
+            pkg_file: path.to_path_buf(),
         });
 
         tx.add_install(pkg_name, version, path.to_path_buf())
@@ -499,6 +553,13 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
         let metadata = read_metadata(&dest)
             .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
+        target_manifests.push(target_manifest(
+            &local_db_dir,
+            &entry.name,
+            &dest,
+            &metadata.meta.backup,
+        )?);
+        target_pkgs.push(install_target(&metadata.meta, &entry.version));
 
         let pkg_reason = if args.as_deps {
             InstallReason::Dep
@@ -520,10 +581,12 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         journal_pkgs.push(journal_pkg);
         installed.push(InstalledRecord {
             name: entry.name.clone(),
+            version: entry.version.clone(),
             repo: repo.name.clone(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
             reason: pkg_reason,
+            pkg_file: dest.clone(),
         });
 
         // Add to transaction
@@ -541,6 +604,11 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         no_confirm,
     )?;
 
+    let installed_pkgs = load_installed_pkgs(&local_db_dir)?;
+    depcheck::check_install(&installed_pkgs, &target_pkgs)
+        .context("installation dependency check failed")?;
+    check_transaction_file_conflicts(config, &local_db_dir, &target_manifests, &overwrite)?;
+
     // Phase 2/3: prepare, commit, hooks and journal.
     commit_transaction(config, "install", journal_pkgs, &mut tx)?;
 
@@ -557,6 +625,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             .with_context(|| format!("failed to record provides for '{}'", record.name))?;
     }
 
+    mirror_pacman_records(config, &installed)?;
+
     println!(":: {} package(s) installed successfully.", installed.len());
     if config.options.root_dir != Path::new("/") {
         println!(":: Shell integration enabled via ~/.local/bin shims.");
@@ -567,34 +637,43 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 }
 
 fn cmd_remove(config: &XpmConfig, args: &cli::RemoveArgs, no_confirm: bool) -> Result<()> {
-    println!(":: Removing packages: {}", args.packages.join(", "));
-    if args.recursive {
+    let local_db_dir = config.options.db_path.join("local");
+    let installed = load_installed_pkgs(&local_db_dir)?;
+    let options = depcheck::RemoveOptions {
+        recursive: args.recursive >= 1,
+        recursive_all: args.recursive >= 2,
+        cascade: args.cascade,
+        unneeded: args.unneeded,
+        ignore_versions: args.no_deps == 1,
+        skip_deps: args.no_deps >= 2,
+    };
+    let plan = depcheck::plan_removal(&installed, &args.packages, &options)
+        .context("failed to plan removal")?;
+
+    if plan.is_empty() {
+        println!(":: Nothing to do.");
+        return Ok(());
+    }
+
+    println!(":: Removing packages: {}", plan.join(", "));
+    if args.recursive >= 1 {
         println!("   (including unneeded dependencies)");
     }
 
     // Create transaction
-    let local_db_dir = config.options.db_path.join("local");
     let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
         .context("failed to create transaction")?;
 
     // Setup hooks chain
-    let hooks = HookChain::default();
+    let hooks = transaction_hooks(config);
     tx.set_hooks(hooks);
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
     tx.set_save_configs(!args.nosave);
 
-    // Add remove operations for each package
+    // Add remove operations for each package.
     let mut journal_pkgs = Vec::new();
-    for pkg_name in &args.packages {
-        // Verify package is installed
-        let pkg_dir = local_db_dir.join(pkg_name);
-        if !pkg_dir.exists() {
-            return Err(
-                XpmError::Package(format!("package '{}' is not installed", pkg_name)).into(),
-            );
-        }
-
-        let version = std::fs::read_to_string(pkg_dir.join("version"))
+    for pkg_name in &plan {
+        let version = std::fs::read_to_string(local_db_dir.join(pkg_name).join("version"))
             .unwrap_or_default()
             .trim()
             .to_string();
@@ -609,10 +688,7 @@ fn cmd_remove(config: &XpmConfig, args: &cli::RemoveArgs, no_confirm: bool) -> R
     // Phase 2/3: prepare, commit, hooks and journal.
     commit_transaction(config, "remove", journal_pkgs, &mut tx)?;
 
-    println!(
-        ":: {} package(s) removed successfully.",
-        args.packages.len()
-    );
+    println!(":: {} package(s) removed successfully.", plan.len());
     if config.options.root_dir != Path::new("/") {
         println!(":: If command lookup is stale in current shell, run: hash -r");
     }
@@ -640,6 +716,9 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("failed to create cache dir {}", cache_dir.display()))?;
 
+    let overwrite = conflict::OverwritePatterns::parse(&args.overwrite);
+    let mut target_manifests: Vec<conflict::TargetManifest> = Vec::new();
+    let mut target_pkgs: Vec<depcheck::InstallTarget> = Vec::new();
     let installed = read_installed_versions(&local_db_dir)?;
     if installed.is_empty() {
         println!(":: No packages are currently installed in xpm local database.");
@@ -728,11 +807,15 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         }
     }
 
+    if args.print {
+        return Ok(());
+    }
+
     confirm_action(":: Proceed with upgrade? [y/N] ", no_confirm)?;
 
     let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
         .context("failed to create transaction")?;
-    let hooks = HookChain::default();
+    let hooks = transaction_hooks(config);
     tx.set_hooks(hooks);
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
@@ -769,13 +852,20 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
 
         let metadata = read_metadata(&dest)
             .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
+        target_manifests.push(target_manifest(
+            &local_db_dir,
+            &entry.name,
+            &dest,
+            &metadata.meta.backup,
+        )?);
+        target_pkgs.push(install_target(&metadata.meta, &entry.version));
 
         // New dependency: plain install. Upgrade of an existing package: a
         // single `Upgrade` operation, so hooks can compare the old and new
         // manifests (config files, stale files) before the local-db entry is
         // rewritten.
         let mut journal_pkg = if is_new {
-            tx.add_install(entry.name.clone(), entry.version.clone(), dest)
+            tx.add_install(entry.name.clone(), entry.version.clone(), dest.clone())
                 .context("failed to add install op to transaction")?;
             JournalPackage::install(&entry.name, &entry.version)
         } else {
@@ -783,7 +873,7 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
                 entry.name.clone(),
                 local_version.clone(),
                 entry.version.clone(),
-                dest,
+                dest.clone(),
             )
             .context("failed to add upgrade op to transaction")?;
             JournalPackage::upgrade(&entry.name, &local_version, &entry.version)
@@ -803,12 +893,19 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
 
         installed_records.push(InstalledRecord {
             name: entry.name.clone(),
+            version: entry.version.clone(),
             repo: repo.name.clone(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
             reason: record_reason,
+            pkg_file: dest.clone(),
         });
     }
+
+    let installed_pkgs = load_installed_pkgs(&local_db_dir)?;
+    depcheck::check_install(&installed_pkgs, &target_pkgs)
+        .context("upgrade dependency check failed")?;
+    check_transaction_file_conflicts(config, &local_db_dir, &target_manifests, &overwrite)?;
 
     commit_transaction(config, "upgrade", journal_pkgs, &mut tx)?;
 
@@ -825,8 +922,58 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             .with_context(|| format!("failed to record provides for '{}'", record.name))?;
     }
 
+    mirror_pacman_records(config, &installed_records)?;
+
     println!(":: Upgrade complete.");
     Ok(())
+}
+
+fn load_installed_pkgs(local_db_dir: &Path) -> Result<Vec<depcheck::InstalledPkg>> {
+    let installed = read_installed_versions(local_db_dir)?;
+    let mut packages = Vec::with_capacity(installed.len());
+
+    for (name, version) in installed {
+        let depends = local_db::read_depends(local_db_dir, &name)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dep| DepConstraint::parse(&dep))
+            .collect();
+        let provides = local_db::read_provides(local_db_dir, &name)?
+            .into_iter()
+            .map(|provide| DepConstraint::parse(&provide))
+            .collect();
+        packages.push(depcheck::InstalledPkg {
+            name: name.clone(),
+            version: Version::parse(&version),
+            depends,
+            provides,
+            reason: InstallReason::read(local_db_dir, &name),
+        });
+    }
+
+    Ok(packages)
+}
+
+fn load_installed_candidates(local_db_dir: &Path) -> Result<Vec<PackageCandidate>> {
+    let installed = read_installed_versions(local_db_dir)?;
+    let mut candidates = Vec::with_capacity(installed.len());
+
+    for (name, version) in installed {
+        let provides = local_db::read_provides(local_db_dir, &name)?
+            .into_iter()
+            .map(|provide| DepConstraint::parse(&provide))
+            .collect();
+        candidates.push(PackageCandidate {
+            name,
+            version: Version::parse(&version),
+            depends: Vec::new(),
+            conflicts: Vec::new(),
+            provides,
+            optdepends: Vec::new(),
+        });
+    }
+
+    Ok(candidates)
 }
 
 fn read_installed_versions(local_db_dir: &Path) -> Result<HashMap<String, String>> {
@@ -984,15 +1131,20 @@ fn run_alpm_hooks(config: &XpmConfig, packages: &[JournalPackage], when: HookWhe
         paths: Vec::new(),
     };
 
-    let hooks =
-        alpm_hooks::load_hooks(&alpm_hooks::hook_dirs()).context("failed to load ALPM hooks")?;
+    let hooks = alpm_hooks::load_hooks(&alpm_hooks::hook_dirs_for(&config.options.root_dir))
+        .context("failed to load ALPM hooks")?;
     if hooks.is_empty() {
         return Ok(());
     }
 
     let installed = alpm_hooks::installed_names(&config.options.db_path.join("local"));
-    let failures =
-        alpm_hooks::run_hooks(&hooks, when, &transaction, |name| installed.contains(name))?;
+    let failures = alpm_hooks::run_hooks(
+        &hooks,
+        when,
+        &transaction,
+        &config.options.root_dir,
+        |name| installed.contains(name),
+    )?;
     let warnings = alpm_hooks::enforce_failures(when, &failures)?;
     for warning in warnings {
         eprintln!("xpm: warning: ALPM hook failed: {warning}");
@@ -1214,7 +1366,7 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
 
     let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
         .context("failed to create transaction")?;
-    let hooks = HookChain::default();
+    let hooks = transaction_hooks(config);
     tx.set_hooks(hooks);
     tx.set_shell_integration(config.options.root_dir != Path::new("/"));
 
@@ -1272,10 +1424,12 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
                 };
                 reinstall_records.push(InstalledRecord {
                     name: name.clone(),
+                    version: version.clone(),
                     repo: "cache".to_string(),
                     depends: metadata.meta.depends.clone(),
                     provides: metadata.meta.provides.clone(),
                     reason,
+                    pkg_file: file.clone(),
                 });
             }
         }
@@ -1295,6 +1449,8 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
         local_db::write_provides(&local_db_dir, &record.name, &record.provides)
             .with_context(|| format!("failed to record provides for '{}'", record.name))?;
     }
+
+    mirror_pacman_records(config, &reinstall_records)?;
 
     println!(":: Rollback complete ({} operation(s)).", plan.ops.len());
     Ok(())
@@ -1530,6 +1686,268 @@ fn cmd_repo(config: &XpmConfig, args: &cli::RepoArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn install_target(meta: &PackageMeta, version: &str) -> depcheck::InstallTarget {
+    depcheck::InstallTarget {
+        name: meta.name.clone(),
+        version: Version::parse(version),
+        depends: meta
+            .depends
+            .iter()
+            .map(|dep| DepConstraint::parse(dep))
+            .collect(),
+        provides: meta
+            .provides
+            .iter()
+            .map(|provide| DepConstraint::parse(provide))
+            .collect(),
+        conflicts: meta
+            .conflicts
+            .iter()
+            .map(|conflict| DepConstraint::parse(conflict))
+            .collect(),
+    }
+}
+
+fn package_file_list(pkg_file: &Path) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for file in xpm_core::package::list_files(pkg_file)
+        .with_context(|| format!("failed to list files in {}", pkg_file.display()))?
+    {
+        let mut path = file.path.to_string_lossy().into_owned();
+        while let Some(stripped) = path.strip_prefix("./") {
+            path = stripped.to_string();
+        }
+        if path.is_empty() {
+            continue;
+        }
+        if path.starts_with('/') || path.split('/').any(|component| component == "..") {
+            anyhow::bail!(
+                "package {} contains an unsafe path: {}",
+                pkg_file.display(),
+                path
+            );
+        }
+        if file.is_dir && !path.ends_with('/') {
+            path.push('/');
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn target_manifest(
+    local_db_dir: &Path,
+    name: &str,
+    pkg_file: &Path,
+    backups: &[String],
+) -> Result<conflict::TargetManifest> {
+    let old_files = if local_db_dir.join(name).is_dir() {
+        local_db::read_files(local_db_dir, name)?
+    } else {
+        Vec::new()
+    };
+    Ok(conflict::TargetManifest {
+        name: name.to_string(),
+        files: package_file_list(pkg_file)?,
+        backups: backups.to_vec(),
+        old_files,
+    })
+}
+
+fn load_installed_manifests(local_db_dir: &Path) -> Result<Vec<conflict::InstalledManifest>> {
+    let mut manifests = Vec::new();
+    if !local_db_dir.exists() {
+        return Ok(manifests);
+    }
+
+    for entry in std::fs::read_dir(local_db_dir)
+        .with_context(|| format!("failed to read {}", local_db_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        manifests.push(conflict::InstalledManifest {
+            files: local_db::read_files(local_db_dir, &name)?,
+            backups: local_db::read_backup_list(local_db_dir, &name)?,
+            name,
+        });
+    }
+    Ok(manifests)
+}
+
+fn check_transaction_file_conflicts(
+    config: &XpmConfig,
+    local_db_dir: &Path,
+    targets: &[conflict::TargetManifest],
+    overwrite: &conflict::OverwritePatterns,
+) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let installed = load_installed_manifests(local_db_dir)?;
+    let conflicts =
+        conflict::check_file_conflicts(&config.options.root_dir, &installed, targets, overwrite)
+            .context("failed to check file conflicts")?;
+
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!("error: failed to commit transaction (conflicting files)");
+    for file_conflict in &conflicts {
+        match file_conflict.kind {
+            conflict::ConflictKind::TargetTarget => {
+                eprintln!(
+                    "{}: {} exists in both '{}' and '{}'",
+                    file_conflict.target,
+                    file_conflict.path,
+                    file_conflict.target,
+                    file_conflict.other_target.as_deref().unwrap_or("?")
+                );
+            }
+            conflict::ConflictKind::FilesystemOwned => {
+                eprintln!(
+                    "{}: {} exists in filesystem (owned by {})",
+                    file_conflict.target,
+                    file_conflict.path,
+                    file_conflict.owner.as_deref().unwrap_or("?")
+                );
+            }
+            conflict::ConflictKind::FilesystemUnowned => {
+                eprintln!(
+                    "{}: {} exists in filesystem",
+                    file_conflict.target, file_conflict.path
+                );
+            }
+        }
+    }
+    anyhow::bail!("failed to commit transaction (conflicting files)");
+}
+
+fn transaction_hooks(config: &XpmConfig) -> HookChain {
+    let mut hooks = HookChain::default();
+    if let Some(pacman_local) = auto_pacman_local(config) {
+        hooks.add_hook(Box::new(xpm_core::hooks::PacmanDbHook::new(
+            pacman_local,
+            config.options.root_dir.clone(),
+        )));
+    }
+    hooks
+}
+
+fn auto_pacman_local(config: &XpmConfig) -> Option<PathBuf> {
+    if !config.options.mirror_pacman {
+        return None;
+    }
+    if let Some(db) = &config.options.pacman_db {
+        return Some(db.join("local"));
+    }
+    if config.options.root_dir == Path::new("/") {
+        let candidate = PathBuf::from("/var/lib/pacman/local");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn mirror_pacman_records(config: &XpmConfig, records: &[InstalledRecord]) -> Result<()> {
+    let Some(pacman_local) = auto_pacman_local(config) else {
+        return Ok(());
+    };
+    let xpm_local = config.options.db_path.join("local");
+    let mut failures = Vec::new();
+
+    for record in records {
+        if let Err(err) = xpm_core::pacman_db::mirror_entry(
+            &pacman_local,
+            &xpm_local,
+            &record.name,
+            &record.version,
+            record.reason,
+            Some(&record.pkg_file),
+            &config.options.root_dir,
+        ) {
+            failures.push(format!("{}: {err:#}", record.name));
+        }
+    }
+
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "the xpm transaction succeeded but mirroring into pacman's database failed: {}\nRun `xpm sync-pacman-db` to repair it.",
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn cmd_sync_pacman_db(config: &XpmConfig, args: &cli::SyncPacmanDbArgs) -> Result<()> {
+    let pacman_local = args
+        .pacman_db
+        .as_ref()
+        .map(|db| db.join("local"))
+        .or_else(|| auto_pacman_local(config))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pacman database not found; pass --pacman-db or set `pacman_db` in the config"
+            )
+        })?;
+    let xpm_local = config.options.db_path.join("local");
+
+    let report = xpm_core::pacman_db::sync_all(
+        &pacman_local,
+        &xpm_local,
+        &config.options.cache_dir,
+        &config.options.root_dir,
+    )
+    .context("failed to mirror the xpm database into pacman's")?;
+
+    println!(
+        ":: Mirrored {} package(s) into {}, skipped {}.",
+        report.written,
+        pacman_local.display(),
+        report.skipped
+    );
+    for (package, error) in &report.failed {
+        eprintln!("   {package}: {error}");
+    }
+    if !report.failed.is_empty() {
+        anyhow::bail!("{} package(s) could not be mirrored", report.failed.len());
+    }
+    Ok(())
+}
+
+fn cmd_import_pacman(config: &XpmConfig, args: &cli::ImportArgs) -> Result<()> {
+    let dest = config.options.db_path.join("local");
+    println!(
+        ":: Importing pacman local database {} -> {}",
+        args.from.display(),
+        dest.display()
+    );
+    let report = xpm_core::migrate::import_pacman_local(&args.from, &dest, args.force)
+        .context("failed to import pacman local database")?;
+
+    println!(
+        ":: Imported {} package(s), skipped {} already present.",
+        report.imported, report.skipped
+    );
+    for (package, error) in &report.failed {
+        eprintln!("   {package}: {error}");
+    }
+    if !report.failed.is_empty() {
+        anyhow::bail!("{} package(s) failed to import", report.failed.len());
+    }
+    println!(":: Import complete. Run `xpm query` to inspect the local database.");
     Ok(())
 }
 

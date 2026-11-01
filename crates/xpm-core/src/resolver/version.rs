@@ -88,15 +88,11 @@ impl Ord for Version {
             ord => return ord,
         }
 
-        // 3. Compare pkgrel (empty pkgrel is less than any pkgrel)
-        if self.pkgrel.is_empty() && other.pkgrel.is_empty() {
+        // 3. Compare pkgrel. libalpm ignores pkgrel when either side omits
+        // it: `vercmp 262.1-1 262.1` returns 0, so dependencies written as
+        // `pkg=262.1` match `262.1-1`.
+        if self.pkgrel.is_empty() || other.pkgrel.is_empty() {
             return Ordering::Equal;
-        }
-        if self.pkgrel.is_empty() {
-            return Ordering::Less;
-        }
-        if other.pkgrel.is_empty() {
-            return Ordering::Greater;
         }
 
         alpm_vercmp(&self.pkgrel, &other.pkgrel)
@@ -338,6 +334,14 @@ mod tests {
     fn vercmp_pkgrel() {
         assert_eq!(Version::cmp_versions("1.0-1", "1.0-2"), Ordering::Less);
         assert_eq!(Version::cmp_versions("1.0-2", "1.0-1"), Ordering::Greater);
+    }
+
+    #[test]
+    fn vercmp_ignores_pkgrel_when_one_side_omits_it() {
+        // pacman's `vercmp 262.1-1 262.1` prints 0.
+        assert_eq!(Version::cmp_versions("262.1-1", "262.1"), Ordering::Equal);
+        assert_eq!(Version::cmp_versions("262.1", "262.1-1"), Ordering::Equal);
+        assert_eq!(Version::cmp_versions("5.3.20-1", "5.3.20"), Ordering::Equal);
     }
 
     // ── vercmp — real-world examples ─────────────────────────────────

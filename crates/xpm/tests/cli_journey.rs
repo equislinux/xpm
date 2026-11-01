@@ -167,6 +167,7 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("XPM_HOOKS_DIR", self._tmp.path().join("hooks"))
             .env("XPM_ALPM_HOOKS_DIRS", &self.alpm_hooks_dir)
+            .env("XPM_ALPM_HOOKS_NO_CHROOT", "1")
             .output()
             .expect("run xpm")
     }

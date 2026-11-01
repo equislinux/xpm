@@ -12,7 +12,9 @@
 //! (`pacman` grew this in 5.2) while xpkg writes it as plain text; both are
 //! accepted here.
 
+use std::ffi::OsString;
 use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use crate::error::XpmError;
@@ -33,6 +35,14 @@ pub fn parse_mtree(data: &[u8]) -> Result<Vec<MtreeEntry>, XpmError> {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // mtree defaults and unset directives are not package entries.
+        if line == "/set"
+            || line.starts_with("/set ")
+            || line == "/unset"
+            || line.starts_with("/unset ")
+        {
             continue;
         }
 
@@ -57,6 +67,37 @@ fn decode_mtree(data: &[u8]) -> Result<Vec<u8>, XpmError> {
     Ok(decoded)
 }
 
+/// Decode mtree path escapes (`\040` space, `\134` backslash, etc.) to raw
+/// bytes. libarchive uses three-digit octal escapes for arbitrary bytes.
+fn unescape_mtree_bytes(raw: &str) -> Vec<u8> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1..index + 4]
+                .iter()
+                .all(|byte| (b'0'..=b'7').contains(byte))
+        {
+            let value = (bytes[index + 1] - b'0') * 64
+                + (bytes[index + 2] - b'0') * 8
+                + (bytes[index + 3] - b'0');
+            out.push(value);
+            index += 4;
+        } else if bytes[index] == b'\\' && index + 1 < bytes.len() {
+            out.push(bytes[index + 1]);
+            index += 2;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    out
+}
+
 // ── Line parser ───────────────────────────────────────────────
 
 fn parse_mtree_line(line: &str) -> Result<MtreeEntry, XpmError> {
@@ -65,7 +106,7 @@ fn parse_mtree_line(line: &str) -> Result<MtreeEntry, XpmError> {
     let path_str = parts
         .next()
         .ok_or_else(|| XpmError::Package("empty .MTREE line".into()))?;
-    let path = PathBuf::from(path_str);
+    let path = PathBuf::from(OsString::from_vec(unescape_mtree_bytes(path_str)));
 
     let mut file_type = MtreeFileType::File;
     let mut mode: u32 = 0o644;
@@ -99,7 +140,10 @@ fn parse_mtree_line(line: &str) -> Result<MtreeEntry, XpmError> {
             "gid" => gid = value.parse().unwrap_or(0),
             "size" => size = value.parse().unwrap_or(0),
             "sha256digest" => sha256 = Some(value.to_string()),
-            "link" => link_target = Some(value.to_string()),
+            "link" => {
+                link_target =
+                    Some(String::from_utf8_lossy(&unescape_mtree_bytes(value)).into_owned())
+            }
             _ => {} // Forward-compatible: ignore unknown attributes.
         }
     }
@@ -210,6 +254,21 @@ mod tests {
         let entries = parse_mtree(&gz).expect("gzip mtree must parse");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sha256.as_deref(), Some("aa"));
+    }
+
+    #[test]
+    fn parse_skips_set_and_unset_directives() {
+        let data = "#mtree\n/set type=file uid=0 gid=0\n./usr/bin/hello type=file mode=0644\n/unset type\n";
+        let entries = parse_mtree(data.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("./usr/bin/hello"));
+    }
+
+    #[test]
+    fn parse_unescapes_mtree_paths() {
+        let data = "#mtree\n./usr/share/Librem\\0405.conf type=file mode=0644\n";
+        let entries = parse_mtree(data.as_bytes()).unwrap();
+        assert_eq!(entries[0].path, PathBuf::from("./usr/share/Librem 5.conf"));
     }
 
     #[test]

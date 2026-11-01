@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -119,6 +120,7 @@ impl Hook for FileExtractionHook {
         let mut installed_files: Vec<String> = Vec::new();
         let mut shell_shims: Vec<PathBuf> = Vec::new();
         let mut pacnew_files: Vec<String> = Vec::new();
+        let mut deferred_hardlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
 
         for entry in archive.entries()? {
             let mut entry = entry?;
@@ -130,13 +132,26 @@ impl Hook for FileExtractionHook {
                 continue;
             }
 
-            let is_regular_file = entry.header().entry_type().is_file();
+            let entry_type = entry.header().entry_type();
+            let is_regular_file = entry_type.is_file();
             let mode = entry.header().mode().unwrap_or(0);
             let is_executable = mode & 0o111 != 0;
             let target = context.root_dir.join(&normalized);
 
+            ensure_no_symlink_ancestors(&context.root_dir, &target)?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
+            }
+
+            if entry_type.is_hard_link() {
+                let link = entry.link_name()?.ok_or_else(|| {
+                    XpmError::Package(format!("hardlink entry {} has no link target", normalized))
+                })?;
+                let link_normalized = normalize_archive_path(&link);
+                let link_target = context.root_dir.join(&link_normalized);
+                ensure_no_symlink_ancestors(&context.root_dir, &link_target)?;
+                deferred_hardlinks.push((target, link_target));
+                continue;
             }
 
             let write_pacnew = is_regular_file
@@ -168,6 +183,19 @@ impl Hook for FileExtractionHook {
                 if let Some(shim) = ensure_shell_shim(&normalized, &target)? {
                     shell_shims.push(shim);
                 }
+            }
+        }
+
+        for (target, source) in deferred_hardlinks {
+            fs::hard_link(&source, &target).map_err(|err| {
+                XpmError::Package(format!(
+                    "failed to create hardlink {} -> {}: {err}",
+                    target.display(),
+                    source.display()
+                ))
+            })?;
+            if let Ok(relative) = target.strip_prefix(&context.root_dir) {
+                installed_files.push(relative.to_string_lossy().into_owned());
             }
         }
 
@@ -277,19 +305,59 @@ fn open_package_archive(pkg_file: &Path) -> XpmResult<tar::Archive<Box<dyn Read>
 
 /// Normalizes an archive path to the manifest form (`etc/foo.conf`).
 /// A trailing `/` (directory entries) is preserved on purpose.
+fn ensure_no_symlink_ancestors(root: &Path, target: &Path) -> XpmResult<()> {
+    let relative = target.strip_prefix(root).map_err(|_| {
+        XpmError::Package(format!(
+            "target {} is outside the installation root {}",
+            target.display(),
+            root.display()
+        ))
+    })?;
+    let components: Vec<_> = relative.components().collect();
+    let mut current = root.to_path_buf();
+
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(XpmError::Package(format!(
+                    "refusing to extract through symlink {}",
+                    current.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(XpmError::Package(format!(
+                    "path component is not a directory: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(())
+}
+
 fn normalize_archive_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .to_string()
+    let raw = path.to_string_lossy();
+    let mut normalized = raw.as_ref();
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped;
+    }
+    normalized.to_string()
 }
 
 /// Whether the entry is package metadata rather than payload.
+///
+/// Only top-level metadata files are special; `usr/share/foo.PKGINFO` is a
+/// normal package file.
 fn is_metadata_path(normalized: &str) -> bool {
-    normalized.ends_with(".PKGINFO")
-        || normalized.ends_with(".BUILDINFO")
-        || normalized.ends_with(".MTREE")
-        || normalized.ends_with(".INSTALL")
+    matches!(
+        normalized,
+        ".PKGINFO" | ".BUILDINFO" | ".MTREE" | ".INSTALL"
+    )
 }
 
 /// Builds the `path -> sha256` map from raw `.MTREE` bytes.
@@ -500,51 +568,135 @@ fn run_scriptlet_functions(
     script_data: &[u8],
     functions: &[&str],
 ) -> XpmResult<()> {
-    let tmp_script = context
-        .local_db_dir
-        .join(format!(".{}.install.tmp", context.pkg_name));
-    fs::write(&tmp_script, script_data)?;
-
-    let shell = r#"set -euo pipefail
-script_path="$1"
-shift
-source "$script_path"
-for fn in "$@"; do
-  if declare -F "$fn" >/dev/null 2>&1; then
-    "$fn"
-  fi
-done
-"#;
-
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(shell)
-        .arg("xpm-scriptlet")
-        .arg(&tmp_script)
-        .args(functions)
-        .current_dir(&context.root_dir)
-        .env("XPM_ROOT_DIR", &context.root_dir)
-        .env("XPM_PKG_NAME", &context.pkg_name)
-        .env("XPM_PKG_VERSION", &context.pkg_version)
-        .status();
-
-    let _ = fs::remove_file(&tmp_script);
-
-    let status = status.map_err(|e| {
-        XpmError::Package(format!(
-            "failed to execute .INSTALL script for '{}': {}",
-            context.pkg_name, e
-        ))
-    })?;
-
-    if !status.success() {
-        return Err(XpmError::Package(format!(
-            ".INSTALL script failed for '{}' with status {}",
-            context.pkg_name, status
-        )));
+    let chrooted = context.root_dir != Path::new("/");
+    if chrooted && !context.root_dir.join("bin/sh").exists() {
+        tracing::warn!(
+            package = %context.pkg_name,
+            root = %context.root_dir.display(),
+            "skipping .INSTALL script: target has no /bin/sh (no host fallback)"
+        );
+        return Ok(());
     }
 
-    Ok(())
+    let tmp_root = context.root_dir.join("tmp");
+    if !tmp_root.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o1777).recursive(true);
+        builder.create(&tmp_root)?;
+    }
+    let unique = format!(
+        ".xpm-scriptlet-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp_dir = tmp_root.join(&unique);
+    fs::create_dir(&tmp_dir)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let script_path = tmp_dir.join(".INSTALL");
+    fs::write(&script_path, script_data)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o644))?;
+    }
+
+    let inside_script = format!("/tmp/{unique}/.INSTALL");
+    let function = functions.first().copied().unwrap_or("");
+    let mut args = vec![context.pkg_version.clone()];
+    if function.contains("upgrade") {
+        args.push(context.old_version.clone().unwrap_or_default());
+    }
+    let quoted_args = args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = format!(
+        ". {script}; if [ -n \"$(command -v {function})\" ]; then {function} {args}; fi",
+        script = shell_quote(&inside_script),
+        function = shell_quote(function),
+        args = quoted_args,
+    );
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(&command);
+    cmd.env_clear()
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin")
+        .env("HOME", "/root")
+        .env("SHELL", "/bin/sh")
+        .env("LANG", "C")
+        .env("SHLVL", "1")
+        .env("XPM_ROOT_DIR", "/")
+        .env("XPM_PKG_NAME", &context.pkg_name)
+        .env("XPM_PKG_VERSION", &context.pkg_version);
+
+    if chrooted {
+        use std::ffi::CString;
+        use std::os::unix::process::CommandExt;
+        let root = CString::new(context.root_dir.as_os_str().as_bytes()).map_err(|_| {
+            XpmError::Package(format!(
+                "root path contains NUL: {}",
+                context.root_dir.display()
+            ))
+        })?;
+        let root_path = root.clone();
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::umask(0o022);
+                if libc::chroot(root_path.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::chdir(c"/".as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        cmd.current_dir("/");
+    }
+
+    let result = cmd.status();
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            tracing::warn!(
+                package = %context.pkg_name,
+                status = %status,
+                "package scriptlet failed; continuing (pacman-compatible)"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!(
+                package = %context.pkg_name,
+                error = %error,
+                "could not execute package scriptlet; continuing (pacman-compatible)"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn ensure_shell_shim(relative_path: &str, target: &Path) -> XpmResult<Option<PathBuf>> {
@@ -638,6 +790,54 @@ impl Hook for LocalDbHook {
                     fs::remove_dir_all(pkg_dir)?;
                 }
                 Ok(())
+            }
+        }
+    }
+}
+
+/// Mirror package database changes into pacman's local database.
+///
+/// Added to the transaction only when a pacman database is configured; runs
+/// after [`LocalDbHook`] so xpm's metadata is available and before the ALPM
+/// post-transaction hooks, keeping generation captures consistent.
+pub struct PacmanDbHook {
+    pacman_local: PathBuf,
+    root_dir: PathBuf,
+}
+
+impl PacmanDbHook {
+    pub fn new(pacman_local: PathBuf, root_dir: PathBuf) -> Self {
+        Self {
+            pacman_local,
+            root_dir,
+        }
+    }
+}
+
+impl Hook for PacmanDbHook {
+    fn name(&self) -> &str {
+        "pacman-db"
+    }
+
+    fn run(&self, context: &HookContext) -> XpmResult<()> {
+        match context.operation_type {
+            OperationType::Install | OperationType::Upgrade => {
+                let reason = crate::install_reason::InstallReason::read(
+                    &context.local_db_dir,
+                    &context.pkg_name,
+                );
+                crate::pacman_db::mirror_entry(
+                    &self.pacman_local,
+                    &context.local_db_dir,
+                    &context.pkg_name,
+                    &context.pkg_version,
+                    reason,
+                    context.pkg_file.as_deref(),
+                    &self.root_dir,
+                )
+            }
+            OperationType::Remove => {
+                crate::pacman_db::remove_entry(&self.pacman_local, &context.pkg_name)
             }
         }
     }
@@ -923,23 +1123,59 @@ mod tests {
 
     #[test]
     fn post_scriptlet_hook_runs_post_install() {
-        let (root, db_tmp, mut ctx) = test_context(OperationType::Install);
+        let (_root, db_tmp, mut ctx) = test_context(OperationType::Install);
         let hook = PostScriptletHook;
         ctx.pkg_file = None;
+        ctx.root_dir = PathBuf::from("/");
 
+        let marker = std::env::temp_dir().join(format!(
+            "xpm-scriptlet-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         let pkg_dir = db_tmp.path().join(&ctx.pkg_name);
         fs::create_dir_all(&pkg_dir).expect("create pkg dir");
         fs::write(
             pkg_dir.join("install"),
-            "post_install() { touch \"$XPM_ROOT_DIR/scriptlet-ok\"; }\n",
+            format!("post_install() {{ touch '{}'; }}\n", marker.display()),
         )
         .expect("write install script");
 
         hook.run(&ctx).expect("run scriptlet hook");
-        assert!(
-            root.path().join("scriptlet-ok").exists(),
-            "post_install should create marker file"
+        assert!(marker.exists(), "post_install should create marker file");
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn normalize_archive_path_preserves_dotfiles_and_backslashes() {
+        assert_eq!(
+            normalize_archive_path(Path::new("./usr/bin/foo")),
+            "usr/bin/foo"
         );
+        assert_eq!(normalize_archive_path(Path::new("./.hidden")), ".hidden");
+        assert_eq!(
+            normalize_archive_path(Path::new("usr/bin/a\\b")),
+            "usr/bin/a\\b"
+        );
+        assert!(!is_metadata_path("usr/share/foo.PKGINFO"));
+        assert!(is_metadata_path(".PKGINFO"));
+    }
+
+    #[test]
+    fn extraction_rejects_symlink_ancestors() {
+        let root = TempDir::new().expect("root");
+        fs::create_dir_all(root.path().join("usr")).expect("usr");
+        std::os::unix::fs::symlink("/tmp", root.path().join("usr/lib")).expect("symlink");
+
+        let err = ensure_no_symlink_ancestors(root.path(), &root.path().join("usr/lib/foo"))
+            .expect_err("must reject symlink ancestor");
+        assert!(format!("{err}").contains("symlink"));
+
+        ensure_no_symlink_ancestors(root.path(), &root.path().join("usr/bin/foo"))
+            .expect("regular ancestors are fine");
     }
 
     #[test]

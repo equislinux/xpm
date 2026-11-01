@@ -38,6 +38,7 @@ xz2 = "0.1"
 
 # Cryptography
 sha2 = "0.10"
+md-5 = "0.10"
 sequoia-openpgp = { version = "1", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
 
 # Logging
@@ -46,6 +47,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Network
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# Globbing (pacman-style --overwrite patterns)
+glob = "0.3"
 
 # Internal crates
 xpm-core = { path = "crates/xpm-core" }

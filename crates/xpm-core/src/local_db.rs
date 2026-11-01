@@ -80,10 +80,9 @@ fn is_package_metadata_path(path: &str) -> bool {
 }
 
 fn normalize_mtree_path(raw: &str) -> Option<String> {
-    let cleaned = raw.replace('\\', "/");
     let mut parts = Vec::new();
 
-    for component in Path::new(&cleaned).components() {
+    for component in Path::new(raw).components() {
         match component {
             Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
             Component::RootDir | Component::CurDir => {}

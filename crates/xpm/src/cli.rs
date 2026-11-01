@@ -44,6 +44,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
+    /// Do not mirror transactions into pacman's local database.
+    #[arg(long, global = true)]
+    pub no_pacman_mirror: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -94,6 +98,14 @@ pub enum Command {
     /// Compare the installed packages against a generation capture.
     Diff(DiffArgs),
 
+    /// Import installed packages from pacman's local database.
+    #[command(name = "import-pacman")]
+    ImportPacman(ImportArgs),
+
+    /// Rewrite pacman's local database from xpm's database.
+    #[command(name = "sync-pacman-db")]
+    SyncPacmanDb(SyncPacmanDbArgs),
+
     /// Display detailed usage information and guides.
     Usage(HelpArgs),
 }
@@ -128,6 +140,14 @@ pub struct InstallArgs {
     /// Do not install optional dependencies.
     #[arg(long)]
     pub no_optional: bool,
+
+    /// Print the resolved packages without downloading or installing them.
+    #[arg(long, short = 'p')]
+    pub print: bool,
+
+    /// Overwrite conflicting files matching PATTERN (repeatable; `!` negates).
+    #[arg(long, value_name = "PATTERN")]
+    pub overwrite: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -136,13 +156,21 @@ pub struct RemoveArgs {
     #[arg(required = true)]
     pub packages: Vec<String>,
 
-    /// Remove also unneeded dependencies (recursive).
-    #[arg(long, short = 's')]
-    pub recursive: bool,
+    /// Remove unneeded dependencies; repeat (-Rss) to include explicit ones.
+    #[arg(long, short = 's', action = clap::ArgAction::Count)]
+    pub recursive: u8,
 
-    /// Skip dependency checks.
-    #[arg(long, short = 'd')]
-    pub no_deps: bool,
+    /// Ignore dependency versions (-d) or all dependency checks (-dd).
+    #[arg(long = "nodeps", alias = "no-deps", short = 'd', action = clap::ArgAction::Count)]
+    pub no_deps: u8,
+
+    /// Remove packages that depend on the targets (pacman -Rc).
+    #[arg(long)]
+    pub cascade: bool,
+
+    /// Keep targets that are still required by another package (-Ru).
+    #[arg(long, short = 'u')]
+    pub unneeded: bool,
 
     /// Remove configuration files as well (purge).
     #[arg(long, short = 'n')]
@@ -158,6 +186,14 @@ pub struct UpgradeArgs {
     /// Ignore specific packages during upgrade.
     #[arg(long, value_name = "PKG")]
     pub ignore: Vec<String>,
+
+    /// Print the upgrade plan without downloading or installing anything.
+    #[arg(long, short = 'p')]
+    pub print: bool,
+
+    /// Overwrite conflicting files matching PATTERN (repeatable; `!` negates).
+    #[arg(long, value_name = "PATTERN")]
+    pub overwrite: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -283,6 +319,24 @@ pub struct DiffArgs {
     /// Emit the diff as a single JSON object.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ImportArgs {
+    /// pacman local database directory.
+    #[arg(long, value_name = "PATH", default_value = "/var/lib/pacman/local")]
+    pub from: PathBuf,
+
+    /// Overwrite entries that already exist in the xpm database.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SyncPacmanDbArgs {
+    /// pacman database directory (default: configured or auto-detected).
+    #[arg(long, value_name = "PATH")]
+    pub pacman_db: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]

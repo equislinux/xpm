@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use resolvo::{ArenaId, NameId, Problem, Solver, VersionSetId};
+use resolvo::{ArenaId, NameId, Problem, SolvableId, Solver, VersionSetId};
 
 use crate::error::{XpmError, XpmResult};
 use crate::resolver::dependency::{DepConstraint, Operator};
@@ -69,9 +69,35 @@ pub fn resolve_closure(
     candidates: Vec<PackageCandidate>,
     requirements: &[Requirement],
 ) -> XpmResult<Vec<(PackageCandidate, bool)>> {
+    Ok(
+        resolve_closure_with_installed(candidates, Vec::new(), requirements)?
+            .into_iter()
+            .map(|(candidate, explicit, _installed)| (candidate, explicit))
+            .collect(),
+    )
+}
+
+/// Resolve `requirements` while treating `installed` as already-present
+/// packages.
+///
+/// Installed candidates are added to the pool and marked as favored for their
+/// package name and every name they provide, except for names explicitly
+/// requested by the user. This keeps satisfied dependencies in place (like
+/// pacman) while still allowing the solver to pick a newer repository
+/// candidate when a version constraint requires it.
+///
+/// The returned boolean pair is `(explicit, installed)`. Callers should skip
+/// installed entries that are not being changed.
+pub fn resolve_closure_with_installed(
+    candidates: Vec<PackageCandidate>,
+    installed: Vec<PackageCandidate>,
+    requirements: &[Requirement],
+) -> XpmResult<Vec<(PackageCandidate, bool, bool)>> {
     if requirements.is_empty() {
         return Ok(Vec::new());
     }
+
+    let explicit_names: HashSet<&str> = requirements.iter().map(|req| req.name.as_str()).collect();
 
     let mut pool = PackagePool::new();
     for candidate in &candidates {
@@ -80,8 +106,28 @@ pub fn resolve_closure(
         pool.add_provides(solvable, &provides);
     }
 
+    for candidate in &installed {
+        let solvable = pool.add_candidate(candidate.clone());
+        let provides = candidate.provides.clone();
+        pool.add_provides(solvable, &provides);
+        pool.mark_installed(solvable);
+
+        if !explicit_names.contains(candidate.name.as_str()) {
+            if let Some(name_id) = pool.name_to_id.get(&candidate.name).copied() {
+                pool.set_favored(name_id, solvable);
+            }
+        }
+        for provide in &provides {
+            if !explicit_names.contains(provide.name.as_str()) {
+                if let Some(name_id) = pool.name_to_id.get(&provide.name).copied() {
+                    pool.set_favored(name_id, solvable);
+                }
+            }
+        }
+    }
+
     // Intern dependency and conflict version sets for every candidate.
-    for candidate in &candidates {
+    for candidate in candidates.iter().chain(installed.iter()) {
         for dep in &candidate.depends {
             intern_once(&mut pool, dep, false);
         }
@@ -94,7 +140,7 @@ pub fn resolve_closure(
     let mut requirement_ids = Vec::new();
     for requirement in requirements {
         let constraint = requirement.constraint();
-        let satisfiable = candidates.iter().any(|candidate| {
+        let satisfiable = candidates.iter().chain(installed.iter()).any(|candidate| {
             candidate.name == constraint.name
                 || candidate
                     .provides
@@ -114,6 +160,9 @@ pub fn resolve_closure(
         requirement_ids.push(version_set.into());
     }
 
+    let installed_indexes: HashSet<usize> = (0..pool.solvables.len())
+        .filter(|&index| pool.is_installed(SolvableId::from_usize(index)))
+        .collect();
     let snapshot = pool.solvables.clone();
     let problem = Problem::new().requirements(requirement_ids);
     let mut solver = Solver::new(XpmProvider::new(pool));
@@ -132,8 +181,6 @@ pub fn resolve_closure(
             by_name.entry(provide.name.as_str()).or_insert(idx);
         }
     }
-
-    let explicit_names: HashSet<&str> = requirements.iter().map(|req| req.name.as_str()).collect();
 
     let mut visited = HashSet::new();
     let mut order = Vec::new();
@@ -157,7 +204,8 @@ pub fn resolve_closure(
                     .provides
                     .iter()
                     .any(|provide| explicit_names.contains(provide.name.as_str()));
-            (candidate, explicit)
+            let is_installed = installed_indexes.contains(&idx);
+            (candidate, explicit, is_installed)
         })
         .collect())
 }
@@ -322,6 +370,153 @@ mod tests {
 
         let error = resolve_closure(candidates, &requests).unwrap_err();
         assert!(matches!(error, XpmError::DependencyConflict(_)));
+    }
+
+    #[test]
+    fn versioned_provides_satisfy_versioned_dependencies() {
+        // Real Arch pattern: bash depends on the readline soname, and the
+        // readline package provides it with its own version, unrelated to
+        // the package version.
+        let candidates = vec![
+            candidate("app", "1.0-1", &["libfoo.so=8-64"], &[]),
+            candidate("libfoo", "1.2.3-1", &[], &["libfoo.so=8-64"]),
+        ];
+        let requests = vec![Requirement::parse("app").unwrap()];
+
+        let plan = resolve_closure(candidates, &requests).unwrap();
+        let names = plan_names(&plan);
+        assert_eq!(names, vec!["libfoo=1.2.3-1", "app=1.0-1"]);
+    }
+
+    #[test]
+    fn versioned_provides_reject_mismatched_versions() {
+        let candidates = vec![
+            candidate("app", "1.0-1", &["libfoo.so=8-64"], &[]),
+            candidate("libfoo", "1.2.3-1", &[], &["libfoo.so=7-64"]),
+        ];
+        let requests = vec![Requirement::parse("app").unwrap()];
+
+        let error = resolve_closure(candidates, &requests).unwrap_err();
+        assert!(matches!(error, XpmError::DependencyConflict(_)));
+    }
+
+    #[test]
+    fn unversioned_provide_does_not_satisfy_versioned_dependency() {
+        let candidates = vec![
+            candidate("app", "1.0-1", &["libfoo.so=8-64"], &[]),
+            candidate("libfoo", "1.2.3-1", &[], &["libfoo.so"]),
+        ];
+        let requests = vec![Requirement::parse("app").unwrap()];
+
+        let error = resolve_closure(candidates, &requests).unwrap_err();
+        assert!(matches!(error, XpmError::DependencyConflict(_)));
+    }
+
+    #[test]
+    fn unversioned_dependency_accepts_versioned_provide() {
+        let candidates = vec![
+            candidate("app", "1.0-1", &["sh"], &[]),
+            candidate("bash", "5.3-1", &[], &["sh=5.3"]),
+        ];
+        let requests = vec![Requirement::parse("app").unwrap()];
+
+        let plan = resolve_closure(candidates, &requests).unwrap();
+        let names = plan_names(&plan);
+        assert_eq!(names, vec!["bash=5.3-1", "app=1.0-1"]);
+    }
+
+    #[test]
+    fn conflicts_match_versioned_provides() {
+        let mut conflicting = candidate("other", "1.0-1", &["libfoo.so=8-64"], &[]);
+        conflicting.conflicts = vec![DepConstraint::parse("libfoo.so=8-64")];
+
+        let candidates = vec![
+            candidate("app", "1.0-1", &["libfoo.so=8-64"], &[]),
+            candidate("libfoo", "1.2.3-1", &[], &["libfoo.so=8-64"]),
+            conflicting,
+        ];
+        let requests = vec![
+            Requirement::parse("app").unwrap(),
+            Requirement::parse("other").unwrap(),
+        ];
+
+        let error = resolve_closure(candidates, &requests).unwrap_err();
+        assert!(matches!(error, XpmError::DependencyConflict(_)));
+    }
+
+    #[test]
+    fn installed_dependency_is_kept_even_when_repo_has_newer() {
+        let candidates = vec![
+            candidate("app", "1.0-1", &["lib"], &[]),
+            candidate("lib", "3.0-1", &[], &[]),
+        ];
+        let installed = vec![candidate("lib", "2.0-1", &[], &[])];
+        let requests = vec![Requirement::parse("app").unwrap()];
+
+        let plan = resolve_closure_with_installed(candidates, installed, &requests).unwrap();
+        let install: Vec<_> = plan
+            .iter()
+            .filter(|(_, _, installed)| !*installed)
+            .map(|(c, _, _)| c.name.clone())
+            .collect();
+        assert_eq!(install, vec!["app"]);
+        assert!(plan
+            .iter()
+            .any(|(c, _, installed)| c.name == "lib" && *installed));
+    }
+
+    #[test]
+    fn installed_version_is_replaced_when_constraint_requires_newer() {
+        let candidates = vec![
+            candidate("app", "1.0-1", &["lib>=3"], &[]),
+            candidate("lib", "3.0-1", &[], &[]),
+        ];
+        let installed = vec![candidate("lib", "2.0-1", &[], &[])];
+        let requests = vec![Requirement::parse("app").unwrap()];
+
+        let plan = resolve_closure_with_installed(candidates, installed, &requests).unwrap();
+        let lib = plan.iter().find(|(c, _, _)| c.name == "lib").unwrap();
+        assert_eq!(lib.0.version, Version::parse("3.0-1"));
+        assert!(!lib.2, "the newer repository candidate must be selected");
+    }
+
+    #[test]
+    fn explicit_request_prefers_newer_repository_candidate() {
+        let candidates = vec![candidate("foo", "2.0-1", &[], &[])];
+        let installed = vec![candidate("foo", "1.0-1", &[], &[])];
+        let requests = vec![Requirement::parse("foo").unwrap()];
+
+        let plan = resolve_closure_with_installed(candidates, installed, &requests).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.version, Version::parse("2.0-1"));
+        assert!(!plan[0].2);
+    }
+
+    #[test]
+    fn explicit_request_does_not_downgrade_below_installed() {
+        let candidates = vec![candidate("foo", "2.0-1", &[], &[])];
+        let installed = vec![candidate("foo", "3.0-1", &[], &[])];
+        let requests = vec![Requirement::parse("foo").unwrap()];
+
+        let plan = resolve_closure_with_installed(candidates, installed, &requests).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.version, Version::parse("3.0-1"));
+        assert!(plan[0].2);
+    }
+
+    #[test]
+    fn installed_provide_satisfies_dependency() {
+        let candidates = vec![
+            candidate("app", "1.0-1", &["sh"], &[]),
+            candidate("bash", "6.0-1", &[], &["sh"]),
+        ];
+        let installed = vec![candidate("bash", "5.3-1", &[], &["sh"])];
+        let requests = vec![Requirement::parse("app").unwrap()];
+
+        let plan = resolve_closure_with_installed(candidates, installed, &requests).unwrap();
+        let bash = plan.iter().find(|(c, _, _)| c.name == "bash").unwrap();
+        assert_eq!(bash.0.version, Version::parse("5.3-1"));
+        assert!(bash.2);
     }
 
     #[test]

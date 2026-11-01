@@ -74,6 +74,14 @@ pub struct GeneralOptions {
     pub parallel_downloads: u32,
     /// Check available disk space before installing.
     pub check_space: bool,
+    /// pacman database directory used for the compatibility mirror.
+    ///
+    /// When unset and `root_dir` is `/`, `/var/lib/pacman` is used if it
+    /// exists. Set to a path to mirror into a different database, or disable
+    /// the mirror with `mirror_pacman = false`.
+    pub pacman_db: Option<PathBuf>,
+    /// Mirror xpm transactions into pacman's local database.
+    pub mirror_pacman: bool,
 }
 
 impl GeneralOptions {
@@ -96,9 +104,20 @@ impl GeneralOptions {
         self.gpg_dir.clone()
     }
 
-    /// Path of the trusted-keys file inside [`Self::effective_gpg_dir`].
+    /// Path of the keyring file inside [`Self::effective_gpg_dir`].
+    ///
+    /// pacman's keyring may be a legacy `trustedkeys.gpg` file or GnuPG's
+    /// `pubring.gpg`; prefer whichever exists so xpm can use the same trust
+    /// store as pacman without a separate initialization step.
     pub fn keyring_path(&self) -> PathBuf {
-        self.effective_gpg_dir().join("trustedkeys.gpg")
+        let dir = self.effective_gpg_dir();
+        for candidate in ["trustedkeys.gpg", "pubring.gpg"] {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return path;
+            }
+        }
+        dir.join("trustedkeys.gpg")
     }
 }
 
@@ -118,6 +137,8 @@ impl Default for GeneralOptions {
             color: true,
             parallel_downloads: 5,
             check_space: true,
+            pacman_db: None,
+            mirror_pacman: true,
         }
     }
 }
@@ -263,6 +284,12 @@ color = true
 parallel_downloads = 3
 check_space = true
 
+# Mirror xpm transactions into pacman's local database so pacman -Q and the
+# generation tooling keep seeing xpm-managed packages. Auto-detected at
+# /var/lib/pacman when root_dir is "/" unless set here.
+# pacman_db = "/var/lib/pacman"
+# mirror_pacman = true
+
 [[repo]]
 name = "core"
 server = ["https://mirror.example.com/archlinux/core/os/x86_64"]
@@ -322,6 +349,18 @@ server = ["https://mirror.example.com/archlinux/extra/os/x86_64"]
         assert_eq!(options.keyring_path(), tmp.path().join("trustedkeys.gpg"));
         assert_eq!(DEFAULT_GPG_DIR, "/etc/pacman.d/gnupg/");
         assert_eq!(XPM_GPG_DIR, "/etc/xpm/gnupg/");
+    }
+
+    #[test]
+    fn keyring_path_falls_back_to_pubring_gpg() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let options = GeneralOptions {
+            gpg_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        std::fs::write(tmp.path().join("pubring.gpg"), b"not parsed here").unwrap();
+        assert_eq!(options.keyring_path(), tmp.path().join("pubring.gpg"));
     }
 
     #[test]
