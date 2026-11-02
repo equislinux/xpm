@@ -22,6 +22,7 @@ pub mod orphans;
 pub mod package;
 pub mod pacman_conf;
 pub mod pacman_db;
+mod progress;
 pub mod query;
 pub mod replace;
 pub mod repo;

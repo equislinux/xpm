@@ -1,11 +1,12 @@
 //! Remote repository database synchronization.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{Repository, SigLevel};
+use crate::progress::{format_mib, format_progress, percentage};
 use crate::repo_db::RepoEntry;
 use crate::signing::{load_keyring, verify_file, VerifyOutcome};
 use crate::{XpmError, XpmResult};
@@ -357,6 +358,8 @@ fn download_once(url: &str, dest: &Path) -> XpmResult<()> {
     let mut downloaded: u64 = 0;
     let mut buffer = [0u8; 65536];
     let mut next_report: u64 = 25;
+    let mut progress = DownloadProgress::new(dest);
+    let mut last_percent: Option<u64> = None;
 
     loop {
         let n = response
@@ -370,10 +373,11 @@ fn download_once(url: &str, dest: &Path) -> XpmResult<()> {
         downloaded += n as u64;
 
         if let Some(total) = total {
-            let percent = total
-                .checked_div(1)
-                .map(|_| downloaded.saturating_mul(100) / total)
-                .unwrap_or(0);
+            let percent = percentage(downloaded, total);
+            if last_percent != Some(percent) {
+                progress.update(downloaded, total);
+                last_percent = Some(percent);
+            }
             if percent >= next_report {
                 tracing::debug!(url, downloaded, total, percent, "download progress");
                 next_report = (next_report + 25).min(100);
@@ -384,8 +388,74 @@ fn download_once(url: &str, dest: &Path) -> XpmResult<()> {
     file.flush()?;
     fs::rename(&temp_path, dest)?;
 
+    if let Some(total) = total {
+        progress.finish(downloaded, total);
+    }
+
     tracing::debug!(url, downloaded, dest = %dest.display(), "download complete");
     Ok(())
+}
+
+/// Overwrites one stderr line while a download is in progress.
+struct DownloadProgress {
+    enabled: bool,
+    label: String,
+    widest: usize,
+    active: bool,
+}
+
+impl DownloadProgress {
+    fn new(dest: &Path) -> Self {
+        let label = dest
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".to_string());
+
+        Self {
+            enabled: io::stderr().is_terminal(),
+            label,
+            widest: 0,
+            active: false,
+        }
+    }
+
+    fn update(&mut self, downloaded: u64, total: u64) {
+        if !self.enabled {
+            return;
+        }
+
+        let line = format_progress(&self.label, downloaded, total);
+        self.widest = self.widest.max(line.chars().count());
+        let mut stderr = io::stderr();
+        let _ = write!(stderr, "\r{line}");
+        let _ = stderr.flush();
+        self.active = true;
+    }
+
+    fn finish(&mut self, downloaded: u64, total: u64) {
+        if !self.enabled || !self.active {
+            return;
+        }
+
+        let line = format_progress(&self.label, downloaded, total);
+        let padding = self.widest.saturating_sub(line.chars().count());
+        let mut stderr = io::stderr();
+        let _ = write!(stderr, "\r{line}{:padding$}\n", "", padding = padding);
+        let _ = stderr.flush();
+        self.active = false;
+    }
+}
+
+impl Drop for DownloadProgress {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        let mut stderr = io::stderr();
+        let _ = write!(stderr, "\r{:width$}\r", "", width = self.widest);
+        let _ = stderr.flush();
+    }
 }
 
 fn local_file_path(url: &str) -> Option<PathBuf> {
@@ -398,7 +468,17 @@ fn local_file_path(url: &str) -> Option<PathBuf> {
 
 fn copy_local_file(source: &Path, dest: &Path) -> XpmResult<()> {
     let data = fs::read(source)?;
-    write_atomically(dest, &data)
+    write_atomically(dest, &data)?;
+
+    if io::stderr().is_terminal() {
+        let label = dest
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".to_string());
+        eprintln!("{label} (local copy, {})", format_mib(data.len() as u64));
+    }
+
+    Ok(())
 }
 
 fn write_atomically(dest: &Path, bytes: &[u8]) -> XpmResult<()> {
