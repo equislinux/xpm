@@ -17,6 +17,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 xpm-core = { workspace = true }
+xpm-makepkg = { workspace = true }
+serde_json = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

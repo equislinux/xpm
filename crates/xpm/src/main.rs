@@ -45,6 +45,7 @@ use xpm_core::rollback::{last_rollback_candidate, RollbackOp, RollbackPlan};
 use xpm_core::txhooks::run_transaction_hooks;
 use xpm_core::{FileLock, HookChain, Transaction};
 use xpm_core::{XpmConfig, XpmError, XpmResult};
+use xpm_makepkg::{build as build_source_package, BuildOptions};
 
 fn main() -> Result<()> {
     // Rust ignores SIGPIPE by default, so `xpm ... | head` panics with a
@@ -167,6 +168,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Command::Sync(args) => cmd_sync(&config, args),
         Command::Install(args) => cmd_install(&config, args, cli.no_confirm),
+        Command::Build(args) => cmd_build(&config, args, cli.no_confirm),
         Command::Remove(args) => cmd_remove(&config, args, cli.no_confirm),
         Command::Upgrade(args) => cmd_upgrade(&config, args, cli.no_confirm),
         Command::Query(args) => cmd_query(&config, args),
@@ -473,6 +475,68 @@ struct InstalledRecord {
     groups: Vec<String>,
     reason: InstallReason,
     pkg_file: PathBuf,
+}
+
+fn cmd_build(config: &XpmConfig, args: &cli::BuildArgs, no_confirm: bool) -> Result<()> {
+    if args.as_deps && args.as_explicit {
+        anyhow::bail!("xpm build: --as-deps and --as-explicit are mutually exclusive");
+    }
+
+    let source = if args.path.is_file() {
+        args.path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid PKGBUILD path"))?
+            .to_path_buf()
+    } else {
+        args.path.clone()
+    };
+    let pkgdest = args
+        .pkgdest
+        .clone()
+        .unwrap_or_else(|| source.join(".xpm-packages"));
+
+    let options = BuildOptions {
+        pkgdest: pkgdest.clone(),
+        srcdest: args.srcdest.clone(),
+        builddir: args.builddir.clone(),
+        run_checks: !args.nocheck,
+        clean: args.clean,
+        extra_args: args.makepkg_args.clone(),
+    };
+
+    println!(":: Building source package in {}", source.display());
+    let artifacts = build_source_package(&source, &options)?;
+    println!(":: Package base: {}", artifacts.pkgbase);
+    for package in &artifacts.packages {
+        println!("   {} -> {}", package.name, package.path.display());
+    }
+
+    if let Some(path) = &args.json {
+        let json =
+            serde_json::to_vec_pretty(&artifacts).context("failed to serialize build result")?;
+        std::fs::write(path, json)
+            .with_context(|| format!("failed to write build result {}", path.display()))?;
+    }
+
+    if args.install {
+        let install_args = cli::InstallArgs {
+            packages: artifacts
+                .packages
+                .iter()
+                .map(|package| package.path.display().to_string())
+                .collect(),
+            download_only: false,
+            as_deps: args.as_deps,
+            as_explicit: args.as_explicit,
+            no_optional: false,
+            needed: false,
+            print: false,
+            overwrite: Vec::new(),
+        };
+        cmd_install(config, &install_args, no_confirm)?;
+    }
+
+    Ok(())
 }
 
 fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) -> Result<()> {

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/xpm", "crates/xpm-core"]
+members = ["crates/xpm", "crates/xpm-core", "crates/xpm-makepkg"]
 resolver = "2"
 
 [workspace.package]
@@ -53,3 +53,4 @@ glob = "0.3"
 
 # Internal crates
 xpm-core = { path = "crates/xpm-core" }
+xpm-makepkg = { path = "crates/xpm-makepkg" }

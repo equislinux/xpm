@@ -3426,12 +3426,14 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "serde_json",
  "sha2",
  "tar",
  "tempfile",
  "tracing",
  "tracing-subscriber",
  "xpm-core",
+ "xpm-makepkg",
  "zstd",
 ]
 
@@ -3458,6 +3460,16 @@ dependencies = [
  "tracing",
  "xz2",
  "zstd",
+]
+
+[[package]]
+name = "xpm-makepkg"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
