@@ -16,10 +16,10 @@ pub(crate) fn percentage(downloaded: u64, total: u64) -> u64 {
     downloaded.saturating_mul(100).div_euclid(total).min(100)
 }
 
-/// Render an ASCII progress bar such as `##########----------`.
+/// Render an ASCII progress bar such as `xxxxxxxxxx----------`.
 pub(crate) fn bar(percent: u64, width: usize) -> String {
     let filled = (percent.min(100) as usize).saturating_mul(width) / 100;
-    format!("{}{}", "#".repeat(filled), "-".repeat(width - filled))
+    format!("{}{}", "x".repeat(filled), "-".repeat(width - filled))
 }
 
 /// Render a byte count in MiB with one decimal place.
@@ -28,7 +28,7 @@ pub(crate) fn format_mib(bytes: u64) -> String {
 }
 
 /// Render one progress line, e.g.
-/// `pkg.tar.zst [##########----------]  52%  12.3/23.5 MiB`.
+/// `pkg.tar.zst [xxxxxxxxxx----------]  52%  12.3/23.5 MiB`.
 pub(crate) fn format_progress(label: &str, downloaded: u64, total: u64) -> String {
     let percent = percentage(downloaded, total);
     format!(
@@ -64,9 +64,9 @@ mod tests {
     #[test]
     fn bar_fills_proportionally_and_clamps() {
         assert_eq!(bar(0, 20), "--------------------");
-        assert_eq!(bar(52, 20), "##########----------");
-        assert_eq!(bar(100, 20), "####################");
-        assert_eq!(bar(150, 20), "####################");
+        assert_eq!(bar(52, 20), "xxxxxxxxxx----------");
+        assert_eq!(bar(100, 20), "xxxxxxxxxxxxxxxxxxxx");
+        assert_eq!(bar(150, 20), "xxxxxxxxxxxxxxxxxxxx");
         assert_eq!(bar(0, 0), "");
     }
 
@@ -82,7 +82,7 @@ mod tests {
         let line = format_progress("pkg.tar.zst", 13 * 1024 * 1024, 26 * 1024 * 1024);
         assert_eq!(
             line,
-            "pkg.tar.zst [##########----------]  50%  13.0/26.0 MiB"
+            "pkg.tar.zst [xxxxxxxxxx----------]  50%  13.0/26.0 MiB"
         );
     }
 
