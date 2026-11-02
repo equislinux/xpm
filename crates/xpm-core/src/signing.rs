@@ -51,9 +51,21 @@ pub fn verify_with_gpg(
     sig_path: &Path,
     keyring_path: &Path,
 ) -> XpmResult<VerifyOutcome> {
-    let gpg = std::process::Command::new("gpg")
-        .args(["--batch", "--no-tty", "--no-default-keyring", "--keyring"])
-        .arg(keyring_path)
+    let mut gpg = std::process::Command::new("gpg");
+    gpg.args(["--batch", "--no-tty"]);
+    // GnuPG 2.4 may run keyboxd and silently ignore an explicit --keyring.
+    // When the configured keyring lives in a pacman-style home directory, use
+    // --homedir so pubring.gpg (the same trust store pacman uses) is read.
+    let keyring_home = keyring_path
+        .parent()
+        .filter(|dir| dir.join("pubring.gpg").is_file());
+    if let Some(home) = keyring_home {
+        gpg.arg("--homedir").arg(home);
+    } else {
+        gpg.args(["--no-default-keyring", "--keyring"])
+            .arg(keyring_path);
+    }
+    let gpg = gpg
         .arg("--verify")
         .arg(sig_path)
         .arg(file_path)
