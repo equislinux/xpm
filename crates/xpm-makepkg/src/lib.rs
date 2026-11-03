@@ -201,10 +201,17 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
     let build_uid = if uid == 0 { 1000 } else { uid };
     let root = options.chroot_dir.join("root");
     if !root.is_dir() {
-        std::fs::create_dir_all(&root).map_err(|source| BuildError::Io {
-            path: root.display().to_string(),
-            source,
-        })?;
+        let status = root_command("mkdir")
+            .args(["-p"])
+            .arg(&root)
+            .status()
+            .map_err(|err| BuildError::Command(format!("mkdir: {err}")))?;
+        if !status.success() {
+            return Err(BuildError::Command(format!(
+                "could not create chroot root {}",
+                root.display()
+            )));
+        }
         tracing::info!(chroot = %root.display(), "creating clean build chroot");
         let status = root_command("pacstrap")
             .args(["-c", "-C", "/etc/pacman.conf"])
@@ -260,7 +267,9 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         .status()
         .map_err(|err| BuildError::Command(format!("mkdir: {err}")))?;
     if !status.success() {
-        return Err(BuildError::Command("could not create chroot build directory".into()));
+        return Err(BuildError::Command(
+            "could not create chroot build directory".into(),
+        ));
     }
     let _ = root_command("chown")
         .args(["-R", &format!("{build_uid}:{build_uid}")])
