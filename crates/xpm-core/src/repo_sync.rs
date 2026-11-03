@@ -55,7 +55,7 @@ pub fn sync_repo_databases(
         let db_url = format!("{base}/{}.db", repo.name);
         let db_sig_url = format!("{db_url}.sig");
 
-        match download_with_retries(&db_url, &db_temp, retries) {
+        match download_with_retries(&db_url, &db_temp, retries, true) {
             Ok(()) => {
                 if let Err(err) =
                     verify_remote_signature(&db_temp, &db_sig_url, sig_level, keyring_path, retries)
@@ -66,8 +66,12 @@ pub fn sync_repo_databases(
                 }
 
                 let files_url = format!("{base}/{}.files", repo.name);
-                let files_downloaded = match download_with_retries(&files_url, &files_temp, retries)
-                {
+                let files_downloaded = match download_with_retries(
+                    &files_url,
+                    &files_temp,
+                    retries,
+                    true,
+                ) {
                     Ok(()) => {
                         let files_sig_url = format!("{files_url}.sig");
                         match verify_remote_signature(
@@ -133,7 +137,7 @@ pub fn verify_remote_signature(
 
     let sig_dest = signature_cache_path(artifact_path);
 
-    if let Err(err) = download_with_retries(sig_url, &sig_dest, retries) {
+    if let Err(err) = download_with_retries(sig_url, &sig_dest, retries, true) {
         if sig_level == SigLevel::Required {
             return Err(XpmError::SignatureError(format!(
                 "signature required but could not be downloaded from {sig_url}: {err}"
@@ -233,10 +237,30 @@ pub fn package_download_candidates(
 
 /// Download from the first working URL to `dest`.
 pub fn download_first_available(urls: &[String], dest: &Path, retries: u32) -> XpmResult<String> {
+    download_first_available_with_progress(urls, dest, retries, true)
+}
+
+/// Like [`download_first_available`] but without terminal progress updates.
+/// Used by the parallel download scheduler, whose workers must not fight over
+/// one carriage-return line.
+pub fn download_first_available_quiet(
+    urls: &[String],
+    dest: &Path,
+    retries: u32,
+) -> XpmResult<String> {
+    download_first_available_with_progress(urls, dest, retries, false)
+}
+
+fn download_first_available_with_progress(
+    urls: &[String],
+    dest: &Path,
+    retries: u32,
+    show_progress: bool,
+) -> XpmResult<String> {
     let mut last_error: Option<XpmError> = None;
 
     for url in urls {
-        match download_with_retries(url, dest, retries) {
+        match download_with_retries(url, dest, retries, show_progress) {
             Ok(()) => return Ok(url.clone()),
             Err(err) => last_error = Some(err),
         }
@@ -269,12 +293,17 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> XpmResult<()> {
     }
 }
 
-fn download_with_retries(url: &str, dest: &Path, retries: u32) -> XpmResult<()> {
+fn download_with_retries(
+    url: &str,
+    dest: &Path,
+    retries: u32,
+    show_progress: bool,
+) -> XpmResult<()> {
     let attempts = retries.max(1);
     let mut last_error: Option<XpmError> = None;
 
     for attempt in 1..=attempts {
-        match download_once(url, dest) {
+        match download_once(url, dest, show_progress) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 tracing::warn!(url, attempt, attempts, error = %err, "download attempt failed");
@@ -286,7 +315,7 @@ fn download_with_retries(url: &str, dest: &Path, retries: u32) -> XpmResult<()> 
     Err(last_error.unwrap_or_else(|| XpmError::Database(format!("download failed: {url}"))))
 }
 
-fn download_once(url: &str, dest: &Path) -> XpmResult<()> {
+fn download_once(url: &str, dest: &Path, show_progress: bool) -> XpmResult<()> {
     if let Some(path) = local_file_path(url) {
         tracing::debug!(url, source = %path.display(), "syncing database from local file mirror");
         return copy_local_file(&path, dest);
@@ -314,7 +343,7 @@ fn download_once(url: &str, dest: &Path) -> XpmResult<()> {
     let mut downloaded: u64 = 0;
     let mut buffer = [0u8; 65536];
     let mut next_report: u64 = 25;
-    let mut progress = DownloadProgress::new(dest);
+    let mut progress = show_progress.then(|| DownloadProgress::new(dest));
     let mut last_percent: Option<u64> = None;
 
     loop {
@@ -331,7 +360,9 @@ fn download_once(url: &str, dest: &Path) -> XpmResult<()> {
         if let Some(total) = total {
             let percent = percentage(downloaded, total);
             if last_percent != Some(percent) {
-                progress.update(downloaded, total);
+                if let Some(progress) = progress.as_mut() {
+                    progress.update(downloaded, total);
+                }
                 last_percent = Some(percent);
             }
             if percent >= next_report {
@@ -344,7 +375,7 @@ fn download_once(url: &str, dest: &Path) -> XpmResult<()> {
     file.flush()?;
     fs::rename(&temp_path, dest)?;
 
-    if let Some(total) = total {
+    if let (Some(total), Some(progress)) = (total, progress.as_mut()) {
         progress.finish(downloaded, total);
     }
 

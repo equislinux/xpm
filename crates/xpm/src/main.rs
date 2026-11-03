@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
@@ -34,8 +36,8 @@ use xpm_core::query;
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db, RepoEntry};
 use xpm_core::repo_sync::{
-    download_first_available, package_download_candidates, sync_repo_databases,
-    verify_remote_signature, verify_sha256,
+    download_first_available, download_first_available_quiet, package_download_candidates,
+    sync_repo_databases, verify_remote_signature, verify_sha256,
 };
 use xpm_core::resolver::{
     resolve_closure, resolve_closure_with_installed, DepConstraint, PackageCandidate, Requirement,
@@ -545,6 +547,89 @@ fn cmd_build(config: &XpmConfig, args: &cli::BuildArgs, no_confirm: bool) -> Res
     Ok(())
 }
 
+struct DownloadJob {
+    index: usize,
+    urls: Vec<String>,
+    dest: PathBuf,
+}
+
+/// Download all resolved packages before the sequential verification and
+/// transaction phases. Network I/O is parallel; signatures, hashes, metadata
+/// and transaction ordering stay sequential.
+fn prefetch_downloads(
+    resolved: &[(Repository, RepoEntry, bool)],
+    installed: &HashMap<String, String>,
+    needed: bool,
+    arch: &str,
+    cache_dir: &Path,
+    parallel_downloads: u32,
+) -> Result<Vec<Option<String>>> {
+    let mut jobs = Vec::new();
+    let mut mirrors = vec![None; resolved.len()];
+
+    for (index, (repo, entry, _)) in resolved.iter().enumerate() {
+        if needed
+            && installed
+                .get(&entry.name)
+                .is_some_and(|current| Version::parse(current) == Version::parse(&entry.version))
+        {
+            continue;
+        }
+        jobs.push(DownloadJob {
+            index,
+            urls: package_download_candidates(repo, arch, entry),
+            dest: cache_dir.join(entry.resolved_filename(arch)),
+        });
+    }
+
+    if jobs.is_empty() {
+        return Ok(mirrors);
+    }
+
+    let workers = (parallel_downloads.max(1) as usize).min(jobs.len());
+    if workers == 1 {
+        for job in jobs {
+            let mirror = download_first_available(&job.urls, &job.dest, 3)
+                .with_context(|| format!("failed to download '{}'", job.dest.display()))?;
+            mirrors[job.index] = Some(mirror);
+        }
+        return Ok(mirrors);
+    }
+
+    let results: Mutex<Vec<Option<Result<String, String>>>> =
+        Mutex::new((0..jobs.len()).map(|_| None).collect());
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(job) = jobs.get(index) else {
+                    break;
+                };
+                let result = download_first_available_quiet(&job.urls, &job.dest, 3)
+                    .map_err(|err| err.to_string());
+                if let Ok(mut slots) = results.lock() {
+                    slots[index] = Some(result);
+                }
+            });
+        }
+    });
+
+    let results = results
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner());
+    for (index, result) in results.into_iter().enumerate() {
+        match result {
+            Some(Ok(mirror)) => mirrors[jobs[index].index] = Some(mirror),
+            Some(Err(err)) => {
+                anyhow::bail!("failed to download '{}': {err}", jobs[index].dest.display())
+            }
+            None => anyhow::bail!("download worker did not report a result"),
+        }
+    }
+    Ok(mirrors)
+}
+
 fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) -> Result<()> {
     if args.as_deps && args.as_explicit {
         anyhow::bail!("xpm install: --as-deps and --as-explicit are mutually exclusive");
@@ -718,6 +803,14 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     let mut target_manifests: Vec<conflict::TargetManifest> = Vec::new();
     let mut target_pkgs: Vec<depcheck::InstallTarget> = Vec::new();
     let installed_versions = read_installed_versions(&local_db_dir)?;
+    let mirrors = prefetch_downloads(
+        &resolved,
+        &installed_versions,
+        args.needed,
+        &arch,
+        cache_dir,
+        config.options.parallel_downloads,
+    )?;
 
     // Phase 1a: local package files (already "downloaded")
     for spec in &local_files {
@@ -806,7 +899,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     }
 
     // Phase 1b: Download and validate the resolved plan (dependencies first)
-    for (repo, entry, explicit) in &resolved {
+    for (index, (repo, entry, explicit)) in resolved.iter().enumerate() {
         let pkg_name = &entry.name;
         let installed_version = installed_versions.get(pkg_name);
 
@@ -823,11 +916,11 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
         let filename = entry.resolved_filename(&arch);
         let dest = cache_dir.join(&filename);
-        let urls = package_download_candidates(repo, &arch, entry);
-        let mirror = download_first_available(&urls, &dest, 3).with_context(|| {
-            format!(
+        let mirror = mirrors[index].clone().ok_or_else(|| {
+            anyhow::anyhow!(
                 "failed to download '{}' from repo '{}'",
-                pkg_name, repo.name
+                pkg_name,
+                repo.name
             )
         })?;
 
