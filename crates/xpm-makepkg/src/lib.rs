@@ -186,14 +186,13 @@ pub fn build(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildArti
 
 /// Build in a clean chroot assembled with pacstrap.
 ///
-/// devtools is deliberately not required: pacstrap, arch-chroot and
-/// systemd-nspawn are part of arch-install-scripts/systemd, which are already
-/// present on X installs. The pristine root is created once; every build uses
-/// a disposable copy and a bind-mounted package directory.
+/// devtools is deliberately not required: pacstrap and arch-chroot are part of
+/// arch-install-scripts. The pristine root is created once; every build uses a
+/// disposable copy and runs makepkg as an unprivileged build user.
 fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildArtifacts> {
-    if !command_exists("pacstrap") || !command_exists("systemd-nspawn") {
+    if !command_exists("pacstrap") || !command_exists("arch-chroot") {
         return Err(BuildError::Command(
-            "clean builds require pacstrap (arch-install-scripts) and systemd-nspawn".into(),
+            "clean builds require pacstrap and arch-chroot (arch-install-scripts)".into(),
         ));
     }
 
@@ -260,6 +259,31 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         )));
     }
 
+    // pacman inside the fresh root needs a real package cache directory;
+    // without it its free-space check cannot resolve the cachedir mount point.
+    let cache_dir = work.join("var/cache/pacman/pkg");
+    let status = root_command("mkdir")
+        .args(["-p"])
+        .arg(&cache_dir)
+        .status()
+        .map_err(|err| BuildError::Command(format!("mkdir: {err}")))?;
+    if !status.success() {
+        return Err(BuildError::Command("could not create chroot pacman cache".into()));
+    }
+
+    // arch-chroot expects a mountpoint for pacman's free-space checks.
+    let status = root_command("mount")
+        .args(["--bind"])
+        .arg(&work)
+        .arg(&work)
+        .status()
+        .map_err(|err| BuildError::Command(format!("mount --bind: {err}")))?;
+    if !status.success() {
+        return Err(BuildError::Command(
+            "could not bind-mount the chroot root".into(),
+        ));
+    }
+
     let build_dir = work.join("build");
     let status = root_command("mkdir")
         .args(["-p"])
@@ -292,23 +316,21 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         .arg(&build_dir)
         .status();
 
-    std::fs::create_dir_all(&options.pkgdest).map_err(|source| BuildError::Io {
-        path: options.pkgdest.display().to_string(),
-        source,
-    })?;
-    if uid == 0 {
-        let _ = root_command("chown")
-            .args(["-R", &format!("{build_uid}:{build_uid}")])
-            .arg(&options.pkgdest)
-            .status();
+    let pkgdest_in_chroot = work.join("pkgdest");
+    let status = root_command("mkdir")
+        .args(["-p"])
+        .arg(&pkgdest_in_chroot)
+        .status()
+        .map_err(|err| BuildError::Command(format!("mkdir: {err}")))?;
+    if !status.success() {
+        return Err(BuildError::Command(
+            "could not create chroot package directory".into(),
+        ));
     }
-    let pkgdest = options
-        .pkgdest
-        .canonicalize()
-        .map_err(|source| BuildError::Io {
-            path: options.pkgdest.display().to_string(),
-            source,
-        })?;
+    let _ = root_command("chown")
+        .args(["-R", &format!("{build_uid}:{build_uid}")])
+        .arg(&pkgdest_in_chroot)
+        .status();
 
     let mut makepkg =
         String::from("makepkg --syncdeps --noconfirm --cleanbuild --force --noprogressbar");
@@ -320,18 +342,40 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         makepkg.push_str(&shell_quote(arg));
     }
     let command = format!("PKGDEST=/pkgdest {makepkg}");
-    let mut spawn = root_command("systemd-nspawn");
-    spawn
-        .args(["-D"])
-        .arg(&work)
-        .arg(format!("--bind={}:/pkgdest", pkgdest.display()))
-        .arg("--network-namespace-path=/proc/1/ns/net")
-        .args(["-u", "build", "--chdir=/build", "/bin/bash", "-lc"])
-        .arg(command);
     tracing::info!(chroot = %options.chroot_dir.display(), "building in clean chroot");
-    let status = spawn
+    let status = root_command("arch-chroot")
+        .arg(&work)
+        .args(["runuser", "-u", "build", "--", "bash", "-lc"])
+        .arg(format!("cd /build && {command}"))
         .status()
-        .map_err(|err| BuildError::Command(format!("systemd-nspawn: {err}")))?;
+        .map_err(|err| BuildError::Command(format!("arch-chroot: {err}")))?;
+
+    if status.success() {
+        std::fs::create_dir_all(&options.pkgdest).map_err(|source| BuildError::Io {
+            path: options.pkgdest.display().to_string(),
+            source,
+        })?;
+        let entries = std::fs::read_dir(&pkgdest_in_chroot).map_err(|source| BuildError::Io {
+            path: pkgdest_in_chroot.display().to_string(),
+            source,
+        })?;
+        for entry in entries.flatten() {
+            let source = entry.path();
+            let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".pkg.tar.zst") {
+                continue;
+            }
+            let dest = options.pkgdest.join(name);
+            let _ = std::fs::copy(&source, &dest);
+            let _ = root_command("chown")
+                .arg(format!("{uid}:{uid}"))
+                .arg(&dest)
+                .status();
+        }
+    }
+    let _ = root_command("umount").arg(&work).status();
     let cleanup = root_command("rm").args(["-rf"]).arg(&work).status();
     let _ = cleanup;
     if !status.success() {
@@ -341,7 +385,7 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         )));
     }
 
-    let packages = collect_packages(&pkgdest, None)?;
+    let packages = collect_packages(&options.pkgdest, None)?;
     if packages.is_empty() {
         return Err(BuildError::NoArtifacts(
             options.pkgdest.display().to_string(),
