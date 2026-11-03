@@ -70,6 +70,8 @@ pub struct BuildOptions {
     pub chroot: bool,
     /// Directory containing the pristine `root` and disposable build copies.
     pub chroot_dir: PathBuf,
+    /// Local packages to install into the clean chroot before building.
+    pub preinstall: Vec<PathBuf>,
     pub extra_args: Vec<String>,
 }
 
@@ -83,6 +85,7 @@ impl BuildOptions {
             clean: false,
             chroot: false,
             chroot_dir: PathBuf::from("/var/lib/archbuild/xpm-aur"),
+            preinstall: Vec::new(),
             extra_args: Vec::new(),
         }
     }
@@ -268,7 +271,9 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         .status()
         .map_err(|err| BuildError::Command(format!("mkdir: {err}")))?;
     if !status.success() {
-        return Err(BuildError::Command("could not create chroot pacman cache".into()));
+        return Err(BuildError::Command(
+            "could not create chroot pacman cache".into(),
+        ));
     }
 
     // arch-chroot expects a mountpoint for pacman's free-space checks.
@@ -331,6 +336,43 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         .args(["-R", &format!("{build_uid}:{build_uid}")])
         .arg(&pkgdest_in_chroot)
         .status();
+
+    if !options.preinstall.is_empty() {
+        let preinstall_dir = work.join("preinstall");
+        let status = root_command("mkdir")
+            .args(["-p"])
+            .arg(&preinstall_dir)
+            .status()
+            .map_err(|err| BuildError::Command(format!("mkdir: {err}")))?;
+        if !status.success() {
+            return Err(BuildError::Command(
+                "could not create chroot preinstall directory".into(),
+            ));
+        }
+        for package in &options.preinstall {
+            let status = root_command("cp")
+                .arg(package)
+                .arg(&preinstall_dir)
+                .status()
+                .map_err(|err| BuildError::Command(format!("copy preinstall: {err}")))?;
+            if !status.success() {
+                return Err(BuildError::Command(format!(
+                    "could not copy {} into the chroot",
+                    package.display()
+                )));
+            }
+        }
+        let status = root_command("arch-chroot")
+            .arg(&work)
+            .args(["pacman", "-U", "--noconfirm", "/preinstall/*.pkg.tar.zst"])
+            .status()
+            .map_err(|err| BuildError::Command(format!("preinstall pacman: {err}")))?;
+        if !status.success() {
+            return Err(BuildError::Command(
+                "could not preinstall AUR dependencies into the chroot".into(),
+            ));
+        }
+    }
 
     let mut makepkg =
         String::from("makepkg --syncdeps --noconfirm --cleanbuild --force --noprogressbar");

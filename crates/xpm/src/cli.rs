@@ -234,6 +234,10 @@ pub struct BuildArgs {
     #[arg(long)]
     pub as_explicit: bool,
 
+    /// Install a local package into the clean chroot before building.
+    #[arg(long, value_name = "PKG")]
+    pub preinstall: Vec<PathBuf>,
+
     /// Write the build result as JSON to this path.
     #[arg(long, value_name = "PATH")]
     pub json: Option<PathBuf>,
