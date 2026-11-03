@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::config::{Repository, SigLevel};
 use crate::progress::{format_mib, percentage};
 use crate::repo_db::RepoEntry;
-use crate::signing::{load_keyring, verify_file, VerifyOutcome};
+use crate::signing::{verify_file, VerifyOutcome};
 use crate::{XpmError, XpmResult};
 use sha2::{Digest, Sha256};
 
@@ -149,62 +149,18 @@ pub fn verify_remote_signature(
         return Ok(());
     }
 
-    let certs = match load_keyring(keyring_path) {
-        Ok(certs) => certs,
+    let outcome = match verify_file(artifact_path, &sig_dest, keyring_path) {
+        Ok(outcome) => outcome,
         Err(err) => {
             if sig_level == SigLevel::Required {
-                return Err(XpmError::SignatureError(format!(
-                    "failed to load keyring {}: {err}",
-                    keyring_path.display()
-                )));
+                return Err(err);
             }
-
             tracing::warn!(
                 artifact = %artifact_path.display(),
-                keyring = %keyring_path.display(),
                 error = %err,
-                "could not load keyring in optional mode; continuing"
+                "signature check failed in optional mode; continuing"
             );
             return Ok(());
-        }
-    };
-
-    if certs.is_empty() {
-        if sig_level == SigLevel::Optional {
-            tracing::warn!(
-                artifact = %artifact_path.display(),
-                keyring = %keyring_path.display(),
-                "keyring has no certificates in optional mode; continuing"
-            );
-            return Ok(());
-        }
-
-        return Err(XpmError::SignatureError(format!(
-            "no certificates found in keyring {}",
-            keyring_path.display()
-        )));
-    }
-
-    let outcome = match verify_file(artifact_path, &sig_dest, &certs) {
-        Ok(VerifyOutcome::Good { key_id }) => VerifyOutcome::Good { key_id },
-        Ok(VerifyOutcome::UnknownKey) | Ok(VerifyOutcome::Bad { .. }) | Err(_) => {
-            // Sequoia's policy is stricter than gpgme for some valid packager
-            // keys. Fall back to GnuPG against the same keyring before
-            // declaring the signature invalid or unknown.
-            match crate::signing::verify_with_gpg(artifact_path, &sig_dest, keyring_path) {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    if sig_level == SigLevel::Required {
-                        return Err(err);
-                    }
-                    tracing::warn!(
-                        artifact = %artifact_path.display(),
-                        error = %err,
-                        "signature check failed in optional mode; continuing"
-                    );
-                    return Ok(());
-                }
-            }
         }
     };
 
@@ -588,9 +544,6 @@ mod tests {
 
     #[test]
     fn local_file_repo_sync_required_sig_fails_on_invalid_signature() {
-        use sequoia_openpgp::cert::CertBuilder;
-        use sequoia_openpgp::serialize::Serialize;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let mirror = temp.path().join("mirror");
         let sync = temp.path().join("sync");
@@ -599,14 +552,8 @@ mod tests {
         fs::write(mirror.join("core.db"), b"db-data").expect("write db");
         fs::write(mirror.join("core.db.sig"), b"not-a-valid-signature").expect("write bad sig");
 
-        let (cert, _) = CertBuilder::general_purpose(None, Some("Test <test@example.com>"))
-            .generate()
-            .expect("generate cert");
-
         let keyring = temp.path().join("trustedkeys.gpg");
-        let mut keyring_file = fs::File::create(&keyring).expect("create keyring");
-        cert.serialize(&mut keyring_file)
-            .expect("write keyring cert");
+        fs::write(&keyring, b"").expect("create keyring");
 
         let repo = Repository {
             name: "core".to_string(),
@@ -624,9 +571,6 @@ mod tests {
 
     #[test]
     fn local_file_package_verify_required_sig_fails_on_invalid_signature() {
-        use sequoia_openpgp::cert::CertBuilder;
-        use sequoia_openpgp::serialize::Serialize;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let mirror = temp.path().join("mirror");
         let download_dir = temp.path().join("download");
@@ -640,14 +584,8 @@ mod tests {
         let sig_path = mirror.join(format!("{package_name}.sig"));
         fs::write(&sig_path, b"not-a-valid-signature").expect("write bad sig");
 
-        let (cert, _) = CertBuilder::general_purpose(None, Some("Test <test@example.com>"))
-            .generate()
-            .expect("generate cert");
-
         let keyring = temp.path().join("trustedkeys.gpg");
-        let mut keyring_file = fs::File::create(&keyring).expect("create keyring");
-        cert.serialize(&mut keyring_file)
-            .expect("write keyring cert");
+        fs::write(&keyring, b"").expect("create keyring");
 
         let sig_url = format!("file://{}", sig_path.display());
         let err = verify_remote_signature(&package_dest, &sig_url, SigLevel::Required, &keyring, 2)

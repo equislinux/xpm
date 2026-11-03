@@ -39,7 +39,6 @@ xz2 = "0.1"
 # Cryptography
 sha2 = "0.10"
 md-5 = "0.10"
-sequoia-openpgp = { version = "1", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
 
 # Logging
 tracing = "0.1"

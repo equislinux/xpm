@@ -1,14 +1,14 @@
 [package]
 name = "xpm"
 version = "0.1.0"
-release = 13
+release = 14
 description = "Modern Rust-based package manager for X Distribution"
 url = "https://github.com/equislinux/xpm"
 license = ["GPL-3.0-or-later"]
 arch = ["x86_64"]
 
 [dependencies]
-depends = ["glibc", "arch-install-scripts"]
+depends = ["glibc", "arch-install-scripts", "gnupg"]
 makedepends = ["cargo", "gcc", "rust"]
 
 [source]
