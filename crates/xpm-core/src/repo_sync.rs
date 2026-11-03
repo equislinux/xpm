@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{Repository, SigLevel};
-use crate::progress::{format_mib, format_progress, percentage};
+use crate::progress::{format_mib, percentage};
 use crate::repo_db::RepoEntry;
 use crate::signing::{load_keyring, verify_file, VerifyOutcome};
 use crate::{XpmError, XpmResult};
@@ -400,6 +400,7 @@ fn download_once(url: &str, dest: &Path) -> XpmResult<()> {
 struct DownloadProgress {
     enabled: bool,
     label: String,
+    style: crate::progress::ProgressStyle,
     widest: usize,
     active: bool,
 }
@@ -414,6 +415,7 @@ impl DownloadProgress {
         Self {
             enabled: io::stderr().is_terminal(),
             label,
+            style: crate::progress::ProgressStyle::for_download(),
             widest: 0,
             active: false,
         }
@@ -424,7 +426,7 @@ impl DownloadProgress {
             return;
         }
 
-        let line = format_progress(&self.label, downloaded, total);
+        let line = self.style.render(&self.label, downloaded, total);
         self.widest = self.widest.max(line.chars().count());
         let mut stderr = io::stderr();
         let _ = write!(stderr, "\r{line}");
@@ -437,7 +439,7 @@ impl DownloadProgress {
             return;
         }
 
-        let line = format_progress(&self.label, downloaded, total);
+        let line = self.style.render(&self.label, downloaded, total);
         let padding = self.widest.saturating_sub(line.chars().count());
         let mut stderr = io::stderr();
         let _ = write!(stderr, "\r{line}{:padding$}\n", "", padding = padding);

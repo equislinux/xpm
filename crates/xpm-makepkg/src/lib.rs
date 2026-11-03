@@ -364,7 +364,11 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         }
         let status = root_command("arch-chroot")
             .arg(&work)
-            .args(["bash", "-lc", "pacman -U --noconfirm /preinstall/*.pkg.tar.zst"])
+            .args([
+                "bash",
+                "-lc",
+                "pacman -U --noconfirm /preinstall/*.pkg.tar.zst",
+            ])
             .status()
             .map_err(|err| BuildError::Command(format!("preinstall pacman: {err}")))?;
         if !status.success() {

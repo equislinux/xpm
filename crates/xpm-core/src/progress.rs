@@ -1,8 +1,5 @@
 //! Shared terminal progress rendering helpers.
 
-/// Width of the ASCII progress bar, in characters.
-pub(crate) const BAR_WIDTH: usize = 20;
-
 const MIB: f64 = 1024.0 * 1024.0;
 
 /// Percentage of `downloaded` relative to `total`, clamped to 0..=100.
@@ -27,16 +24,83 @@ pub(crate) fn format_mib(bytes: u64) -> String {
     format!("{} MiB", mib_value(bytes))
 }
 
-/// Render one progress line, e.g.
-/// `pkg.tar.zst [xxxxxxxxxx----------]  52%  12.3/23.5 MiB`.
-pub(crate) fn format_progress(label: &str, downloaded: u64, total: u64) -> String {
+/// Fixed-width layout for progress lines.
+///
+/// The package/file label is padded (or truncated) to `label_width` so every
+/// bar in a transaction starts at the same column, like pacman's download
+/// display.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgressStyle {
+    pub label_width: usize,
+    pub bar_width: usize,
+}
+
+impl ProgressStyle {
+    /// Style for independent downloads; a wide fixed label column keeps
+    /// package filenames readable while aligning every bar.
+    pub fn for_download() -> Self {
+        let terminal = terminal_width().unwrap_or(80);
+        let label_width = (terminal / 2).clamp(24, 40);
+        let bar_width = terminal.saturating_sub(label_width + 34).clamp(10, 40);
+        Self {
+            label_width,
+            bar_width,
+        }
+    }
+
+    pub fn render(&self, label: &str, downloaded: u64, total: u64) -> String {
+        format_progress_with(self, label, downloaded, total)
+    }
+}
+
+/// Render one progress line with an aligned label column.
+pub fn format_progress_with(
+    style: &ProgressStyle,
+    label: &str,
+    downloaded: u64,
+    total: u64,
+) -> String {
     let percent = percentage(downloaded, total);
+    let label = align_label(label, style.label_width);
     format!(
         "{label} [{}] {percent:>3}%  {}/{} MiB",
-        bar(percent, BAR_WIDTH),
+        bar(percent, style.bar_width),
         mib_value(downloaded),
         mib_value(total),
     )
+}
+
+fn align_label(label: &str, width: usize) -> String {
+    let chars: Vec<char> = label.chars().collect();
+    if chars.len() > width {
+        if width <= 2 {
+            return ".".repeat(width);
+        }
+        let mut truncated: String = chars.into_iter().take(width - 2).collect();
+        truncated.push_str("..");
+        truncated
+    } else {
+        format!("{label:<width$}")
+    }
+}
+
+fn terminal_width() -> Option<usize> {
+    if let Ok(value) = std::env::var("COLUMNS") {
+        if let Ok(width) = value.parse::<usize>() {
+            if width > 0 {
+                return Some(width);
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) };
+        if result == 0 && size.ws_col > 0 {
+            return Some(size.ws_col as usize);
+        }
+    }
+    None
 }
 
 fn mib_value(bytes: u64) -> String {
@@ -79,7 +143,11 @@ mod tests {
 
     #[test]
     fn progress_line_matches_pacman_style() {
-        let line = format_progress("pkg.tar.zst", 13 * 1024 * 1024, 26 * 1024 * 1024);
+        let line = ProgressStyle {
+            label_width: 11,
+            bar_width: 20,
+        }
+        .render("pkg.tar.zst", 13 * 1024 * 1024, 26 * 1024 * 1024);
         assert_eq!(
             line,
             "pkg.tar.zst [xxxxxxxxxx----------]  50%  13.0/26.0 MiB"
@@ -88,7 +156,41 @@ mod tests {
 
     #[test]
     fn progress_line_handles_zero_total() {
-        let line = format_progress("empty", 0, 0);
-        assert_eq!(line, "empty [--------------------]   0%  0.0/0.0 MiB");
+        let line = ProgressStyle {
+            label_width: 11,
+            bar_width: 20,
+        }
+        .render("empty", 0, 0);
+        assert_eq!(line, "empty       [--------------------]   0%  0.0/0.0 MiB");
+    }
+
+    #[test]
+    fn aligned_labels_put_bars_in_the_same_column() {
+        let style = ProgressStyle {
+            label_width: 16,
+            bar_width: 12,
+        };
+        let short = style.render("vim", 1, 2);
+        let long = style.render("linux-firmware", 1, 2);
+        assert_eq!(short.find('['), long.find('['));
+        assert_eq!(short.find('['), Some(17));
+    }
+
+    #[test]
+    fn long_labels_are_truncated_to_the_column() {
+        let style = ProgressStyle {
+            label_width: 10,
+            bar_width: 10,
+        };
+        let line = style.render("a-very-long-package-name", 1, 2);
+        assert!(line.starts_with("a-very-l.. ["));
+        assert_eq!(line.find('['), Some(11));
+    }
+
+    #[test]
+    fn style_respects_terminal_width_floor() {
+        let style = ProgressStyle::for_download();
+        assert!(style.label_width >= 12);
+        assert!(style.bar_width >= 10);
     }
 }
