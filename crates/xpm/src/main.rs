@@ -501,6 +501,11 @@ fn cmd_build(config: &XpmConfig, args: &cli::BuildArgs, no_confirm: bool) -> Res
         builddir: args.builddir.clone(),
         run_checks: !args.nocheck,
         clean: args.clean,
+        chroot: args.chroot,
+        chroot_dir: args
+            .chroot_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/var/lib/archbuild/xpm-aur")),
         extra_args: args.makepkg_args.clone(),
     };
 

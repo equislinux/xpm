@@ -214,6 +214,14 @@ pub struct BuildArgs {
     #[arg(long)]
     pub clean: bool,
 
+    /// Build inside a clean devtools chroot (requires devtools and sudo).
+    #[arg(long)]
+    pub chroot: bool,
+
+    /// Chroot root/copy directory (default: /var/lib/archbuild/xpm-aur).
+    #[arg(long, value_name = "PATH")]
+    pub chroot_dir: Option<PathBuf>,
+
     /// Install the built packages with xpm after a successful build.
     #[arg(long)]
     pub install: bool,
