@@ -20,6 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
 use xpm_core::alpm_hooks::{self, HookOperation, HookTransaction, HookWhen};
+use xpm_core::cache::clean_cache;
 use xpm_core::check;
 use xpm_core::config::Repository;
 use xpm_core::conflict;
@@ -33,15 +34,16 @@ use xpm_core::local_db;
 use xpm_core::orphans::{find_orphans, InstalledPackage};
 use xpm_core::package::{read_metadata, PackageMeta};
 use xpm_core::query;
+use xpm_core::replace::matches_ignore_group;
 use xpm_core::repo::RepoManager;
-use xpm_core::repo_db::{merge_files_db, parse_sync_db, RepoEntry};
+use xpm_core::repo_db::{merge_files_db, parse_sync_db_cached, RepoEntry};
 use xpm_core::repo_sync::{
     download_first_available, download_first_available_quiet, package_download_candidates,
     sync_repo_databases, verify_remote_signature, verify_sha256,
 };
 use xpm_core::resolver::{
-    resolve_closure, resolve_closure_with_installed, DepConstraint, PackageCandidate, Requirement,
-    Version,
+    assume_installed_candidates, resolve_closure, resolve_closure_with_installed, DepConstraint,
+    PackageCandidate, Requirement, Version,
 };
 use xpm_core::rollback::{last_rollback_candidate, RollbackOp, RollbackPlan};
 use xpm_core::txhooks::run_transaction_hooks;
@@ -80,7 +82,26 @@ fn main() -> Result<()> {
     tracing::debug!("xpm v{}", env!("CARGO_PKG_VERSION"));
 
     // ── Load configuration ──────────────────────────────────────────────
-    let config_path = cli.config.clone().unwrap_or_else(XpmConfig::default_path);
+    // `--sysroot` behaves like pacman's: configuration is discovered inside
+    // the guest root. An explicit `--config` always wins and is loaded as-is.
+    let sysroot_config = cli.sysroot.as_ref().map(|root| {
+        let xpm_conf = root.join("etc/xpm.conf");
+        if xpm_conf.exists() {
+            xpm_conf
+        } else {
+            let pacman_conf = root.join("etc/pacman.conf");
+            if pacman_conf.exists() {
+                pacman_conf
+            } else {
+                xpm_conf
+            }
+        }
+    });
+    let config_path = cli
+        .config
+        .clone()
+        .or(sysroot_config)
+        .unwrap_or_else(XpmConfig::default_path);
     let pacman_style = config_path
         .file_name()
         .map(|name| name == "pacman.conf")
@@ -100,9 +121,16 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to load config from {}", path.display()))?
         }
     } else if config_path.exists() {
-        XpmConfig::load(&config_path)
-            .with_context(|| format!("failed to load config from {}", config_path.display()))?
-    } else if Path::new("/etc/pacman.conf").exists() {
+        if pacman_style {
+            XpmConfig::from_pacman(
+                xpm_core::pacman_conf::parse_pacman_conf(&config_path)
+                    .with_context(|| format!("failed to load {}", config_path.display()))?,
+            )
+        } else {
+            XpmConfig::load(&config_path)
+                .with_context(|| format!("failed to load config from {}", config_path.display()))?
+        }
+    } else if cli.sysroot.is_none() && Path::new("/etc/pacman.conf").exists() {
         XpmConfig::from_pacman(
             xpm_core::pacman_conf::parse_pacman_conf(Path::new("/etc/pacman.conf"))
                 .context("failed to load /etc/pacman.conf")?,
@@ -112,9 +140,10 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to load config from {}", config_path.display()))?
     };
 
-    // Apply CLI overrides
+    // Apply CLI overrides. An explicit --root wins over --sysroot.
+    let operation_root = cli.root.as_deref().or(cli.sysroot.as_deref());
     config.apply_overrides(
-        cli.root.as_deref(),
+        operation_root,
         cli.dbpath.as_deref(),
         cli.cachedir.as_deref(),
     );
@@ -137,23 +166,29 @@ fn main() -> Result<()> {
         config.options.scriptlet_mode = xpm_core::hooks::ScriptletMode::Skip;
     }
 
-    if let Some(root) = &cli.root {
+    if let Some(root) = operation_root {
         if root != Path::new("/") {
-            if cli.dbpath.is_none() && config.options.db_path == Path::new("/var/lib/xpm/") {
+            // `--sysroot` always relocates the standard paths into the guest
+            // root; `--root` keeps custom config paths unless they are the
+            // built-in defaults (preserving the pre-existing behavior).
+            let sysroot_active = cli.root.is_none() && cli.sysroot.is_some();
+            if cli.dbpath.is_none()
+                && (sysroot_active || config.options.db_path == Path::new("/var/lib/xpm/"))
+            {
                 config.options.db_path = root.join("var/lib/xpm");
             }
             if cli.cachedir.is_none()
-                && config.options.cache_dir == Path::new("/var/cache/xpm/pkg/")
+                && (sysroot_active || config.options.cache_dir == Path::new("/var/cache/xpm/pkg/"))
             {
                 config.options.cache_dir = root.join("var/cache/xpm/pkg");
             }
-            if config.options.gpg_dir == Path::new("/etc/pacman.d/gnupg/") {
+            if sysroot_active || config.options.gpg_dir == Path::new("/etc/pacman.d/gnupg/") {
                 config.options.gpg_dir = root.join("etc/pacman.d/gnupg");
             }
-            if config.options.log_file == Path::new("/var/log/xpm.log") {
+            if sysroot_active || config.options.log_file == Path::new("/var/log/xpm.log") {
                 config.options.log_file = root.join("var/log/xpm.log");
             }
-            if config.options.pacman_db.is_none() {
+            if sysroot_active || config.options.pacman_db.is_none() {
                 config.options.pacman_db = Some(root.join("var/lib/pacman"));
             }
         }
@@ -187,6 +222,9 @@ fn main() -> Result<()> {
         Command::Mark(args) => cmd_mark(&config, args),
         Command::Deptest(args) => cmd_deptest(&config, args),
         Command::Groups(args) => cmd_groups(&config, args),
+        Command::List(args) => cmd_list(&config, args),
+        Command::Clean(args) => cmd_clean(&config, args, cli.no_confirm),
+        Command::FileDb(args) => cmd_file_db(&config, args),
         Command::Usage(args) => cmd_help(args),
     }
 }
@@ -250,7 +288,7 @@ fn cmd_sync(config: &XpmConfig, args: &cli::SyncArgs) -> Result<()> {
 
         let db_path = sync_dir.join(format!("{}.db", repo.name));
         if db_path.exists() {
-            match parse_sync_db(&db_path, &repo.name) {
+            match parse_sync_db_cached(&db_path, &repo.name) {
                 Ok(mut db) => {
                     let files_path = sync_dir.join(format!("{}.files", repo.name));
                     if files_path.exists() {
@@ -312,7 +350,7 @@ fn read_all_sync_entries(
         if !db_path.exists() {
             continue;
         }
-        let db = parse_sync_db(&db_path, &repo.name)
+        let db = parse_sync_db_cached(&db_path, &repo.name)
             .with_context(|| format!("failed to parse sync db {}", display_rel_or_abs(&db_path)))?;
         for entry in db.entries {
             entries.push((repo.clone(), entry));
@@ -540,6 +578,8 @@ fn cmd_build(config: &XpmConfig, args: &cli::BuildArgs, no_confirm: bool) -> Res
             needed: false,
             print: false,
             overwrite: Vec::new(),
+            ignore_groups: Vec::new(),
+            assume_installed: Vec::new(),
         };
         cmd_install(config, &install_args, no_confirm)?;
     }
@@ -575,9 +615,16 @@ fn prefetch_downloads(
         {
             continue;
         }
+        let mut urls = package_download_candidates(repo, arch, entry);
+        let mirror_count = urls.len();
+        if mirror_count > 0 {
+            // Spread concurrent workers across mirrors instead of making every
+            // package hammer the first server.
+            urls.rotate_left(index % mirror_count);
+        }
         jobs.push(DownloadJob {
             index,
-            urls: package_download_candidates(repo, arch, entry),
+            urls,
             dest: cache_dir.join(entry.resolved_filename(arch)),
         });
     }
@@ -653,6 +700,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     let sync_dir = config.options.db_path.join("sync");
     let cache_dir = &config.options.cache_dir;
     let local_db_dir = config.options.db_path.join("local");
+    let assumed = assume_installed_candidates(&args.assume_installed)
+        .context("invalid --assume-installed")?;
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("failed to create cache dir {}", cache_dir.display()))?;
 
@@ -666,7 +715,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             if !db_path.exists() {
                 continue;
             }
-            let db = parse_sync_db(&db_path, &repo.name).with_context(|| {
+            let db = parse_sync_db_cached(&db_path, &repo.name).with_context(|| {
                 format!("failed to parse sync db {}", display_rel_or_abs(&db_path))
             })?;
             for entry in db.entries {
@@ -721,7 +770,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             .iter()
             .map(|spec| Requirement::parse(spec))
             .collect::<XpmResult<Vec<_>>>()?;
-        let installed_candidates = load_installed_candidates(&local_db_dir)?;
+        let mut installed_candidates = load_installed_candidates(&local_db_dir)?;
+        installed_candidates.extend(assumed.iter().cloned());
         let plan = resolve_closure_with_installed(candidates, installed_candidates, &requirements)
             .with_context(|| {
                 format!(
@@ -1023,7 +1073,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         no_confirm,
     )?;
 
-    let installed_pkgs = load_installed_pkgs(&local_db_dir)?;
+    let mut installed_pkgs = load_installed_pkgs(&local_db_dir)?;
+    installed_pkgs.extend(assume_installed_pkgs(&assumed));
     depcheck::check_install(&installed_pkgs, &target_pkgs)
         .context("installation dependency check failed")?;
     check_transaction_file_conflicts(config, &local_db_dir, &target_manifests, &[], &overwrite)?;
@@ -1174,6 +1225,8 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         .architecture
         .clone()
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
+    let assumed = assume_installed_candidates(&args.assume_installed)
+        .context("invalid --assume-installed")?;
 
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("failed to create cache dir {}", cache_dir.display()))?;
@@ -1224,23 +1277,29 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             })
         })
         .collect();
-    let installed_replacements: Vec<xpm_core::replace::InstalledReplacement> = installed
-        .iter()
-        .map(|(name, version)| xpm_core::replace::InstalledReplacement {
+    let mut installed_groups: HashMap<String, Vec<String>> = HashMap::new();
+    let mut installed_replacements: Vec<xpm_core::replace::InstalledReplacement> =
+        Vec::with_capacity(installed.len());
+    for (name, version) in &installed {
+        let groups = local_db::read_groups(&local_db_dir, name)?;
+        installed_groups.insert(name.clone(), groups.clone());
+        installed_replacements.push(xpm_core::replace::InstalledReplacement {
             name: name.clone(),
             version: Version::parse(version),
             reason: InstallReason::read_optional(&local_db_dir, name)
                 .unwrap_or(InstallReason::Explicit),
-            groups: Vec::new(),
-        })
-        .collect();
+            groups,
+        });
+    }
     let mut ignore_patterns = args.ignore.clone();
     ignore_patterns.extend(config.options.ignore_pkg.iter().cloned());
+    let mut ignore_groups = args.ignore_groups.clone();
+    ignore_groups.extend(config.options.ignore_group.iter().cloned());
     let found_replacements = xpm_core::replace::find_replacements(
         &installed_replacements,
         &replacement_candidates,
         &ignore_patterns,
-        &config.options.ignore_group,
+        &ignore_groups,
     );
 
     let mut replacement_new: HashMap<String, xpm_core::replace::Replacement> = HashMap::new();
@@ -1291,6 +1350,16 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             continue;
         };
 
+        let local_groups = installed_groups
+            .get(pkg_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if matches_ignore_group(local_groups, &ignore_groups)
+            || matches_ignore_group(&entry.groups, &ignore_groups)
+        {
+            continue;
+        }
+
         let ordering = Version::cmp_versions(&entry.version, local_version);
         if ordering.is_gt() || (args.force && ordering.is_eq()) {
             planned.push((repo.clone(), entry.clone(), local_version.clone()));
@@ -1320,12 +1389,26 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             version: None,
         })
         .collect();
-    let closure = resolve_closure(candidates, &requirements).with_context(|| {
-        format!(
-            "failed to resolve the upgrade closure for: {}",
-            planned_names.iter().cloned().collect::<Vec<_>>().join(", ")
-        )
-    })?;
+    let closure: Vec<(PackageCandidate, bool)> = if assumed.is_empty() {
+        resolve_closure(candidates, &requirements).with_context(|| {
+            format!(
+                "failed to resolve the upgrade closure for: {}",
+                planned_names.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })?
+    } else {
+        resolve_closure_with_installed(candidates, assumed.clone(), &requirements)
+            .with_context(|| {
+                format!(
+                    "failed to resolve the upgrade closure for: {}",
+                    planned_names.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })?
+            .into_iter()
+            .filter(|(_, _, installed)| !installed)
+            .map(|(candidate, explicit, _)| (candidate, explicit))
+            .collect()
+    };
 
     let mut plan: Vec<UpgradePlanItem> = Vec::new();
     let mut planned_replacements: HashSet<String> = HashSet::new();
@@ -1558,7 +1641,13 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         });
     }
 
-    let installed_pkgs = load_installed_pkgs(&local_db_dir)?;
+    if args.download_only {
+        println!(":: Download complete.");
+        return Ok(());
+    }
+
+    let mut installed_pkgs = load_installed_pkgs(&local_db_dir)?;
+    installed_pkgs.extend(assume_installed_pkgs(&assumed));
     let added_pkgs: Vec<depcheck::InstalledPkg> = target_pkgs
         .iter()
         .map(|target| depcheck::InstalledPkg {
@@ -1636,6 +1725,19 @@ fn load_installed_pkgs(local_db_dir: &Path) -> Result<Vec<depcheck::InstalledPkg
     Ok(packages)
 }
 
+fn assume_installed_pkgs(candidates: &[PackageCandidate]) -> Vec<depcheck::InstalledPkg> {
+    candidates
+        .iter()
+        .map(|candidate| depcheck::InstalledPkg {
+            name: candidate.name.clone(),
+            version: candidate.version.clone(),
+            depends: Vec::new(),
+            provides: Vec::new(),
+            reason: InstallReason::Explicit,
+        })
+        .collect()
+}
+
 fn load_installed_candidates(local_db_dir: &Path) -> Result<Vec<PackageCandidate>> {
     let installed = read_installed_versions(local_db_dir)?;
     let mut candidates = Vec::with_capacity(installed.len());
@@ -1705,7 +1807,7 @@ fn read_latest_remote_entries(
             continue;
         }
 
-        let db = parse_sync_db(&db_path, &repo.name)
+        let db = parse_sync_db_cached(&db_path, &repo.name)
             .with_context(|| format!("failed to parse sync db {}", db_path.display()))?;
 
         // Preserve repository priority order: first repo that contains a package wins.
@@ -2208,6 +2310,73 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
 
 fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
     let local_db_dir = config.options.db_path.join("local");
+
+    if let Some(path) = &args.file {
+        if args.filter.is_some() {
+            anyhow::bail!("xpm query: --file takes one package file and no name filter");
+        }
+        if args.changelog
+            || args.native
+            || args.owner.is_some()
+            || args.explicit
+            || args.deps
+            || args.foreign
+            || args.unrequired
+            || args.orphans
+            || args.upgrades
+        {
+            anyhow::bail!("xpm query: --file cannot be combined with database filters");
+        }
+
+        let metadata = read_metadata(path)
+            .with_context(|| format!("failed to read package metadata from {}", path.display()))?;
+        let name = &metadata.meta.name;
+        let version = metadata.meta.full_version();
+        if args.quiet {
+            println!("{name}");
+        } else {
+            match args.format.as_str() {
+                "tsv" => println!("{name}\t{version}"),
+                _ => println!("{name} {version}"),
+            }
+        }
+        return Ok(());
+    }
+
+    // `-Qc` reads the pacman-style changelog stored in the local database.
+    // xpm installs do not extract a package's optional changelog yet, so this
+    // currently covers entries imported from pacman (or populated externally).
+    if args.changelog {
+        let Some(package) = args.filter.as_deref() else {
+            anyhow::bail!("xpm query: --changelog requires a package name");
+        };
+        if args.native
+            || args.owner.is_some()
+            || args.explicit
+            || args.deps
+            || args.foreign
+            || args.unrequired
+            || args.orphans
+            || args.upgrades
+            || args.search
+        {
+            anyhow::bail!("xpm query: --changelog cannot be combined with filters");
+        }
+
+        let Some(changelog) = local_db::read_changelog(&local_db_dir, package)? else {
+            eprintln!("error: no changelog available for '{package}'.");
+            exit_with(1);
+        };
+        if args.quiet {
+            return Ok(());
+        }
+        print!("{changelog}");
+        if !changelog.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+
     let local = query::load_local_packages(&local_db_dir)?;
 
     if let Some(owner_path) = args.owner.as_deref() {
@@ -2255,6 +2424,12 @@ fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
             .map(|(name, _)| name)
             .collect();
         packages.retain(|(name, _)| foreign.contains(name));
+    }
+
+    if args.native {
+        let sync_dir = config.options.db_path.join("sync");
+        let sync_names = read_sync_package_names(config, &sync_dir)?;
+        packages.retain(|(name, _)| sync_names.contains(name));
     }
 
     if args.unrequired {
@@ -2330,7 +2505,7 @@ fn read_sync_package_names(config: &XpmConfig, sync_dir: &Path) -> Result<HashSe
         if !db_path.exists() {
             continue;
         }
-        let db = parse_sync_db(&db_path, &repo.name)
+        let db = parse_sync_db_cached(&db_path, &repo.name)
             .with_context(|| format!("failed to parse sync db {}", db_path.display()))?;
         names.extend(db.entries.into_iter().map(|entry| entry.name));
     }
@@ -2477,7 +2652,7 @@ fn cmd_search(config: &XpmConfig, args: &cli::SearchArgs) -> Result<()> {
             if !db_path.exists() {
                 continue;
             }
-            let db = parse_sync_db(&db_path, &repo.name)
+            let db = parse_sync_db_cached(&db_path, &repo.name)
                 .with_context(|| format!("failed to parse sync db {}", db_path.display()))?;
             for entry in db.entries {
                 if matches_query(&entry, &args.query) {
@@ -2851,7 +3026,7 @@ fn cmd_groups(config: &XpmConfig, args: &cli::GroupsArgs) -> Result<()> {
             if !db_path.exists() {
                 continue;
             }
-            let db = parse_sync_db(&db_path, &repo.name).with_context(|| {
+            let db = parse_sync_db_cached(&db_path, &repo.name).with_context(|| {
                 format!("failed to parse sync db {}", display_rel_or_abs(&db_path))
             })?;
             for entry in db.entries {
@@ -2863,6 +3038,13 @@ fn cmd_groups(config: &XpmConfig, args: &cli::GroupsArgs) -> Result<()> {
                 });
             }
         }
+    }
+
+    if args.names && args.group.is_none() {
+        for group in index.group_names() {
+            println!("{group}");
+        }
+        return Ok(());
     }
 
     let pairs = if let Some(group) = &args.group {
@@ -2884,6 +3066,196 @@ fn cmd_groups(config: &XpmConfig, args: &cli::GroupsArgs) -> Result<()> {
         } else {
             println!("{group} {package}");
         }
+    }
+    Ok(())
+}
+
+fn sync_repositories<'a>(
+    config: &'a XpmConfig,
+    requested: Option<&str>,
+) -> Result<Vec<&'a Repository>> {
+    if let Some(name) = requested {
+        let selected: Vec<&Repository> = config
+            .repositories
+            .iter()
+            .filter(|repo| repo.name == name)
+            .collect();
+        if selected.is_empty() {
+            anyhow::bail!("repository '{name}' was not found");
+        }
+        Ok(selected)
+    } else {
+        Ok(config.repositories.iter().collect())
+    }
+}
+
+fn cmd_list(config: &XpmConfig, args: &cli::ListArgs) -> Result<()> {
+    let sync_dir = config.options.db_path.join("sync");
+    let local_db_dir = config.options.db_path.join("local");
+    let installed = read_installed_versions(&local_db_dir)?;
+
+    for repo in sync_repositories(config, args.repo.as_deref())? {
+        let db_path = sync_dir.join(format!("{}.db", repo.name));
+        if !db_path.exists() {
+            if args.repo.is_some() {
+                anyhow::bail!("database for repository '{}' was not found", repo.name);
+            }
+            continue;
+        }
+        let db = parse_sync_db_cached(&db_path, &repo.name)
+            .with_context(|| format!("failed to parse sync db {}", display_rel_or_abs(&db_path)))?;
+
+        for entry in db.entries {
+            if args.quiet {
+                println!("{}", entry.name);
+                continue;
+            }
+            let installed_note = match installed.get(&entry.name) {
+                Some(version) if version == &entry.version => " [installed]".to_string(),
+                Some(version) => format!(" [installed: {version}]"),
+                None => String::new(),
+            };
+            println!(
+                "{} {} {}{}",
+                repo.name, entry.name, entry.version, installed_note
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_clean(config: &XpmConfig, args: &cli::CleanArgs, no_confirm: bool) -> Result<()> {
+    let cache_dir = &config.options.cache_dir;
+    let local_db_dir = config.options.db_path.join("local");
+    let installed = read_installed_versions(&local_db_dir)?;
+
+    let prompt = if args.all {
+        ":: Remove all cached package files? [y/N] "
+    } else {
+        ":: Remove cached package files that are not installed? [y/N] "
+    };
+    confirm_action(prompt, no_confirm)?;
+
+    let report = clean_cache(cache_dir, &installed, args.all)
+        .with_context(|| format!("failed to clean cache {}", cache_dir.display()))?;
+
+    if report.removed.is_empty() {
+        println!(":: No cached package files to remove.");
+    } else {
+        println!(
+            ":: Removed {} cached package file(s) ({} bytes).",
+            report.removed.len(),
+            report.bytes_freed
+        );
+    }
+    Ok(())
+}
+
+fn normalize_files_query(raw: &str) -> String {
+    let mut value = raw.trim();
+    while let Some(stripped) = value.strip_prefix("./") {
+        value = stripped;
+    }
+    value
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn cmd_file_db(config: &XpmConfig, args: &cli::FilesDbArgs) -> Result<()> {
+    if args.refresh > 0 {
+        cmd_sync(
+            config,
+            &cli::SyncArgs {
+                force: args.refresh > 1,
+            },
+        )?;
+    }
+
+    if args.targets.is_empty() {
+        if args.refresh > 0 {
+            return Ok(());
+        }
+        anyhow::bail!("xpm file-db: at least one file or package target is required");
+    }
+
+    let sync_dir = config.options.db_path.join("sync");
+    let mut entries: Vec<(String, RepoEntry)> = Vec::new();
+    for repo in sync_repositories(config, args.repo.as_deref())? {
+        let db_path = sync_dir.join(format!("{}.db", repo.name));
+        if !db_path.exists() {
+            if args.repo.is_some() {
+                anyhow::bail!("database for repository '{}' was not found", repo.name);
+            }
+            continue;
+        }
+        let mut db = parse_sync_db_cached(&db_path, &repo.name)
+            .with_context(|| format!("failed to parse sync db {}", display_rel_or_abs(&db_path)))?;
+        let files_path = sync_dir.join(format!("{}.files", repo.name));
+        if files_path.exists() {
+            merge_files_db(&files_path, &mut db).with_context(|| {
+                format!(
+                    "failed to parse files db {}",
+                    display_rel_or_abs(&files_path)
+                )
+            })?;
+        }
+        for entry in db.entries {
+            entries.push((repo.name.clone(), entry));
+        }
+    }
+
+    if args.list {
+        let mut found = false;
+        for target in &args.targets {
+            for (_, entry) in &entries {
+                if entry.name != *target {
+                    continue;
+                }
+                found = true;
+                if entry.files.is_empty() {
+                    eprintln!("warning: no files database entry for '{}'", entry.name);
+                    continue;
+                }
+                for file in &entry.files {
+                    println!("{} {}", entry.name, file);
+                }
+            }
+        }
+        if !found {
+            eprintln!("error: package '{}' was not found", args.targets.join(", "));
+            exit_with(1);
+        }
+        return Ok(());
+    }
+
+    let mut found = false;
+    for target in &args.targets {
+        let normalized = normalize_files_query(target);
+        for (repo_name, entry) in &entries {
+            let owns = entry
+                .files
+                .iter()
+                .any(|file| normalize_files_query(file) == normalized);
+            if !owns {
+                continue;
+            }
+            found = true;
+            if args.quiet {
+                println!("{repo_name}/{}", entry.name);
+            } else {
+                println!(
+                    "{target} is owned by {}/{} {}",
+                    repo_name, entry.name, entry.version
+                );
+            }
+        }
+    }
+
+    if !found {
+        eprintln!("error: no package owns {}", args.targets.join(", "));
+        exit_with(1);
     }
     Ok(())
 }

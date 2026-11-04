@@ -23,3 +23,38 @@ pub use plan::{resolve_closure, resolve_closure_with_installed, Requirement};
 pub use provider::XpmProvider;
 pub use types::{PackageCandidate, PackageDependency, PackagePool, VersionReq};
 pub use version::Version;
+
+use crate::error::{XpmError, XpmResult};
+
+/// Parses `--assume-installed package=version` specifications into synthetic
+/// installed candidates.
+///
+/// The returned candidates have no dependencies or provides; they only make
+/// the named package/version available to dependency resolution and checks.
+pub fn assume_installed_candidates(specs: &[String]) -> XpmResult<Vec<PackageCandidate>> {
+    let mut candidates = Vec::with_capacity(specs.len());
+
+    for spec in specs {
+        let Some((name, version)) = spec.split_once('=') else {
+            return Err(XpmError::Package(format!(
+                "invalid --assume-installed '{spec}' (expected package=version)"
+            )));
+        };
+        if name.is_empty() || version.is_empty() {
+            return Err(XpmError::Package(format!(
+                "invalid --assume-installed '{spec}' (expected package=version)"
+            )));
+        }
+
+        candidates.push(PackageCandidate {
+            name: name.to_string(),
+            version: Version::parse(version),
+            depends: Vec::new(),
+            conflicts: Vec::new(),
+            provides: Vec::new(),
+            optdepends: Vec::new(),
+        });
+    }
+
+    Ok(candidates)
+}

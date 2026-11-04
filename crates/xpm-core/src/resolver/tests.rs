@@ -4,7 +4,9 @@
 
 use resolvo::{ArenaId, Problem, Solver};
 
+use super::assume_installed_candidates;
 use super::dependency::DepConstraint;
+use super::plan::resolve_closure_with_installed;
 use super::provider::XpmProvider;
 use super::types::{PackageCandidate, PackagePool};
 use super::version::Version;
@@ -355,4 +357,40 @@ fn solve_wide_fanout_resolves_all_versions_once() {
 
     let solved = solve(provider, &["app-wide"]).expect("fan-out must resolve");
     assert_eq!(solved.len(), 501);
+}
+
+#[test]
+fn assume_installed_candidates_parse_and_satisfy_dependencies() {
+    let assumed = assume_installed_candidates(&["virtual=2.1-1".to_string()])
+        .expect("parse assume-installed");
+    assert_eq!(assumed.len(), 1);
+    assert_eq!(assumed[0].name, "virtual");
+    assert_eq!(assumed[0].version.to_string(), "2.1-1");
+
+    let candidates = vec![with_deps("app", "1.0-1", &["virtual>=2"])];
+    let requirements = vec![super::plan::Requirement {
+        name: "app".to_string(),
+        version: None,
+    }];
+    let plan = resolve_closure_with_installed(candidates, assumed, &requirements)
+        .expect("the assumed package satisfies the dependency");
+    let names: Vec<&str> = plan
+        .iter()
+        .map(|(candidate, _, _)| candidate.name.as_str())
+        .collect();
+    assert!(names.contains(&"app"));
+    assert!(names.contains(&"virtual"));
+    assert!(plan
+        .iter()
+        .any(|(candidate, _, installed)| candidate.name == "virtual" && *installed));
+}
+
+#[test]
+fn assume_installed_rejects_invalid_specs() {
+    for spec in ["virtual", "=1.0", "virtual="] {
+        assert!(
+            assume_installed_candidates(&[spec.to_string()]).is_err(),
+            "{spec} must be rejected"
+        );
+    }
 }

@@ -6,6 +6,7 @@
 //! one by reading the metadata of each candidate instead of trusting the file
 //! name alone, so a renamed or truncated file is never mistaken for a match.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +72,84 @@ pub fn find_package(cache_dir: &Path, name: &str, version: &str) -> XpmResult<Op
     }
 
     Ok(None)
+}
+
+/// Result of [`clean_cache`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CacheCleanReport {
+    /// Package files that were removed.
+    pub removed: Vec<PathBuf>,
+    /// Package files that were kept.
+    pub kept: usize,
+    /// Total size of the removed package files.
+    pub bytes_freed: u64,
+}
+
+/// Removes cached package files.
+///
+/// With `all = false` (`pacman -Sc`), only package files whose metadata does
+/// not match an installed name/version are removed. Unreadable candidates are
+/// kept because their identity cannot be established safely. With
+/// `all = true` (`pacman -Scc`), every recognized package file is removed.
+///
+/// Only files with a known package suffix are touched; signatures belonging
+/// to removed packages are removed as well. Unrelated cache files are left
+/// alone. Sync databases live in the database directory and are not part of
+/// this operation.
+pub fn clean_cache(
+    cache_dir: &Path,
+    installed: &HashMap<String, String>,
+    all: bool,
+) -> XpmResult<CacheCleanReport> {
+    let mut report = CacheCleanReport::default();
+    if !cache_dir.is_dir() {
+        return Ok(report);
+    }
+
+    let mut candidates: Vec<PathBuf> = fs::read_dir(cache_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_package_file(path))
+        .collect();
+    candidates.sort();
+
+    for path in candidates {
+        let remove = if all {
+            true
+        } else {
+            match read_metadata(&path) {
+                Ok(metadata) => !installed
+                    .get(&metadata.meta.name)
+                    .is_some_and(|version| version == &metadata.meta.full_version()),
+                Err(e) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        error = %e,
+                        "keeping unreadable cache candidate"
+                    );
+                    false
+                }
+            }
+        };
+
+        if !remove {
+            report.kept += 1;
+            continue;
+        }
+
+        let size = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        fs::remove_file(&path)?;
+        let signature = PathBuf::from(format!("{}.sig", path.display()));
+        if signature.is_file() {
+            let _ = fs::remove_file(&signature);
+        }
+        report.bytes_freed += size;
+        report.removed.push(path);
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -155,5 +234,66 @@ mod tests {
 
         let found = find_package(tmp.path(), "kitty", "0.44.0-1").expect("lookup");
         assert!(found.is_some(), "the valid candidate must still be found");
+    }
+
+    #[test]
+    fn clean_cache_keeps_installed_versions_and_drops_the_rest() {
+        let tmp = TempDir::new().expect("tmp");
+        let current = write_fake_package(tmp.path(), "kitty", "0.44.0", "1");
+        let old = write_fake_package(tmp.path(), "kitty", "0.43.0", "1");
+        let orphan = write_fake_package(tmp.path(), "orphan", "2.0.0", "1");
+        fs::write(
+            tmp.path().join("kitty-0.44.0-1-x86_64.xp.sig"),
+            b"signature",
+        )
+        .expect("sig");
+        fs::write(tmp.path().join("notes.txt"), b"keep me").expect("notes");
+
+        let installed = HashMap::from([("kitty".to_string(), "0.44.0-1".to_string())]);
+        let report = clean_cache(tmp.path(), &installed, false).expect("clean");
+
+        assert!(current.is_file(), "the installed version stays cached");
+        assert!(!old.exists());
+        assert!(!orphan.exists());
+        assert!(current
+            .with_file_name("kitty-0.44.0-1-x86_64.xp.sig")
+            .is_file());
+        assert!(tmp.path().join("notes.txt").is_file());
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.removed.len(), 2);
+        assert!(report.bytes_freed > 0);
+    }
+
+    #[test]
+    fn clean_cache_all_removes_package_artifacts_including_corrupt_ones() {
+        let tmp = TempDir::new().expect("tmp");
+        write_fake_package(tmp.path(), "kitty", "0.44.0", "1");
+        fs::write(
+            tmp.path().join("broken-1.0-1-x86_64.pkg.tar.zst"),
+            b"garbage",
+        )
+        .expect("corrupt package");
+
+        let report = clean_cache(tmp.path(), &HashMap::new(), true).expect("clean everything");
+
+        assert_eq!(report.removed.len(), 2);
+        assert!(fs::read_dir(tmp.path()).expect("dir").next().is_none());
+    }
+
+    #[test]
+    fn clean_cache_safe_mode_keeps_corrupt_and_unrelated_files() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(
+            tmp.path().join("broken-1.0-1-x86_64.pkg.tar.zst"),
+            b"garbage",
+        )
+        .expect("corrupt package");
+        fs::write(tmp.path().join("README"), b"notes").expect("notes");
+
+        let report = clean_cache(tmp.path(), &HashMap::new(), false).expect("clean");
+
+        assert!(report.removed.is_empty());
+        assert_eq!(report.kept, 1);
+        assert!(tmp.path().join("README").is_file());
     }
 }

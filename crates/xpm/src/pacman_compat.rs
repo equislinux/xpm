@@ -8,8 +8,11 @@
 //! The rewriter is pure and deterministic. Unsupported pacman operations or
 //! flags are returned unchanged so clap can report them instead of silently
 //! dropping meaning. Implemented query/repair operations include `-Qo`,
-//! `-Qm`, `-Qq`, `-Qt`/`-Qdt`, `-Qg`, `-Qk`/`-Qkk`, `-D --asdeps`,
-//! `-D --asexplicit` and `-T`; `-F` remains deliberately unimplemented.
+//! `-Qm`/`-Qn`, `-Qc`, `-Qp`, `-Qq`, `-Qt`/`-Qdt`, `-Qg`, `-Qk`/`-Qkk`,
+//! `-D --asdeps`, `-D --asexplicit`, `-T`, `-Sl`, `-Sg`/`-Sgg`, `-Sc`/`-Scc`,
+//! `-Sw`/`-Suw`, and basic `-F`/`-Fl`/`-Fq`/`-Fy` files-database queries.
+//! `-Fx` is left unchanged because xpm does not link a regular-expression
+//! engine; treating an ERE as a literal path would silently change meaning.
 //!
 //! `--color never` maps to `--no-color`; other color modes are left for clap
 //! to reject.
@@ -36,6 +39,9 @@ const NATIVE_TOKENS: &[&str] = &[
     "mark",
     "deptest",
     "groups",
+    "list",
+    "clean",
+    "file-db",
     "usage",
     "Sy",
     "S",
@@ -167,6 +173,8 @@ struct Flags {
     as_explicit: bool,
     download_only: bool,
     ignore: Vec<OsString>,
+    ignore_groups: Vec<OsString>,
+    assume_installed: Vec<OsString>,
     nodeps: bool,
     help: bool,
 }
@@ -366,7 +374,7 @@ fn parse_long_option(args: &[OsString], index: usize, flags: &mut Flags) -> Opti
         .map_or((arg, None), |(name, value)| (name, Some(value)));
 
     match name {
-        "--root" | "--dbpath" | "--cachedir" | "--config" | "--scriptlets" => {
+        "--root" | "--dbpath" | "--cachedir" | "--config" | "--scriptlets" | "--sysroot" => {
             let (value, next) = take_value(args, index, inline_value)?;
             if os_starts_with_dash(&value) {
                 return None;
@@ -382,6 +390,16 @@ fn parse_long_option(args: &[OsString], index: usize, flags: &mut Flags) -> Opti
         "--ignore" => {
             let (value, next) = take_value(args, index, inline_value)?;
             flags.ignore.push(value);
+            Some(next)
+        }
+        "--ignoregroup" => {
+            let (value, next) = take_value(args, index, inline_value)?;
+            flags.ignore_groups.push(value);
+            Some(next)
+        }
+        "--assume-installed" => {
+            let (value, next) = take_value(args, index, inline_value)?;
+            flags.assume_installed.push(value);
             Some(next)
         }
         "--overwrite" => {
@@ -487,6 +505,8 @@ fn has_install_flags(flags: &Flags) -> bool {
         || flags.as_deps
         || flags.as_explicit
         || flags.download_only
+        || !flags.ignore_groups.is_empty()
+        || !flags.assume_installed.is_empty()
 }
 
 fn has_upgrade_flags(flags: &Flags) -> bool {
@@ -516,9 +536,53 @@ fn build_command(operation: char, modifiers: &[char], flags: &Flags) -> Option<V
         }
         'D' => build_mark_command(modifiers, flags),
         'T' => build_deptest_command(modifiers, flags),
-        // -F is deliberately unimplemented.
+        'F' => build_files_db_command(modifiers, flags),
         _ => None,
     }
+}
+
+fn build_files_db_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>> {
+    // `-Fx` would need a regular-expression engine that xpm does not link.
+    // Leave it unchanged so clap reports the unsupported option rather than
+    // silently treating an ERE as a literal path.
+    if modifiers
+        .iter()
+        .any(|c| !matches!(c, 'l' | 'y' | 'q' | 'v'))
+    {
+        return None;
+    }
+
+    if !flags.ignore.is_empty()
+        || has_install_flags(flags)
+        || has_upgrade_flags(flags)
+        || has_remove_flags(flags)
+    {
+        return None;
+    }
+
+    let list = count(modifiers, 'l');
+    let refresh = count(modifiers, 'y');
+    let quiet = count(modifiers, 'q');
+    let verbose = count(modifiers, 'v');
+
+    if list > 1 || quiet > 1 || verbose > 1 {
+        return None;
+    }
+
+    let mut command = vec![OsString::from("file-db")];
+    for _ in 0..refresh {
+        command.push(OsString::from("--refresh"));
+    }
+    if list > 0 {
+        command.push(OsString::from("--list"));
+    }
+    if quiet > 0 {
+        command.push(OsString::from("--quiet"));
+    }
+    if verbose > 0 {
+        command.push(OsString::from("--verbose"));
+    }
+    Some(command)
 }
 
 fn build_mark_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>> {
@@ -528,6 +592,8 @@ fn build_mark_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>
         || !flags.overwrite.is_empty()
         || flags.download_only
         || !flags.ignore.is_empty()
+        || !flags.ignore_groups.is_empty()
+        || !flags.assume_installed.is_empty()
         || flags.nodeps
     {
         return None;
@@ -558,7 +624,7 @@ fn build_deptest_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsStri
 fn build_sync_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>> {
     if modifiers
         .iter()
-        .any(|c| !matches!(c, 'y' | 'u' | 'p' | 's' | 'i'))
+        .any(|c| !matches!(c, 'y' | 'u' | 'p' | 's' | 'i' | 'w' | 'g' | 'l' | 'c' | 'q'))
     {
         return None;
     }
@@ -568,9 +634,60 @@ fn build_sync_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>
     let p = count(modifiers, 'p');
     let s = count(modifiers, 's');
     let i = count(modifiers, 'i');
+    let w = count(modifiers, 'w');
+    let g = count(modifiers, 'g');
+    let l = count(modifiers, 'l');
+    let c = count(modifiers, 'c');
+    let q = count(modifiers, 'q');
+
+    // Read-only sync listings.
+    if l > 0 {
+        if l > 1 || y > 0 || u > 0 || p > 0 || s > 0 || i > 0 || w > 0 || g > 0 || c > 0 || q > 1 {
+            return None;
+        }
+        if has_install_flags(flags) || has_upgrade_flags(flags) || has_remove_flags(flags) {
+            return None;
+        }
+        let mut command = vec![OsString::from("list")];
+        if q > 0 {
+            command.push(OsString::from("--quiet"));
+        }
+        return Some(command);
+    }
+
+    if g > 0 {
+        if g > 2 || y > 0 || u > 0 || p > 0 || s > 0 || i > 0 || w > 0 || l > 0 || c > 0 || q > 1 {
+            return None;
+        }
+        if has_install_flags(flags) || has_upgrade_flags(flags) || has_remove_flags(flags) {
+            return None;
+        }
+        let mut command = vec![OsString::from("groups")];
+        if g == 1 {
+            command.push(OsString::from("--names"));
+        }
+        if q > 0 {
+            command.push(OsString::from("--quiet"));
+        }
+        return Some(command);
+    }
+
+    if c > 0 {
+        if c > 2 || y > 0 || u > 0 || p > 0 || s > 0 || i > 0 || w > 0 || l > 0 || g > 0 || q > 0 {
+            return None;
+        }
+        if has_install_flags(flags) || has_upgrade_flags(flags) || has_remove_flags(flags) {
+            return None;
+        }
+        let mut command = vec![OsString::from("clean")];
+        if c == 2 {
+            command.push(OsString::from("--all"));
+        }
+        return Some(command);
+    }
 
     if s > 0 {
-        if s > 1 || y > 0 || u > 0 || p > 0 || i > 0 {
+        if s > 1 || y > 0 || u > 0 || p > 0 || i > 0 || w > 0 || q > 0 {
             return None;
         }
         if has_install_flags(flags) || has_upgrade_flags(flags) || has_remove_flags(flags) {
@@ -580,7 +697,7 @@ fn build_sync_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>
     }
 
     if i > 0 {
-        if i > 1 || y > 0 || u > 0 || p > 0 || s > 0 {
+        if i > 1 || y > 0 || u > 0 || p > 0 || s > 0 || w > 0 || q > 0 {
             return None;
         }
         if has_install_flags(flags) || has_upgrade_flags(flags) || has_remove_flags(flags) {
@@ -591,17 +708,28 @@ fn build_sync_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>
 
     if u > 0 {
         // Upgrade only installs newer versions, so --needed is inherently
-        // satisfied; the remaining install-only flags have no equivalent.
-        if flags.as_deps || flags.as_explicit || flags.download_only || flags.nodeps {
+        // satisfied; --downloadonly is supported by `xpm upgrade`.
+        if flags.as_deps || flags.as_explicit || flags.nodeps {
             return None;
         }
         let mut command = vec![OsString::from("upgrade")];
         if flags.print || p > 0 {
             command.push(OsString::from("--print"));
         }
+        if w > 0 || flags.download_only {
+            command.push(OsString::from("--download-only"));
+        }
         for ignore in &flags.ignore {
             command.push(OsString::from("--ignore"));
             command.push(ignore.clone());
+        }
+        for group in &flags.ignore_groups {
+            command.push(OsString::from("--ignoregroup"));
+            command.push(group.clone());
+        }
+        for spec in &flags.assume_installed {
+            command.push(OsString::from("--assume-installed"));
+            command.push(spec.clone());
         }
         for pattern in &flags.overwrite {
             command.push(OsString::from("--overwrite"));
@@ -611,7 +739,15 @@ fn build_sync_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>
     }
 
     if y > 0 {
-        if p > 0 || flags.print || flags.nodeps || !flags.ignore.is_empty() {
+        if p > 0
+            || flags.print
+            || flags.nodeps
+            || w > 0
+            || q > 0
+            || !flags.ignore.is_empty()
+            || !flags.ignore_groups.is_empty()
+            || !flags.assume_installed.is_empty()
+        {
             return None;
         }
         if flags.as_deps
@@ -629,8 +765,15 @@ fn build_sync_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString>
         return Some(command);
     }
 
+    if q > 0 {
+        return None;
+    }
+
     if flags.ignore.is_empty() && !flags.nodeps {
         let mut command = build_install_command(flags)?;
+        if w > 0 && !flags.download_only {
+            command.insert(1, OsString::from("--download-only"));
+        }
         if p > 0 && !flags.print {
             command.insert(1, OsString::from("--print"));
         }
@@ -665,6 +808,14 @@ fn build_install_command(flags: &Flags) -> Option<Vec<OsString>> {
         command.push(OsString::from("--overwrite"));
         command.push(pattern.clone());
     }
+    for group in &flags.ignore_groups {
+        command.push(OsString::from("--ignoregroup"));
+        command.push(group.clone());
+    }
+    for spec in &flags.assume_installed {
+        command.push(OsString::from("--assume-installed"));
+        command.push(spec.clone());
+    }
     Some(command)
 }
 
@@ -672,7 +823,7 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
     if modifiers.iter().any(|c| {
         !matches!(
             c,
-            'e' | 'd' | 'l' | 'i' | 'q' | 'u' | 't' | 'o' | 'k' | 'g' | 'm'
+            'e' | 'd' | 'l' | 'i' | 'q' | 'u' | 't' | 'o' | 'k' | 'g' | 'm' | 'n' | 'c' | 'p'
         )
     }) {
         return None;
@@ -693,16 +844,45 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
     let k = count(modifiers, 'k');
     let g = count(modifiers, 'g');
     let m = count(modifiers, 'm');
+    let n = count(modifiers, 'n');
+    let c = count(modifiers, 'c');
+    let p = count(modifiers, 'p');
+
+    // -Qc is an action: the package name follows as a positional argument.
+    if c > 0 {
+        if c > 1 || e + d + l + i + u + t + o + k + g + m + n + p > 0 || q > 1 {
+            return None;
+        }
+        let mut command = vec![OsString::from("query"), OsString::from("--changelog")];
+        if q > 0 {
+            command.push(OsString::from("--quiet"));
+        }
+        return Some(command);
+    }
+
+    // -Qp takes the package file as the next positional argument. Flags that
+    // consume a value must therefore come before `--file`.
+    if p > 0 {
+        if p > 1 || e + d + l + i + u + t + o + k + g + m + n + c > 0 || q > 1 {
+            return None;
+        }
+        let mut command = vec![OsString::from("query")];
+        if q > 0 {
+            command.push(OsString::from("--quiet"));
+        }
+        command.push(OsString::from("--file"));
+        return Some(command);
+    }
 
     if o > 0 {
-        if o > 1 || e + d + l + i + q + u + t + k + g + m > 0 {
+        if o > 1 || e + d + l + i + q + u + t + k + g + m + n > 0 {
             return None;
         }
         return Some(vec![OsString::from("query"), OsString::from("--owner")]);
     }
 
     if k > 0 {
-        if k > 2 || e + d + l + i + q + u + t + o + g + m > 0 {
+        if k > 2 || e + d + l + i + q + u + t + o + g + m + n > 0 {
             return None;
         }
         let mut command = vec![OsString::from("check")];
@@ -713,7 +893,7 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
     }
 
     if g > 0 {
-        if g > 1 || e + d + l + i + u + t + o + k + m > 0 {
+        if g > 1 || e + d + l + i + u + t + o + k + m + n > 0 {
             return None;
         }
         let mut command = vec![OsString::from("groups"), OsString::from("--local")];
@@ -724,17 +904,21 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
     }
 
     if l > 0 {
-        if l > 1 || e > 0 || d > 0 || i > 0 || u > 0 || t > 0 || q > 0 || m > 0 {
+        if l > 1 || e > 0 || d > 0 || i > 0 || u > 0 || t > 0 || q > 0 || m > 0 || n > 0 {
             return None;
         }
         return Some(vec![OsString::from("files")]);
     }
 
     if i > 0 {
-        if i > 1 || e > 0 || d > 0 || u > 0 || t > 0 || q > 0 || m > 0 {
+        if i > 1 || e > 0 || d > 0 || u > 0 || t > 0 || q > 0 || m > 0 || n > 0 {
             return None;
         }
         return Some(vec![OsString::from("info")]);
+    }
+
+    if n > 1 || m > 1 {
+        return None;
     }
 
     if u > 0 && (t > 0 || m > 0) {
@@ -749,6 +933,9 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
         if m > 0 {
             command.push(OsString::from("--foreign"));
         }
+        if n > 0 {
+            command.push(OsString::from("--native"));
+        }
         command.push(OsString::from("--unrequired"));
         if d > 0 {
             command.push(OsString::from("--deps"));
@@ -762,10 +949,6 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
         return Some(command);
     }
 
-    if m > 1 {
-        return None;
-    }
-
     let mut command = vec![OsString::from("query")];
     if e > 0 {
         command.push(OsString::from("--explicit"));
@@ -775,6 +958,9 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
     }
     if m > 0 {
         command.push(OsString::from("--foreign"));
+    }
+    if n > 0 {
+        command.push(OsString::from("--native"));
     }
     if u > 0 {
         command.push(OsString::from("--upgrades"));
@@ -958,6 +1144,119 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_sync_listing_group_and_clean_operations() {
+        assert_rewrite(&["xpm", "-Sl"], &["xpm", "list"]);
+        assert_rewrite(&["xpm", "-Slq"], &["xpm", "list", "--quiet"]);
+        assert_rewrite(&["xpm", "-Sl", "core"], &["xpm", "list", "core"]);
+        assert_rewrite(&["xpm", "-Sg"], &["xpm", "groups", "--names"]);
+        assert_rewrite(&["xpm", "-Sgg"], &["xpm", "groups"]);
+        assert_rewrite(
+            &["xpm", "-Sgq", "desktop"],
+            &["xpm", "groups", "--names", "--quiet", "desktop"],
+        );
+        assert_rewrite(&["xpm", "-Sc"], &["xpm", "clean"]);
+        assert_rewrite(&["xpm", "-Scc"], &["xpm", "clean", "--all"]);
+    }
+
+    #[test]
+    fn rewrites_download_only_sync_and_upgrade() {
+        assert_rewrite(
+            &["xpm", "-Sw", "firefox"],
+            &["xpm", "install", "--download-only", "firefox"],
+        );
+        assert_rewrite(&["xpm", "-Suw"], &["xpm", "upgrade", "--download-only"]);
+        assert_rewrite(
+            &["xpm", "-Syu", "--downloadonly"],
+            &["xpm", "upgrade", "--download-only"],
+        );
+    }
+
+    #[test]
+    fn rewrites_native_file_and_changelog_queries() {
+        assert_rewrite(&["xpm", "-Qn"], &["xpm", "query", "--native"]);
+        assert_rewrite(&["xpm", "-Qnq"], &["xpm", "query", "--native", "--quiet"]);
+        assert_rewrite(
+            &["xpm", "-Qnt"],
+            &["xpm", "query", "--native", "--unrequired"],
+        );
+        assert_rewrite(
+            &["xpm", "-Qc", "hello"],
+            &["xpm", "query", "--changelog", "hello"],
+        );
+        assert_rewrite(
+            &["xpm", "-Qcq", "hello"],
+            &["xpm", "query", "--changelog", "--quiet", "hello"],
+        );
+        assert_rewrite(
+            &["xpm", "-Qp", "/tmp/hello.pkg.tar.zst"],
+            &["xpm", "query", "--file", "/tmp/hello.pkg.tar.zst"],
+        );
+        assert_rewrite(
+            &["xpm", "-Qpq", "/tmp/hello.pkg.tar.zst"],
+            &[
+                "xpm",
+                "query",
+                "--quiet",
+                "--file",
+                "/tmp/hello.pkg.tar.zst",
+            ],
+        );
+    }
+
+    #[test]
+    fn rewrites_files_database_queries() {
+        assert_rewrite(
+            &["xpm", "-F", "usr/bin/hello"],
+            &["xpm", "file-db", "usr/bin/hello"],
+        );
+        assert_rewrite(
+            &["xpm", "-Fl", "hello"],
+            &["xpm", "file-db", "--list", "hello"],
+        );
+        assert_rewrite(
+            &["xpm", "-Fq", "usr/bin/hello"],
+            &["xpm", "file-db", "--quiet", "usr/bin/hello"],
+        );
+        assert_rewrite(&["xpm", "-Fy"], &["xpm", "file-db", "--refresh"]);
+        assert_rewrite(
+            &["xpm", "-Fyy"],
+            &["xpm", "file-db", "--refresh", "--refresh"],
+        );
+    }
+
+    #[test]
+    fn rewrites_transaction_options_and_sysroot() {
+        assert_rewrite(
+            &[
+                "xpm",
+                "-S",
+                "--ignoregroup",
+                "kernel",
+                "--assume-installed",
+                "linux=6.9",
+                "pkg",
+            ],
+            &[
+                "xpm",
+                "install",
+                "--ignoregroup",
+                "kernel",
+                "--assume-installed",
+                "linux=6.9",
+                "pkg",
+            ],
+        );
+        assert_rewrite(
+            &["xpm", "-Syu", "--ignoregroup", "kernel"],
+            &["xpm", "upgrade", "--ignoregroup", "kernel"],
+        );
+        assert_rewrite(
+            &["xpm", "--sysroot", "/mnt", "-Syu"],
+            &["xpm", "--sysroot", "/mnt", "upgrade"],
+        );
+    }
+
+    #[test]
     fn rewrites_version() {
         assert_rewrite(&["xpm", "-V"], &["xpm", "--version"]);
     }
@@ -981,7 +1280,8 @@ mod tests {
             vec!["xpm", "-D", "pkg"],
             vec!["xpm", "-D", "--asdeps", "--asexplicit", "pkg"],
             vec!["xpm", "-T", "--needed", "pkg"],
-            vec!["xpm", "-F"],
+            vec!["xpm", "-Fx", "usr/bin/.*"],
+            vec!["xpm", "-Fz"],
             vec!["xpm", "--gpgdir", "/tmp/gnupg", "-Syu"],
         ] {
             assert_eq!(rewrite(&args), args, "input: {args:?}");
@@ -1075,6 +1375,31 @@ mod tests {
             vec!["xpm", "-Syu", "--color", "never"],
             vec!["xpm", "--root", "/mnt", "--dbpath", "/mnt/db", "-Syu"],
             vec!["xpm", "-S", "--", "-odd-name"],
+            vec!["xpm", "-Sw", "firefox"],
+            vec!["xpm", "-Suw"],
+            vec!["xpm", "-Sl"],
+            vec!["xpm", "-Slq", "core"],
+            vec!["xpm", "-Sg"],
+            vec!["xpm", "-Sgg"],
+            vec!["xpm", "-Sgq", "desktop"],
+            vec!["xpm", "-Sc"],
+            vec!["xpm", "-Scc"],
+            vec!["xpm", "-Qn"],
+            vec!["xpm", "-Qnq"],
+            vec!["xpm", "-Qnt"],
+            vec!["xpm", "-Qc", "hello"],
+            vec!["xpm", "-Qcq", "hello"],
+            vec!["xpm", "-Qp", "/tmp/hello.pkg.tar.zst"],
+            vec!["xpm", "-Qpq", "/tmp/hello.pkg.tar.zst"],
+            vec!["xpm", "-F", "usr/bin/hello"],
+            vec!["xpm", "-Fl", "hello"],
+            vec!["xpm", "-Fq", "usr/bin/hello"],
+            vec!["xpm", "-Fy"],
+            vec!["xpm", "-Fyy"],
+            vec!["xpm", "-S", "--ignoregroup", "kernel", "pkg"],
+            vec!["xpm", "-Syu", "--ignoregroup", "kernel"],
+            vec!["xpm", "-S", "--assume-installed", "linux=6.9", "pkg"],
+            vec!["xpm", "--sysroot", "/mnt", "-Syu"],
         ];
 
         for input in cases {

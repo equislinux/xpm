@@ -8,6 +8,8 @@ use std::fs;
 use std::io::{Cursor, Read};
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use flate2::read::GzDecoder;
 use xz2::read::XzDecoder;
 
@@ -15,7 +17,7 @@ use crate::XpmError;
 use crate::XpmResult;
 
 /// A package entry stored in a repository database.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoEntry {
     pub name: String,
     pub version: String,
@@ -54,7 +56,7 @@ impl RepoEntry {
 }
 
 /// Parsed sync database for a repository (e.g. `core.db`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncDb {
     pub repo: String,
     pub entries: Vec<RepoEntry>,
@@ -77,6 +79,52 @@ struct ArchivePackage {
 pub fn parse_sync_db(path: &Path, repo_name: &str) -> XpmResult<SyncDb> {
     let bytes = fs::read(path)?;
     parse_sync_db_bytes(&bytes, repo_name)
+}
+
+#[derive(Serialize, Deserialize)]
+struct SyncCache {
+    modified_ns: u128,
+    len: u64,
+    repo: String,
+    db: SyncDb,
+}
+
+/// Parse a sync database through a persistent JSON cache keyed by mtime/size.
+/// The first run pays the tar/gzip parse; subsequent commands load JSON.
+pub fn parse_sync_db_cached(path: &Path, repo_name: &str) -> XpmResult<SyncDb> {
+    let metadata = fs::metadata(path)?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let cache_path = path.with_extension("cache.json");
+    if let Ok(text) = fs::read_to_string(&cache_path) {
+        if let Ok(cache) = serde_json::from_str::<SyncCache>(&text) {
+            if cache.modified_ns == modified_ns
+                && cache.len == metadata.len()
+                && cache.repo == repo_name
+            {
+                return Ok(cache.db);
+            }
+        }
+    }
+
+    let db = parse_sync_db(path, repo_name)?;
+    let cache = SyncCache {
+        modified_ns,
+        len: metadata.len(),
+        repo: repo_name.to_string(),
+        db: db.clone(),
+    };
+    if let Ok(text) = serde_json::to_string(&cache) {
+        let tmp = cache_path.with_extension("tmp");
+        if fs::write(&tmp, text).is_ok() {
+            let _ = fs::rename(&tmp, &cache_path);
+        }
+    }
+    Ok(db)
 }
 
 /// Parse a repository files database archive (`<repo>.files`) and merge file

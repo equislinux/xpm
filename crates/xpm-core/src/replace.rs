@@ -110,6 +110,15 @@ fn is_ignored(
     ignore_pkg.matches(name) || groups.iter().any(|group| ignore_group.matches(group))
 }
 
+/// Whether any of `groups` matches an `IgnoreGroup` pattern.
+///
+/// The same glob and `!`-negation semantics as `IgnorePkg` are used, so the
+/// CLI's `--ignoregroup` can share the config-based matching.
+pub fn matches_ignore_group(groups: &[String], patterns: &[String]) -> bool {
+    let patterns = IgnorePatterns::new(patterns);
+    groups.iter().any(|group| patterns.matches(group))
+}
+
 /// Selects replacements for installed packages during a sysupgrade.
 ///
 /// Repositories are visited in ascending [`ReplacementCandidate::repo_rank`]
@@ -345,6 +354,20 @@ mod tests {
 
         assert!(find_replacements(&installed, &candidates, &["old".to_string()], &[]).is_empty());
         assert!(find_replacements(&installed, &candidates, &["o*".to_string()], &[]).is_empty());
+    }
+
+    #[test]
+    fn ignore_group_helper_uses_glob_and_negation() {
+        let groups = vec!["base".to_string(), "tools".to_string()];
+
+        assert!(matches_ignore_group(&groups, &["base".to_string()]));
+        assert!(matches_ignore_group(&groups, &["tool*".to_string()]));
+        assert!(matches_ignore_group(
+            &groups,
+            &["*".to_string(), "!base".to_string()]
+        ));
+        assert!(!matches_ignore_group(&groups, &["desktop".to_string()]));
+        assert!(!matches_ignore_group(&groups, &[]));
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub struct Cli {
     #[arg(long, short = 'r', global = true, value_name = "PATH")]
     pub root: Option<PathBuf>,
 
+    /// Operate on a mounted guest system (root, database and cache paths).
+    #[arg(long, global = true, value_name = "PATH")]
+    pub sysroot: Option<PathBuf>,
+
     /// Set an alternative database directory.
     #[arg(long, short = 'b', global = true, value_name = "PATH")]
     pub dbpath: Option<PathBuf>,
@@ -140,6 +144,16 @@ pub enum Command {
     /// List package groups (sync or local).
     Groups(GroupsArgs),
 
+    /// List packages available in the sync repositories [-Sl].
+    List(ListArgs),
+
+    /// Remove cached package files [-Sc/-Scc].
+    Clean(CleanArgs),
+
+    /// Query the sync files databases [-F].
+    #[command(name = "file-db")]
+    FileDb(FilesDbArgs),
+
     /// Display detailed usage information and guides.
     Usage(HelpArgs),
 }
@@ -186,6 +200,14 @@ pub struct InstallArgs {
     /// Overwrite conflicting files matching PATTERN (repeatable; `!` negates).
     #[arg(long, value_name = "PATTERN")]
     pub overwrite: Vec<String>,
+
+    /// Ignore packages in GROUP (repeatable; applied by upgrades).
+    #[arg(long = "ignoregroup", value_name = "GROUP")]
+    pub ignore_groups: Vec<String>,
+
+    /// Assume package=version is installed for dependency resolution.
+    #[arg(long = "assume-installed", value_name = "PKG=VER")]
+    pub assume_installed: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -288,9 +310,21 @@ pub struct UpgradeArgs {
     #[arg(long, short = 'p')]
     pub print: bool,
 
+    /// Download packages without committing the upgrade.
+    #[arg(long, short = 'w')]
+    pub download_only: bool,
+
     /// Overwrite conflicting files matching PATTERN (repeatable; `!` negates).
     #[arg(long, value_name = "PATTERN")]
     pub overwrite: Vec<String>,
+
+    /// Ignore upgrades for packages in GROUP (repeatable).
+    #[arg(long = "ignoregroup", value_name = "GROUP")]
+    pub ignore_groups: Vec<String>,
+
+    /// Assume package=version is installed for dependency resolution.
+    #[arg(long = "assume-installed", value_name = "PKG=VER")]
+    pub assume_installed: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -325,6 +359,18 @@ pub struct QueryArgs {
     /// List packages that are not present in any configured sync database.
     #[arg(long, short = 'm')]
     pub foreign: bool,
+
+    /// List packages that are present in a configured sync database.
+    #[arg(long, short = 'n')]
+    pub native: bool,
+
+    /// Query a package file instead of the local database.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+
+    /// Show the changelog stored for an installed package.
+    #[arg(long)]
+    pub changelog: bool,
 
     /// List packages that no other installed package directly requires.
     #[arg(long)]
@@ -479,8 +525,51 @@ pub struct GroupsArgs {
     #[arg(long, short = 'q')]
     pub quiet: bool,
 
+    /// With no group argument, print group names instead of members.
+    #[arg(long)]
+    pub names: bool,
+
     /// Restrict output to one group.
     pub group: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ListArgs {
+    /// Restrict the listing to one repository.
+    pub repo: Option<String>,
+
+    /// Print only package names.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CleanArgs {
+    /// Remove every cached package file, including the installed versions.
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct FilesDbArgs {
+    /// Refresh the sync databases (including .files) before querying.
+    #[arg(long, short = 'y', action = clap::ArgAction::Count)]
+    pub refresh: u8,
+
+    /// List files owned by the target package names instead of searching paths.
+    #[arg(long, short = 'l')]
+    pub list: bool,
+
+    /// Print only repository/package identifiers.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
+    /// Restrict results to one repository.
+    #[arg(long, value_name = "REPO")]
+    pub repo: Option<String>,
+
+    /// File paths (default) or package names with --list.
+    pub targets: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]

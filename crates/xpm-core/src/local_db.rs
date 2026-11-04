@@ -40,6 +40,8 @@ pub const PROVIDES_FILE: &str = "provides";
 pub const GROUPS_FILE: &str = "groups";
 /// File name of the configuration-file list (`.PKGINFO` `backup` entries).
 pub const BACKUP_FILE: &str = "backup";
+/// File name of the package changelog stored by pacman-compatible databases.
+pub const CHANGELOG_FILE: &str = "changelog";
 /// File name of the raw `.MTREE` copy, kept for integrity and for deciding
 /// whether a configuration file was modified (`.pacnew`/`.pacsave`).
 pub const MTREE_FILE: &str = "mtree";
@@ -215,6 +217,20 @@ pub fn read_origin(local_db_dir: &Path, pkg: &str) -> Option<String> {
         .ok()
         .map(|raw| raw.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+// ── changelog ─────────────────────────────────────────────────
+
+/// Reads the changelog stored for an installed package.
+///
+/// pacman keeps a `changelog` file in the local database when the package
+/// ships one; packages without it return `None`, matching `pacman -Qc`.
+pub fn read_changelog(local_db_dir: &Path, pkg: &str) -> XpmResult<Option<String>> {
+    match fs::read_to_string(local_db_dir.join(pkg).join(CHANGELOG_FILE)) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ── version ───────────────────────────────────────────────────
@@ -468,6 +484,23 @@ mod tests {
 
         write_origin(&local_db, "empty", "").expect("write empty origin");
         assert_eq!(read_origin(&local_db, "empty"), None);
+    }
+
+    #[test]
+    fn changelog_reads_or_is_none() {
+        let tmp = TempDir::new().expect("tmp");
+        let local_db = tmp.path().join("local");
+
+        assert!(read_changelog(&local_db, "legacy").expect("read").is_none());
+
+        let pkg_dir = local_db.join("hello");
+        fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        fs::write(pkg_dir.join(CHANGELOG_FILE), "1.0-1: initial\n").expect("changelog");
+
+        assert_eq!(
+            read_changelog(&local_db, "hello").expect("read").as_deref(),
+            Some("1.0-1: initial\n")
+        );
     }
 
     #[test]
