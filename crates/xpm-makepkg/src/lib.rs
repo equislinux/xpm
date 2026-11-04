@@ -387,7 +387,7 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         makepkg.push(' ');
         makepkg.push_str(&shell_quote(arg));
     }
-    let command = format!("PKGDEST=/pkgdest {makepkg}");
+    let command = format!("env -u LDFLAGS -u CFLAGS -u CXXFLAGS PKGDEST=/pkgdest {makepkg}");
     tracing::info!(chroot = %options.chroot_dir.display(), "building in clean chroot");
     let status = root_command("arch-chroot")
         .arg(&work)
