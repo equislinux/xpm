@@ -287,7 +287,18 @@ pub fn package_download_candidates(
 
 /// Download from the first working URL to `dest`.
 pub fn download_first_available(urls: &[String], dest: &Path, retries: u32) -> XpmResult<String> {
-    download_first_available_with_progress(urls, dest, retries, true, None)
+    download_first_available_with_progress(urls, dest, retries, true, None, None)
+}
+
+/// Download and fail over until a mirror serves bytes matching the expected
+/// SHA-256. This catches mirrors that return an HTML/error page with HTTP 200.
+pub fn download_first_available_checked(
+    urls: &[String],
+    dest: &Path,
+    retries: u32,
+    expected_sha256: Option<&str>,
+) -> XpmResult<String> {
+    download_first_available_with_progress(urls, dest, retries, true, None, expected_sha256)
 }
 
 /// Like [`download_first_available`] but without terminal progress updates.
@@ -298,7 +309,7 @@ pub fn download_first_available_quiet(
     dest: &Path,
     retries: u32,
 ) -> XpmResult<String> {
-    download_first_available_with_progress(urls, dest, retries, false, None)
+    download_first_available_with_progress(urls, dest, retries, false, None, None)
 }
 
 /// Like [`download_first_available_quiet`] but reports aggregate progress to
@@ -308,8 +319,16 @@ pub fn download_first_available_tracked(
     dest: &Path,
     retries: u32,
     progress: &ParallelDownloadProgress,
+    expected_sha256: Option<&str>,
 ) -> XpmResult<String> {
-    download_first_available_with_progress(urls, dest, retries, false, Some(progress))
+    download_first_available_with_progress(
+        urls,
+        dest,
+        retries,
+        false,
+        Some(progress),
+        expected_sha256,
+    )
 }
 
 fn download_first_available_with_progress(
@@ -318,6 +337,7 @@ fn download_first_available_with_progress(
     retries: u32,
     show_progress: bool,
     progress: Option<&ParallelDownloadProgress>,
+    expected_sha256: Option<&str>,
 ) -> XpmResult<String> {
     let mut last_error: Option<XpmError> = None;
 
@@ -326,7 +346,21 @@ fn download_first_available_with_progress(
         // One attempt per mirror: the next candidate is the retry. Repeating a
         // dead/timing-out mirror delays failover and stalls the worker pool.
         match download_with_retries(url, dest, 1, show_progress, progress) {
-            Ok(()) => return Ok(url.clone()),
+            Ok(()) => {
+                if let Some(expected) = expected_sha256 {
+                    if let Err(err) = verify_sha256(dest, expected) {
+                        let _ = fs::remove_file(dest);
+                        tracing::warn!(
+                            url,
+                            error = %err,
+                            "downloaded package failed checksum; trying next mirror"
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                }
+                return Ok(url.clone());
+            }
             Err(err) => last_error = Some(err),
         }
     }
@@ -750,6 +784,30 @@ mod tests {
             .expect("second mirror should be used");
         assert_eq!(selected, good);
         assert_eq!(fs::read(dest).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn checksum_failure_falls_over_to_the_next_mirror() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bad = temp.path().join("bad.pkg");
+        let good = temp.path().join("good.pkg");
+        fs::write(&bad, b"<html>mirror error</html>").expect("write bad package");
+        fs::write(&good, b"package-payload").expect("write good package");
+        let expected = format!("{:x}", Sha256::digest(b"package-payload"));
+        let dest = temp.path().join("download.pkg");
+
+        let selected = download_first_available_checked(
+            &[
+                format!("file://{}", bad.display()),
+                format!("file://{}", good.display()),
+            ],
+            &dest,
+            1,
+            Some(&expected),
+        )
+        .expect("corrupt mirror must be skipped");
+        assert_eq!(selected, format!("file://{}", good.display()));
+        assert_eq!(fs::read(dest).unwrap(), b"package-payload");
     }
 
     #[test]

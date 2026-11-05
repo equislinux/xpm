@@ -41,8 +41,9 @@ use xpm_core::replace::matches_ignore_group;
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db_cached, RepoEntry};
 use xpm_core::repo_sync::{
-    download_first_available, download_first_available_tracked, package_download_candidates,
-    sync_repo_databases, verify_remote_signature, verify_remote_signature_any, verify_sha256,
+    download_first_available, download_first_available_checked, download_first_available_tracked,
+    package_download_candidates, sync_repo_databases, verify_remote_signature,
+    verify_remote_signature_any, verify_sha256,
 };
 use xpm_core::resolver::{
     assume_installed_candidates, resolve_closure, resolve_closure_with_installed, DepConstraint,
@@ -594,6 +595,7 @@ struct DownloadJob {
     index: usize,
     urls: Vec<String>,
     dest: PathBuf,
+    sha256: Option<String>,
 }
 
 /// Download all resolved packages before the sequential verification and
@@ -638,7 +640,12 @@ fn prefetch_downloads(
             // package hammer the first server.
             urls.rotate_left(index % mirror_count);
         }
-        jobs.push(DownloadJob { index, urls, dest });
+        jobs.push(DownloadJob {
+            index,
+            urls,
+            dest,
+            sha256: entry.sha256sum.clone(),
+        });
     }
 
     if jobs.is_empty() {
@@ -648,8 +655,14 @@ fn prefetch_downloads(
     let workers = (parallel_downloads.max(1) as usize).min(jobs.len());
     if workers == 1 {
         for job in jobs {
-            let mirror = download_first_available(&job.urls, &job.dest, 3)
-                .with_context(|| format!("failed to download '{}'", job.dest.display()))?;
+            let mirror =
+                download_first_available_checked(&job.urls, &job.dest, 3, job.sha256.as_deref())
+                    .with_context(|| {
+                        format!(
+                            "failed to download '{}' from any mirror",
+                            job.dest.display()
+                        )
+                    })?;
             mirrors[job.index] = Some(mirror);
         }
         return Ok(mirrors);
@@ -666,8 +679,14 @@ fn prefetch_downloads(
                 let Some(job) = jobs.get(index) else {
                     break;
                 };
-                let result = download_first_available_tracked(&job.urls, &job.dest, 3, &progress)
-                    .map_err(|err| err.to_string());
+                let result = download_first_available_tracked(
+                    &job.urls,
+                    &job.dest,
+                    3,
+                    &progress,
+                    job.sha256.as_deref(),
+                )
+                .map_err(|err| err.to_string());
                 progress.complete_job();
                 if let Ok(mut slots) = results.lock() {
                     slots[index] = Some(result);
@@ -1106,10 +1125,6 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
         if let Some(Some(Err(err))) = verification.get(index) {
             anyhow::bail!("{err}");
-        }
-
-        if let Some(sum) = entry.sha256sum.as_deref() {
-            verify_sha256(&dest, sum)?;
         }
 
         let metadata = read_metadata(&dest)
@@ -1698,10 +1713,6 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
                 )
             },
         )?;
-
-        if let Some(sum) = entry.sha256sum.as_deref() {
-            verify_sha256(&dest, sum)?;
-        }
 
         let metadata = read_metadata(&dest)
             .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
