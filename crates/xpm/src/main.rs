@@ -9,6 +9,7 @@ mod pacman_compat;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,6 +24,7 @@ use xpm_core::alpm_hooks::{self, HookOperation, HookTransaction, HookWhen};
 use xpm_core::cache::clean_cache;
 use xpm_core::check;
 use xpm_core::config::Repository;
+use xpm_core::config::SigLevel;
 use xpm_core::conflict;
 use xpm_core::depcheck;
 use xpm_core::deptest::{self, InstalledDependency};
@@ -33,12 +35,13 @@ use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::local_db;
 use xpm_core::orphans::{find_orphans, InstalledPackage};
 use xpm_core::package::{read_metadata, PackageMeta};
+use xpm_core::progress::ParallelDownloadProgress;
 use xpm_core::query;
 use xpm_core::replace::matches_ignore_group;
 use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db_cached, RepoEntry};
 use xpm_core::repo_sync::{
-    download_first_available, download_first_available_quiet, package_download_candidates,
+    download_first_available, download_first_available_tracked, package_download_candidates,
     sync_repo_databases, verify_remote_signature, verify_remote_signature_any, verify_sha256,
 };
 use xpm_core::resolver::{
@@ -615,18 +618,27 @@ fn prefetch_downloads(
         {
             continue;
         }
+        let dest = cache_dir.join(entry.resolved_filename(arch));
         let mut urls = package_download_candidates(repo, arch, entry);
+        if dest.is_file() {
+            let cache_valid = match entry.sha256sum.as_deref() {
+                Some(sum) => verify_sha256(&dest, sum).is_ok(),
+                None => fs::metadata(&dest).is_ok_and(|meta| meta.len() > 0),
+            };
+            if cache_valid {
+                // pacman reuses its package cache; xpm should not re-download
+                // every package on every phase or repeated install.
+                mirrors[index] = urls.first().cloned();
+                continue;
+            }
+        }
         let mirror_count = urls.len();
         if mirror_count > 0 {
             // Spread concurrent workers across mirrors instead of making every
             // package hammer the first server.
             urls.rotate_left(index % mirror_count);
         }
-        jobs.push(DownloadJob {
-            index,
-            urls,
-            dest: cache_dir.join(entry.resolved_filename(arch)),
-        });
+        jobs.push(DownloadJob { index, urls, dest });
     }
 
     if jobs.is_empty() {
@@ -646,6 +658,7 @@ fn prefetch_downloads(
     let results: Mutex<Vec<Option<Result<String, String>>>> =
         Mutex::new((0..jobs.len()).map(|_| None).collect());
     let next = AtomicUsize::new(0);
+    let progress = ParallelDownloadProgress::new(jobs.len());
     thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
@@ -653,14 +666,21 @@ fn prefetch_downloads(
                 let Some(job) = jobs.get(index) else {
                     break;
                 };
-                let result = download_first_available_quiet(&job.urls, &job.dest, 3)
+                let result = download_first_available_tracked(&job.urls, &job.dest, 3, &progress)
                     .map_err(|err| err.to_string());
+                progress.complete_job();
                 if let Ok(mut slots) = results.lock() {
                     slots[index] = Some(result);
                 }
             });
         }
+        while !progress.is_done() {
+            progress.render();
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        progress.render();
     });
+    progress.finish();
 
     let results = results
         .into_inner()
@@ -675,6 +695,104 @@ fn prefetch_downloads(
         }
     }
     Ok(mirrors)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_signatures_parallel(
+    resolved: &[(Repository, RepoEntry, bool)],
+    mirrors: &[Option<String>],
+    installed: &HashMap<String, String>,
+    needed: bool,
+    arch: &str,
+    cache_dir: &Path,
+    keyring_path: &Path,
+    default_sig_level: SigLevel,
+    parallel: u32,
+) -> Result<Vec<Option<Result<(), String>>>> {
+    struct Job {
+        index: usize,
+        name: String,
+        repo: String,
+        dest: PathBuf,
+        sig_urls: Vec<String>,
+        sig_level: SigLevel,
+    }
+
+    let mut jobs = Vec::new();
+    for (index, (repo, entry, _)) in resolved.iter().enumerate() {
+        if needed
+            && installed
+                .get(&entry.name)
+                .is_some_and(|current| Version::parse(current) == Version::parse(&entry.version))
+        {
+            continue;
+        }
+        let Some(mirror) = mirrors[index].clone() else {
+            continue;
+        };
+        let dest = cache_dir.join(entry.resolved_filename(arch));
+        let sig_level = repo.sig_level.unwrap_or(default_sig_level);
+        let mut sig_urls: Vec<String> = package_download_candidates(repo, arch, entry)
+            .into_iter()
+            .map(|url| format!("{url}.sig"))
+            .collect();
+        sig_urls.retain(|url| url != &format!("{mirror}.sig"));
+        sig_urls.insert(0, format!("{mirror}.sig"));
+        jobs.push(Job {
+            index,
+            name: entry.name.clone(),
+            repo: repo.name.clone(),
+            dest,
+            sig_urls,
+            sig_level,
+        });
+    }
+
+    let results: Mutex<Vec<Option<Result<(), String>>>> =
+        Mutex::new((0..resolved.len()).map(|_| None).collect());
+    if jobs.is_empty() {
+        return Ok(results
+            .into_inner()
+            .unwrap_or_else(|poison| poison.into_inner()));
+    }
+
+    let workers = (parallel.max(1) as usize).min(jobs.len());
+    println!(
+        ":: Verifying package signatures ({} package(s), {} worker(s))...",
+        jobs.len(),
+        workers
+    );
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let job_index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(job) = jobs.get(job_index) else {
+                    break;
+                };
+                let result = verify_remote_signature_any(
+                    &job.dest,
+                    &job.sig_urls,
+                    job.sig_level,
+                    keyring_path,
+                    1,
+                )
+                .map_err(|err| err.to_string());
+                if let Ok(mut slots) = results.lock() {
+                    slots[job.index] = Some(result.map_err(|err| {
+                        format!(
+                            "signature verification failed for '{}' from repo '{}': {err}",
+                            job.name, job.repo
+                        )
+                    }));
+                }
+            });
+        }
+    });
+
+    Ok(results
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner()))
 }
 
 fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) -> Result<()> {
@@ -861,6 +979,18 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         cache_dir,
         config.options.parallel_downloads,
     )?;
+    let keyring_path = config.options.keyring_path();
+    let verification = verify_signatures_parallel(
+        &resolved,
+        &mirrors,
+        &installed_versions,
+        args.needed,
+        &arch,
+        cache_dir,
+        &keyring_path,
+        config.options.sig_level,
+        config.options.parallel_downloads,
+    )?;
 
     // Phase 1a: local package files (already "downloaded")
     for spec in &local_files {
@@ -974,22 +1104,9 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             )
         })?;
 
-        let sig_level = repo.sig_level.unwrap_or(config.options.sig_level);
-        let keyring_path = config.options.keyring_path();
-        let mut sig_urls: Vec<String> = package_download_candidates(repo, &arch, entry)
-            .into_iter()
-            .map(|url| format!("{url}.sig"))
-            .collect();
-        sig_urls.retain(|url| url != &format!("{mirror}.sig"));
-        sig_urls.insert(0, format!("{mirror}.sig"));
-        verify_remote_signature_any(&dest, &sig_urls, sig_level, &keyring_path, 3).with_context(
-            || {
-                format!(
-                    "signature verification failed for '{}' from repo '{}'",
-                    pkg_name, repo.name
-                )
-            },
-        )?;
+        if let Some(Some(Err(err))) = verification.get(index) {
+            anyhow::bail!("{err}");
+        }
 
         if let Some(sum) = entry.sha256sum.as_deref() {
             verify_sha256(&dest, sum)?;

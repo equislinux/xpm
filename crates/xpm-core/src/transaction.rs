@@ -7,7 +7,7 @@
 //! Transactions are atomic where possible and logged for auditing.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -325,13 +325,10 @@ impl Transaction {
             ));
         }
 
-        let show_progress = io::stdout().is_terminal();
         let total = self.operations.len();
 
         for (index, op) in self.operations.clone().into_iter().enumerate() {
-            if show_progress {
-                print_operation_progress(index + 1, total, &op);
-            }
+            print_operation_progress(index + 1, total, &op);
 
             match op {
                 TransactionOp::Install {
@@ -532,17 +529,17 @@ fn print_operation_progress(index: usize, total: usize, op: &TransactionOp) {
             pkg_version,
             ..
         } => {
-            println!("({index}/{total}) installing {pkg_name} {pkg_version}");
+            eprintln!("({index}/{total}) installing {pkg_name} {pkg_version}");
         }
         TransactionOp::Upgrade {
             pkg_name,
             new_version,
             ..
         } => {
-            println!("({index}/{total}) upgrading {pkg_name} {new_version}");
+            eprintln!("({index}/{total}) upgrading {pkg_name} {new_version}");
         }
         TransactionOp::Remove { pkg_name } => {
-            println!("({index}/{total}) removing {pkg_name}");
+            eprintln!("({index}/{total}) removing {pkg_name}");
         }
     }
 }

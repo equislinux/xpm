@@ -1,5 +1,9 @@
 //! Shared terminal progress rendering helpers.
 
+use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+
 const MIB: f64 = 1024.0 * 1024.0;
 
 /// Percentage of `downloaded` relative to `total`, clamped to 0..=100.
@@ -11,6 +15,83 @@ pub(crate) fn percentage(downloaded: u64, total: u64) -> u64 {
     }
 
     downloaded.saturating_mul(100).div_euclid(total).min(100)
+}
+
+/// Aggregate progress for a pool of concurrent package downloads.
+///
+/// Workers only update atomics; the calling thread renders one stable line.
+/// This avoids workers fighting over the terminal while keeping progress
+/// visible for every parallel download.
+pub struct ParallelDownloadProgress {
+    enabled: bool,
+    total_jobs: usize,
+    completed: AtomicUsize,
+    downloaded: AtomicU64,
+    total: AtomicU64,
+    last_len: Mutex<usize>,
+}
+
+impl ParallelDownloadProgress {
+    pub fn new(total_jobs: usize) -> Self {
+        Self {
+            enabled: io::stderr().is_terminal(),
+            total_jobs,
+            completed: AtomicUsize::new(0),
+            downloaded: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            last_len: Mutex::new(0),
+        }
+    }
+
+    pub fn add_total(&self, bytes: u64) {
+        self.total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn add_downloaded(&self, bytes: u64) {
+        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn complete_job(&self) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.completed.load(Ordering::Relaxed) >= self.total_jobs
+    }
+
+    pub fn render(&self) {
+        if !self.enabled {
+            return;
+        }
+        let downloaded = self.downloaded.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        let completed = self.completed.load(Ordering::Relaxed);
+        let style = ProgressStyle::for_download();
+        let mut line = format_progress_with(&style, "Downloading packages", downloaded, total);
+        line.push_str(&format!("  ({completed}/{})", self.total_jobs));
+
+        let mut last_len = match self.last_len.lock() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+        let width = line.chars().count();
+        let mut stderr = io::stderr();
+        let _ = write!(stderr, "\r{line}");
+        if *last_len > width {
+            let _ = write!(stderr, "{:width$}", "", width = *last_len - width);
+        }
+        let _ = stderr.flush();
+        *last_len = width;
+    }
+
+    pub fn finish(&self) {
+        if !self.enabled {
+            return;
+        }
+        let mut stderr = io::stderr();
+        let _ = writeln!(stderr);
+        let _ = stderr.flush();
+    }
 }
 
 /// Render an ASCII progress bar such as `xxxxxxxxxx----------`.
@@ -152,6 +233,18 @@ mod tests {
             line,
             "pkg.tar.zst [xxxxxxxxxx----------]  50%  13.0/26.0 MiB"
         );
+    }
+
+    #[test]
+    fn parallel_progress_aggregates_bytes_and_completed_jobs() {
+        let progress = ParallelDownloadProgress::new(2);
+        progress.add_total(300);
+        progress.add_downloaded(100);
+        progress.complete_job();
+        assert!(!progress.is_done());
+        progress.add_downloaded(200);
+        progress.complete_job();
+        assert!(progress.is_done());
     }
 
     #[test]

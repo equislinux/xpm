@@ -3,10 +3,11 @@
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::config::{Repository, SigLevel};
-use crate::progress::{format_mib, percentage};
+use crate::progress::{format_mib, percentage, ParallelDownloadProgress};
 use crate::repo_db::RepoEntry;
 use crate::signing::{verify_file, VerifyOutcome};
 use crate::{XpmError, XpmResult};
@@ -55,7 +56,7 @@ pub fn sync_repo_databases(
         let db_url = format!("{base}/{}.db", repo.name);
         let db_sig_url = format!("{db_url}.sig");
 
-        match download_with_retries(&db_url, &db_temp, retries, true) {
+        match download_with_retries(&db_url, &db_temp, retries, true, None) {
             Ok(()) => {
                 if let Err(err) =
                     verify_remote_signature(&db_temp, &db_sig_url, sig_level, keyring_path, retries)
@@ -71,6 +72,7 @@ pub fn sync_repo_databases(
                     &files_temp,
                     retries,
                     true,
+                    None,
                 ) {
                     Ok(()) => {
                         let files_sig_url = format!("{files_url}.sig");
@@ -143,10 +145,30 @@ pub fn verify_remote_signature_any(
         );
     }
     let mut last_error = None;
-    for sig_url in sig_urls {
-        match verify_remote_signature(artifact_path, sig_url, sig_level, keyring_path, retries) {
+    let mut unique = Vec::new();
+    for url in sig_urls {
+        if !unique.contains(url) {
+            unique.push(url.clone());
+        }
+    }
+    for sig_url in &unique {
+        match verify_remote_signature(
+            artifact_path,
+            sig_url,
+            sig_level,
+            keyring_path,
+            retries.min(1),
+        ) {
             Ok(()) => return Ok(()),
-            Err(err) => last_error = Some(err),
+            Err(err) => {
+                tracing::warn!(
+                    artifact = %artifact_path.display(),
+                    sig_url,
+                    error = %err,
+                    "signature candidate failed; trying next mirror"
+                );
+                last_error = Some(err);
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| XpmError::SignatureError("no signature URL".into())))
@@ -165,7 +187,7 @@ pub fn verify_remote_signature(
 
     let sig_dest = signature_cache_path(artifact_path);
 
-    if let Err(err) = download_with_retries(sig_url, &sig_dest, retries, true) {
+    if let Err(err) = download_with_retries(sig_url, &sig_dest, retries, true, None) {
         if sig_level == SigLevel::Required {
             return Err(XpmError::SignatureError(format!(
                 "signature required but could not be downloaded from {sig_url}: {err}"
@@ -265,7 +287,7 @@ pub fn package_download_candidates(
 
 /// Download from the first working URL to `dest`.
 pub fn download_first_available(urls: &[String], dest: &Path, retries: u32) -> XpmResult<String> {
-    download_first_available_with_progress(urls, dest, retries, true)
+    download_first_available_with_progress(urls, dest, retries, true, None)
 }
 
 /// Like [`download_first_available`] but without terminal progress updates.
@@ -276,7 +298,18 @@ pub fn download_first_available_quiet(
     dest: &Path,
     retries: u32,
 ) -> XpmResult<String> {
-    download_first_available_with_progress(urls, dest, retries, false)
+    download_first_available_with_progress(urls, dest, retries, false, None)
+}
+
+/// Like [`download_first_available_quiet`] but reports aggregate progress to
+/// the shared parallel download tracker.
+pub fn download_first_available_tracked(
+    urls: &[String],
+    dest: &Path,
+    retries: u32,
+    progress: &ParallelDownloadProgress,
+) -> XpmResult<String> {
+    download_first_available_with_progress(urls, dest, retries, false, Some(progress))
 }
 
 fn download_first_available_with_progress(
@@ -284,11 +317,15 @@ fn download_first_available_with_progress(
     dest: &Path,
     retries: u32,
     show_progress: bool,
+    progress: Option<&ParallelDownloadProgress>,
 ) -> XpmResult<String> {
     let mut last_error: Option<XpmError> = None;
 
+    let _ = retries;
     for url in urls {
-        match download_with_retries(url, dest, retries, show_progress) {
+        // One attempt per mirror: the next candidate is the retry. Repeating a
+        // dead/timing-out mirror delays failover and stalls the worker pool.
+        match download_with_retries(url, dest, 1, show_progress, progress) {
             Ok(()) => return Ok(url.clone()),
             Err(err) => last_error = Some(err),
         }
@@ -326,15 +363,19 @@ fn download_with_retries(
     dest: &Path,
     retries: u32,
     show_progress: bool,
+    progress: Option<&ParallelDownloadProgress>,
 ) -> XpmResult<()> {
     let attempts = retries.max(1);
     let mut last_error: Option<XpmError> = None;
 
     for attempt in 1..=attempts {
-        match download_once(url, dest, show_progress) {
+        match download_once(url, dest, show_progress, progress) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 tracing::warn!(url, attempt, attempts, error = %err, "download attempt failed");
+                if non_retryable(&err) {
+                    return Err(err);
+                }
                 last_error = Some(err);
             }
         }
@@ -343,19 +384,44 @@ fn download_with_retries(
     Err(last_error.unwrap_or_else(|| XpmError::Database(format!("download failed: {url}"))))
 }
 
-fn download_once(url: &str, dest: &Path, show_progress: bool) -> XpmResult<()> {
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .pool_max_idle_per_host(32)
+            .tcp_nodelay(true)
+            .user_agent("xpm/0.1")
+            .build()
+            .expect("failed to build shared HTTP client")
+    })
+}
+
+fn non_retryable(err: &XpmError) -> bool {
+    let text = err.to_string();
+    if text.contains("429 Too Many Requests") || text.contains("408 Request Timeout") {
+        return false;
+    }
+    text.contains("HTTP status client error (400")
+        || text.contains("HTTP status client error (401")
+        || text.contains("HTTP status client error (403")
+        || text.contains("HTTP status client error (404")
+        || text.contains("HTTP status client error (410")
+}
+
+fn download_once(
+    url: &str,
+    dest: &Path,
+    show_progress: bool,
+    tracker: Option<&ParallelDownloadProgress>,
+) -> XpmResult<()> {
     if let Some(path) = local_file_path(url) {
         tracing::debug!(url, source = %path.display(), "syncing database from local file mirror");
-        return copy_local_file(&path, dest);
+        return copy_local_file(&path, dest, tracker);
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|e| XpmError::Database(format!("http client init failed: {e}")))?;
-
-    let mut response = client
+    let mut response = http_client()
         .get(url)
         .send()
         .and_then(|r| r.error_for_status())
@@ -366,6 +432,9 @@ fn download_once(url: &str, dest: &Path, show_progress: bool) -> XpmResult<()> {
     }
 
     let total = response.content_length();
+    if let (Some(total), Some(tracker)) = (total, tracker) {
+        tracker.add_total(total);
+    }
     let temp_path = dest.with_extension("part");
     let mut file = fs::File::create(&temp_path)?;
     let mut downloaded: u64 = 0;
@@ -384,6 +453,9 @@ fn download_once(url: &str, dest: &Path, show_progress: bool) -> XpmResult<()> {
 
         file.write_all(&buffer[..n])?;
         downloaded += n as u64;
+        if let Some(tracker) = tracker {
+            tracker.add_downloaded(n as u64);
+        }
 
         if let Some(total) = total {
             let percent = percentage(downloaded, total);
@@ -483,8 +555,16 @@ fn local_file_path(url: &str) -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
-fn copy_local_file(source: &Path, dest: &Path) -> XpmResult<()> {
+fn copy_local_file(
+    source: &Path,
+    dest: &Path,
+    progress: Option<&ParallelDownloadProgress>,
+) -> XpmResult<()> {
     let data = fs::read(source)?;
+    if let Some(progress) = progress {
+        progress.add_total(data.len() as u64);
+        progress.add_downloaded(data.len() as u64);
+    }
     write_atomically(dest, &data)?;
 
     if io::stderr().is_terminal() {
@@ -652,6 +732,24 @@ mod tests {
 
         let msg = format!("{err}");
         assert!(msg.contains("signature verification failed"));
+    }
+
+    #[test]
+    fn package_failover_uses_next_mirror_after_a_missing_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mirror = temp.path().join("mirror");
+        fs::create_dir_all(&mirror).expect("create mirror dir");
+        let package = mirror.join("demo-1.0-1-x86_64.pkg.tar.zst");
+        fs::write(&package, b"payload").expect("write package");
+
+        let missing = format!("file://{}", temp.path().join("missing.pkg").display());
+        let good = format!("file://{}", package.display());
+        let dest = temp.path().join("downloaded.pkg");
+
+        let selected = download_first_available(&[missing, good.clone()], &dest, 3)
+            .expect("second mirror should be used");
+        assert_eq!(selected, good);
+        assert_eq!(fs::read(dest).unwrap(), b"payload");
     }
 
     #[test]
