@@ -216,7 +216,7 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         }
         tracing::info!(chroot = %root.display(), "creating clean build chroot");
         let status = root_command("pacstrap")
-            .args(["-c", "-C", "/etc/pacman.conf"])
+            .args(["-C", "/etc/pacman.conf"])
             .arg(&root)
             .arg("base-devel")
             .status()
