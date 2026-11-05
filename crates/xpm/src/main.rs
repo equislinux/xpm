@@ -39,7 +39,7 @@ use xpm_core::repo::RepoManager;
 use xpm_core::repo_db::{merge_files_db, parse_sync_db_cached, RepoEntry};
 use xpm_core::repo_sync::{
     download_first_available, download_first_available_quiet, package_download_candidates,
-    sync_repo_databases, verify_remote_signature, verify_sha256,
+    sync_repo_databases, verify_remote_signature, verify_remote_signature_any, verify_sha256,
 };
 use xpm_core::resolver::{
     assume_installed_candidates, resolve_closure, resolve_closure_with_installed, DepConstraint,
@@ -976,8 +976,13 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
         let sig_level = repo.sig_level.unwrap_or(config.options.sig_level);
         let keyring_path = config.options.keyring_path();
-        let sig_url = format!("{mirror}.sig");
-        verify_remote_signature(&dest, &sig_url, sig_level, &keyring_path, 3).with_context(
+        let mut sig_urls: Vec<String> = package_download_candidates(repo, &arch, entry)
+            .into_iter()
+            .map(|url| format!("{url}.sig"))
+            .collect();
+        sig_urls.retain(|url| url != &format!("{mirror}.sig"));
+        sig_urls.insert(0, format!("{mirror}.sig"));
+        verify_remote_signature_any(&dest, &sig_urls, sig_level, &keyring_path, 3).with_context(
             || {
                 format!(
                     "signature verification failed for '{}' from repo '{}'",

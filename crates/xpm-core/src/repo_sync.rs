@@ -124,6 +124,34 @@ pub fn sync_repo_databases(
     }))
 }
 
+/// Try the detached signature from each candidate mirror until one verifies.
+/// A mirror can return a package while serving an empty/broken `.sig`.
+pub fn verify_remote_signature_any(
+    artifact_path: &Path,
+    sig_urls: &[String],
+    sig_level: SigLevel,
+    keyring_path: &Path,
+    retries: u32,
+) -> XpmResult<()> {
+    if sig_level == SigLevel::Never || sig_urls.is_empty() {
+        return verify_remote_signature(
+            artifact_path,
+            sig_urls.first().map(String::as_str).unwrap_or(""),
+            sig_level,
+            keyring_path,
+            retries,
+        );
+    }
+    let mut last_error = None;
+    for sig_url in sig_urls {
+        match verify_remote_signature(artifact_path, sig_url, sig_level, keyring_path, retries) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| XpmError::SignatureError("no signature URL".into())))
+}
+
 pub fn verify_remote_signature(
     artifact_path: &Path,
     sig_url: &str,
