@@ -27,9 +27,12 @@ pub fn verify_file(
 ) -> XpmResult<VerifyOutcome> {
     let mut gpg = std::process::Command::new("gpg");
     gpg.args(["--batch", "--no-tty"]);
-    let keyring_home = keyring_path
-        .parent()
-        .filter(|dir| dir.join("pubring.gpg").is_file());
+    let keyring_home = keyring_path.parent().filter(|dir| {
+        // Arch migrated the pacman keyring from pubring.gpg to pubring.kbx.
+        // Both are keyring homes: forcing --keyring bypasses keyboxd and can
+        // hide keys that pacman itself trusts.
+        dir.join("pubring.gpg").is_file() || dir.join("pubring.kbx").is_file()
+    });
     if let Some(home) = keyring_home {
         gpg.arg("--homedir").arg(home);
     } else {
