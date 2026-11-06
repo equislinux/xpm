@@ -230,6 +230,7 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
                 status.code()
             )));
         }
+        ensure_chroot_mountpoints(&root)?;
         let setup = format!(
             "useradd -m -u {build_uid} -s /bin/bash build 2>/dev/null || true; \
              printf '%s ALL=(ALL) NOPASSWD: ALL\\n' build > /etc/sudoers.d/build; \
@@ -287,6 +288,8 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
             status.code()
         )));
     }
+
+    ensure_chroot_mountpoints(&work)?;
 
     // The chroot copy is root-owned. Install the shim and xpm with the same
     // privilege used to create it, not as the invoking xpm-aur user.
@@ -564,6 +567,22 @@ fn effective_uid() -> u32 {
     std::fs::metadata("/proc/self")
         .map(|metadata| metadata.uid())
         .unwrap_or(0)
+}
+
+fn ensure_chroot_mountpoints(root: &Path) -> BuildResult<()> {
+    for dir in ["proc", "sys", "dev", "run", "tmp"] {
+        let status = root_command("mkdir")
+            .args(["-p"])
+            .arg(root.join(dir))
+            .status()
+            .map_err(|err| BuildError::Command(format!("mkdir {}: {err}", dir)))?;
+        if !status.success() {
+            return Err(BuildError::Command(format!(
+                "could not create chroot mountpoint {dir}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn root_command(program: &str) -> std::process::Command {
