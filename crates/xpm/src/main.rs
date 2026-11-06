@@ -210,6 +210,7 @@ fn main() -> Result<()> {
         Command::Sync(args) => cmd_sync(&config, args),
         Command::Install(args) => cmd_install(&config, args, cli.no_confirm),
         Command::Build(args) => cmd_build(&config, args, cli.no_confirm),
+        Command::Bootstrap(args) => cmd_bootstrap(&config, args),
         Command::Remove(args) => cmd_remove(&config, args, cli.no_confirm),
         Command::Upgrade(args) => cmd_upgrade(&config, args, cli.no_confirm),
         Command::Query(args) => cmd_query(&config, args),
@@ -519,6 +520,71 @@ struct InstalledRecord {
     groups: Vec<String>,
     reason: InstallReason,
     pkg_file: PathBuf,
+}
+
+fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
+    let root = config.options.root_dir.clone();
+    if root == Path::new("/") {
+        anyhow::bail!("xpm bootstrap: pass an empty target with --root DIR");
+    }
+    fs::create_dir_all(root.join("var/lib/xpm"))
+        .with_context(|| format!("failed to create {}", root.join("var/lib/xpm").display()))?;
+
+    let mut boot = config.clone();
+    boot.options.root_dir = root.clone();
+    boot.options.db_path = root.join("var/lib/xpm");
+    boot.options.cache_dir = root.join("var/cache/xpm/pkg");
+    boot.options.log_file = root.join("var/log/xpm.log");
+    boot.options.pacman_db = None;
+    boot.options.mirror_pacman = false;
+    boot.options.shell_integration = false;
+    if Path::new("/etc/pacman.d/gnupg").is_dir() {
+        // Verify against the host keyring; the new root has no keyring yet.
+        boot.options.gpg_dir = PathBuf::from("/etc/pacman.d/gnupg");
+    }
+
+    println!(
+        ":: Bootstrapping {} with xpm (no pacman/pacstrap)",
+        root.display()
+    );
+    cmd_sync(&boot, &cli::SyncArgs { force: true })?;
+
+    let base = cli::InstallArgs {
+        packages: vec!["filesystem".to_string(), "bash".to_string()],
+        download_only: false,
+        as_deps: false,
+        as_explicit: false,
+        no_optional: false,
+        needed: false,
+        print: false,
+        overwrite: Vec::new(),
+        ignore_groups: Vec::new(),
+        assume_installed: Vec::new(),
+    };
+    boot.options.scriptlet_mode = xpm_core::hooks::ScriptletMode::Skip;
+    cmd_install(&boot, &base, true)?;
+
+    let packages = if args.packages.is_empty() {
+        vec!["base-devel".to_string()]
+    } else {
+        args.packages.clone()
+    };
+    let install = cli::InstallArgs {
+        packages,
+        download_only: false,
+        as_deps: false,
+        as_explicit: false,
+        no_optional: false,
+        needed: false,
+        print: false,
+        overwrite: Vec::new(),
+        ignore_groups: Vec::new(),
+        assume_installed: Vec::new(),
+    };
+    boot.options.scriptlet_mode = xpm_core::hooks::ScriptletMode::Auto;
+    cmd_install(&boot, &install, true)?;
+    println!(":: Bootstrap complete: {}", root.display());
+    Ok(())
 }
 
 fn cmd_build(config: &XpmConfig, args: &cli::BuildArgs, no_confirm: bool) -> Result<()> {

@@ -214,16 +214,18 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
                 root.display()
             )));
         }
-        tracing::info!(chroot = %root.display(), "creating clean build chroot");
-        let status = root_command("pacstrap")
-            .args(["-C", "/etc/pacman.conf"])
+        tracing::info!(chroot = %root.display(), "creating clean build chroot with xpm");
+        // Do not use pacstrap: xpm can bootstrap its own empty root from the
+        // same signed repositories and keyring.
+        let status = root_command("xpm")
+            .args(["--no-confirm", "--no-pacman-mirror", "--root"])
             .arg(&root)
-            .arg("base-devel")
+            .args(["bootstrap", "base-devel"])
             .status()
-            .map_err(|err| BuildError::Command(format!("pacstrap: {err}")))?;
+            .map_err(|err| BuildError::Command(format!("xpm bootstrap: {err}")))?;
         if !status.success() {
             return Err(BuildError::Command(format!(
-                "pacstrap exited with status {:?}",
+                "xpm bootstrap exited with status {:?}",
                 status.code()
             )));
         }

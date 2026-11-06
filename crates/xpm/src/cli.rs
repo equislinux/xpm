@@ -85,6 +85,10 @@ pub enum Command {
     /// Build a source package with makepkg and collect its artifacts.
     Build(BuildArgs),
 
+    /// Bootstrap an empty root with xpm, without pacman or pacstrap.
+    #[command(name = "bootstrap")]
+    Bootstrap(BootstrapArgs),
+
     /// Remove one or more packages [-R].
     #[command(visible_alias = "R")]
     Remove(RemoveArgs),
@@ -208,6 +212,13 @@ pub struct InstallArgs {
     /// Assume package=version is installed for dependency resolution.
     #[arg(long = "assume-installed", value_name = "PKG=VER")]
     pub assume_installed: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct BootstrapArgs {
+    /// Packages to install after filesystem and bash (default: base-devel).
+    #[arg(value_name = "PACKAGE")]
+    pub packages: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
