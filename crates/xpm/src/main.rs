@@ -583,6 +583,61 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     };
     boot.options.scriptlet_mode = xpm_core::hooks::ScriptletMode::Auto;
     cmd_install(&boot, &install, true)?;
+
+    // Copy only the public/trust material from the host pacman keyring. The
+    // chroot's xpm needs it for official build dependencies; private keys are
+    // deliberately never copied.
+    let host_gpg = Path::new("/etc/pacman.d/gnupg");
+    if host_gpg.is_dir() {
+        let target_gpg = root.join("etc/pacman.d/gnupg");
+        fs::create_dir_all(&target_gpg)?;
+        for name in [
+            "pubring.gpg",
+            "pubring.kbx",
+            "trustdb.gpg",
+            "gpg.conf",
+            "common.conf",
+        ] {
+            let source = host_gpg.join(name);
+            if source.is_file() {
+                fs::copy(&source, target_gpg.join(name))
+                    .with_context(|| format!("failed to copy keyring file {}", source.display()))?;
+            }
+        }
+    }
+
+    // Make the new root self-contained for xpm itself: tools inside the
+    // chroot (including the makepkg pacman shim) must not fall back to a
+    // repo-less /etc/pacman.conf.
+    let mut conf = String::from("[options]\n");
+    conf.push_str("root_dir = \"/\"\n");
+    conf.push_str("db_path = \"/var/lib/xpm\"\n");
+    conf.push_str("cache_dir = \"/var/cache/xpm/pkg\"\n");
+    conf.push_str("log_file = \"/var/log/xpm.log\"\n");
+    conf.push_str("gpg_dir = \"/etc/pacman.d/gnupg\"\n");
+    conf.push_str("shell_integration = false\n");
+    conf.push_str("mirror_pacman = false\n");
+    conf.push_str(&format!(
+        "parallel_downloads = {}\n",
+        boot.options.parallel_downloads.max(1)
+    ));
+    conf.push_str("sig_level = \"optional\"\n");
+    for repo in &boot.repositories {
+        conf.push_str("\n[[repo]]\n");
+        conf.push_str(&format!("name = \"{}\"\n", repo.name));
+        conf.push_str("server = [\n");
+        for server in &repo.server {
+            conf.push_str(&format!("  \"{}\",\n", server));
+        }
+        conf.push_str("]\n");
+    }
+    let conf_path = root.join("etc/xpm.conf");
+    if let Some(parent) = conf_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&conf_path, conf)
+        .with_context(|| format!("failed to write {}", conf_path.display()))?;
+
     println!(":: Bootstrap complete: {}", root.display());
     Ok(())
 }

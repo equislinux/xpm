@@ -416,6 +416,7 @@ fn parse_long_option(args: &[OsString], index: usize, flags: &mut Flags) -> Opti
                 None
             }
         }
+        "--noprogressbar" => Some(index + 1),
         "--noconfirm" | "--no-confirm" => {
             require_no_inline_value(inline_value)?;
             flags.no_confirm = true;

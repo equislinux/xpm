@@ -24,9 +24,13 @@ pub struct Cli {
     #[arg(long, short, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Suppress confirmation prompts.
-    #[arg(long, global = true)]
+    /// Suppress confirmation prompts (pacman-compatible alias: --noconfirm).
+    #[arg(long, global = true, alias = "noconfirm")]
     pub no_confirm: bool,
+
+    /// Accepted for pacman/makepkg compatibility; xpm has no progress bar.
+    #[arg(long, global = true, hide = true)]
+    pub noprogressbar: bool,
 
     /// Set an alternative installation root.
     #[arg(long, short = 'r', global = true, value_name = "PATH")]
