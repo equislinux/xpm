@@ -23,7 +23,7 @@ keeping a compatibility layer for the ecosystem that still expects pacman.
 - [x] Make `xpm build --chroot` use xpm bootstrap instead of `pacstrap`.
 - [ ] Replace `pacman -U /preinstall/*` with xpm local-package install.
 - [ ] Cache/reuse the bootstrap root; avoid creating base-devel per AUR base.
-- [ ] Test a clean root build with no pacman binary in PATH.
+- [ ] Test a clean root build with no pacman binary in PATH; the last test hit a full test VM disk while copying base-devel.
 - [ ] Remove the remaining makepkg pacman call seen while generating `.BUILDINFO`.
 
 ## P1 — AUR build dependencies without pacman
@@ -41,7 +41,7 @@ while generating `.BUILDINFO`; that is the next concrete blocker.
 
 ## P2 — Make and package-manager compatibility
 
-- [ ] Provide an optional `xpm-pacman-compat` package/shim for `/usr/bin/pacman`.
+- [x] Add a minimal `pacman` shim for makepkg (`-Qi`, `-Qq`, `-T`, `-S`, `-U`, `-R`); validate against a clean build.
 - [ ] Cover the commands used by makepkg and common AUR scripts (`-Q`, `-T`,
       `-Qq`, `-Qm`, `-U`, `-S`, `-R`, `-Sy`, `-Syu`, `--version`).
 - [ ] Keep pacman's local DB and keyring readable/writable for interoperability.

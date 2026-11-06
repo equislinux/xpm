@@ -5,6 +5,8 @@
 //! produced. It never calls pacman and never installs anything; xpm decides what
 //! to do with the artifacts.
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -234,11 +236,34 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
              printf '%s ALL=(ALL) NOPASSWD: ALL\\n' build > /etc/sudoers.d/build; \
              chmod 440 /etc/sudoers.d/build"
         );
+        // arch-chroot warns and can misbehave when the root is not a mountpoint.
+        let bound = !root_command("mountpoint")
+            .arg("-q")
+            .arg(&root)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if bound {
+            let status = root_command("mount")
+                .args(["--bind"])
+                .arg(&root)
+                .arg(&root)
+                .status()
+                .map_err(|err| BuildError::Command(format!("bind chroot root: {err}")))?;
+            if !status.success() {
+                return Err(BuildError::Command(
+                    "could not bind-mount chroot root".into(),
+                ));
+            }
+        }
         let status = root_command("arch-chroot")
             .arg(&root)
             .args(["bash", "-lc", &setup])
             .status()
             .map_err(|err| BuildError::Command(format!("arch-chroot: {err}")))?;
+        if bound {
+            let _ = root_command("umount").arg(&root).status();
+        }
         if !status.success() {
             return Err(BuildError::Command(format!(
                 "chroot user setup exited with status {:?}",
@@ -250,6 +275,21 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
     let work = options
         .chroot_dir
         .join(format!("work-{}", std::process::id()));
+    // Provide a pacman-compatible command for makepkg that delegates to xpm.
+    let local_bin = work.join("usr/local/bin");
+    fs::create_dir_all(&local_bin)
+        .map_err(|err| BuildError::Command(format!("create chroot shim dir: {err}")))?;
+    fs::write(local_bin.join("pacman"), include_str!("pacman-shim.sh"))
+        .map_err(|err| BuildError::Command(format!("write pacman shim: {err}")))?;
+    fs::set_permissions(local_bin.join("pacman"), fs::Permissions::from_mode(0o755))
+        .map_err(|err| BuildError::Command(format!("chmod pacman shim: {err}")))?;
+    let current_xpm = std::env::current_exe()
+        .map_err(|err| BuildError::Command(format!("current xpm: {err}")))?;
+    fs::copy(&current_xpm, local_bin.join("xpm"))
+        .map_err(|err| BuildError::Command(format!("copy xpm into chroot: {err}")))?;
+    fs::set_permissions(local_bin.join("xpm"), fs::Permissions::from_mode(0o755))
+        .map_err(|err| BuildError::Command(format!("chmod xpm shim: {err}")))?;
+
     let _ = std::fs::remove_dir_all(&work);
     let status = root_command("cp")
         .args(["-a", "--reflink=auto"])
@@ -389,7 +429,7 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
         makepkg.push(' ');
         makepkg.push_str(&shell_quote(arg));
     }
-    let command = format!("env -u LDFLAGS -u CFLAGS -u CXXFLAGS PKGDEST=/pkgdest {makepkg}");
+    let command = format!("env -u LDFLAGS -u CFLAGS -u CXXFLAGS PACMAN=/usr/local/bin/pacman PKGDEST=/pkgdest {makepkg}");
     tracing::info!(chroot = %options.chroot_dir.display(), "building in clean chroot");
     let status = root_command("arch-chroot")
         .arg(&work)
