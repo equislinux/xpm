@@ -21,9 +21,10 @@ keeping a compatibility layer for the ecosystem that still expects pacman.
 - [x] Bootstrap an empty root with xpm: sync, filesystem, bash, then the rest.
 - [x] Use the host pacman keyring only for verification; never run pacman.
 - [x] Make `xpm build --chroot` use xpm bootstrap instead of `pacstrap`.
-- [ ] Replace `pacman -U /preinstall/*` with xpm local-package install.
+- [x] Replace `pacman -U /preinstall/*` with xpm local-package install.
 - [ ] Cache/reuse the bootstrap root; avoid creating base-devel per AUR base.
-- [ ] Test a clean root build with no pacman binary in PATH; the last test hit a full test VM disk while copying base-devel.
+- [ ] Test a clean root build with no pacman binary in PATH and as a non-root xpm-aur user.
+- [x] Fix shim installation permissions for non-root builds; the shim/xpm are installed into the root-owned chroot copy with sudo.
 - [ ] Remove the remaining makepkg pacman call seen while generating `.BUILDINFO`.
 
 ## P1 — AUR build dependencies without pacman

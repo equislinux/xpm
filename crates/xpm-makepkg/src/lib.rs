@@ -6,7 +6,6 @@
 //! to do with the artifacts.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -275,22 +274,7 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
     let work = options
         .chroot_dir
         .join(format!("work-{}", std::process::id()));
-    // Provide a pacman-compatible command for makepkg that delegates to xpm.
-    let local_bin = work.join("usr/local/bin");
-    fs::create_dir_all(&local_bin)
-        .map_err(|err| BuildError::Command(format!("create chroot shim dir: {err}")))?;
-    fs::write(local_bin.join("pacman"), include_str!("pacman-shim.sh"))
-        .map_err(|err| BuildError::Command(format!("write pacman shim: {err}")))?;
-    fs::set_permissions(local_bin.join("pacman"), fs::Permissions::from_mode(0o755))
-        .map_err(|err| BuildError::Command(format!("chmod pacman shim: {err}")))?;
-    let current_xpm = std::env::current_exe()
-        .map_err(|err| BuildError::Command(format!("current xpm: {err}")))?;
-    fs::copy(&current_xpm, local_bin.join("xpm"))
-        .map_err(|err| BuildError::Command(format!("copy xpm into chroot: {err}")))?;
-    fs::set_permissions(local_bin.join("xpm"), fs::Permissions::from_mode(0o755))
-        .map_err(|err| BuildError::Command(format!("chmod xpm shim: {err}")))?;
-
-    let _ = std::fs::remove_dir_all(&work);
+    let _ = root_command("rm").args(["-rf"]).arg(&work).status();
     let status = root_command("cp")
         .args(["-a", "--reflink=auto"])
         .arg(&root)
@@ -302,6 +286,36 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
             "chroot copy exited with status {:?}",
             status.code()
         )));
+    }
+
+    // The chroot copy is root-owned. Install the shim and xpm with the same
+    // privilege used to create it, not as the invoking xpm-aur user.
+    let shim_source =
+        std::env::temp_dir().join(format!("xpm-pacman-shim-{}.sh", std::process::id()));
+    fs::write(&shim_source, include_str!("pacman-shim.sh"))
+        .map_err(|err| BuildError::Command(format!("write temporary pacman shim: {err}")))?;
+    let status = root_command("install")
+        .args(["-Dm755"])
+        .arg(&shim_source)
+        .arg(work.join("usr/local/bin/pacman"))
+        .status()
+        .map_err(|err| BuildError::Command(format!("install pacman shim: {err}")))?;
+    let _ = fs::remove_file(&shim_source);
+    if !status.success() {
+        return Err(BuildError::Command("could not install pacman shim".into()));
+    }
+    let current_xpm = std::env::current_exe()
+        .map_err(|err| BuildError::Command(format!("current xpm: {err}")))?;
+    let status = root_command("install")
+        .args(["-Dm755"])
+        .arg(&current_xpm)
+        .arg(work.join("usr/local/bin/xpm"))
+        .status()
+        .map_err(|err| BuildError::Command(format!("install xpm into chroot: {err}")))?;
+    if !status.success() {
+        return Err(BuildError::Command(
+            "could not install xpm into chroot".into(),
+        ));
     }
 
     // pacman inside the fresh root needs a real package cache directory;
@@ -409,7 +423,7 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
             .args([
                 "bash",
                 "-lc",
-                "pacman -U --noconfirm /preinstall/*.pkg.tar.zst",
+                "/usr/local/bin/xpm --no-confirm install /preinstall/*.pkg.tar.zst",
             ])
             .status()
             .map_err(|err| BuildError::Command(format!("preinstall pacman: {err}")))?;
@@ -463,9 +477,8 @@ fn build_chroot(source_dir: &Path, options: &BuildOptions) -> BuildResult<BuildA
                 .status();
         }
     }
-    let _ = root_command("umount").arg(&work).status();
-    let cleanup = root_command("rm").args(["-rf"]).arg(&work).status();
-    let _ = cleanup;
+    let _ = root_command("umount").args(["-R"]).arg(&work).status();
+    let _ = root_command("rm").args(["-rf"]).arg(&work).status();
     if !status.success() {
         return Err(BuildError::Command(format!(
             "clean chroot build exited with status {:?}",
