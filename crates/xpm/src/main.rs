@@ -945,6 +945,28 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         .iter()
         .partition(|spec| Path::new(spec.as_str()).is_file());
 
+    // Local packages still need their dependencies resolved from the sync DB.
+    // This is what lets a preinstalled AUR package pull its official deps.
+    let mut local_names = HashSet::new();
+    let mut local_deps = Vec::new();
+    let mut local_metadata = Vec::new();
+    for spec in &local_files {
+        let path = Path::new(spec.as_str());
+        let metadata = read_metadata(path)
+            .with_context(|| format!("failed to read metadata from {}", path.display()))?;
+        local_names.insert(metadata.meta.name.clone());
+        local_deps.extend(metadata.meta.depends.iter().cloned());
+        local_metadata.push((path.to_path_buf(), metadata));
+    }
+    let mut dependency_specs: Vec<String> =
+        package_names.iter().map(|name| (*name).clone()).collect();
+    for dep in local_deps {
+        let dep_name = DepConstraint::parse(&dep).name;
+        if !local_names.contains(&dep_name) && !dependency_specs.contains(&dep) {
+            dependency_specs.push(dep);
+        }
+    }
+
     println!(
         ":: Resolving dependencies for: {}",
         args.packages.join(", ")
@@ -965,7 +987,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
     // ── Resolve repository packages (if any) ────────────────────────
     let mut resolved: Vec<(Repository, RepoEntry, bool)> = Vec::new();
-    if !package_names.is_empty() {
+    if !dependency_specs.is_empty() {
         let mut candidates = Vec::new();
         let mut sync_entries: Vec<(Repository, RepoEntry)> = Vec::new();
         for repo in &config.repositories {
@@ -1006,9 +1028,9 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             .collect();
 
         let mut expanded_names = Vec::new();
-        for name in &package_names {
+        for name in &dependency_specs {
             if name.contains('/') {
-                expanded_names.push((*name).clone());
+                expanded_names.push(name.clone());
                 continue;
             }
             match group_index.resolve_target(name, &package_name_set, &provider_set) {
@@ -1133,10 +1155,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     )?;
 
     // Phase 1a: local package files (already "downloaded")
-    for spec in &local_files {
-        let path = Path::new(spec.as_str());
-        let metadata = read_metadata(path)
-            .with_context(|| format!("failed to read metadata from {}", path.display()))?;
+    for (path, metadata) in &local_metadata {
+        let path = path.as_path();
         let pkg_name = metadata.meta.name.clone();
         if pkg_name.is_empty() {
             anyhow::bail!("package file {} has no pkgname", path.display());
