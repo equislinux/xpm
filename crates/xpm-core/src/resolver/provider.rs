@@ -98,7 +98,7 @@ impl DependencyProvider for XpmProvider {
         inverse: bool,
     ) -> Vec<SolvableId> {
         let entry = self.pool.version_set(version_set);
-        candidates
+        let mut selected: Vec<SolvableId> = candidates
             .iter()
             .copied()
             .filter(|&sid| {
@@ -114,7 +114,23 @@ impl DependencyProvider for XpmProvider {
                     matches
                 }
             })
-            .collect()
+            .collect();
+
+        // ALPM precedence: a literal package name wins over packages that only
+        // satisfy the requirement through `provides`. Only apply this to the
+        // matching side (requirements); conflict/constraint filtering must
+        // still consider every provider.
+        if !inverse {
+            let target = self.pool.name_str(entry.name_id);
+            if selected
+                .iter()
+                .any(|&sid| self.pool.candidate(sid).name == target)
+            {
+                selected.retain(|&sid| self.pool.candidate(sid).name == target);
+            }
+        }
+
+        selected
     }
 
     async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
@@ -135,12 +151,21 @@ impl DependencyProvider for XpmProvider {
     async fn sort_candidates(&self, _solver: &SolverCache<Self>, solvables: &mut [SolvableId]) {
         // Highest version first. On equal versions, prefer repository
         // candidates over installed ones so an explicit request can reinstall
-        // from the repository; dependencies still use `favored`.
+        // from the repository; dependencies still use `favored`. Remaining
+        // ties follow repository priority (first repository in the config)
+        // and then package name, which makes provider selection deterministic.
         solvables.sort_by(|&a, &b| {
-            let va = &self.pool.candidate(a).version;
-            let vb = &self.pool.candidate(b).version;
-            vb.cmp(va)
+            let ca = self.pool.candidate(a);
+            let cb = self.pool.candidate(b);
+            cb.version
+                .cmp(&ca.version)
                 .then_with(|| self.pool.is_installed(a).cmp(&self.pool.is_installed(b)))
+                .then_with(|| {
+                    self.pool
+                        .repo_rank(ca.repo.as_deref())
+                        .cmp(&self.pool.repo_rank(cb.repo.as_deref()))
+                })
+                .then_with(|| ca.name.cmp(&cb.name))
         });
     }
 

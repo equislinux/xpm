@@ -49,9 +49,11 @@ pub fn assume_installed_candidates(specs: &[String]) -> XpmResult<Vec<PackageCan
         candidates.push(PackageCandidate {
             name: name.to_string(),
             version: Version::parse(version),
+            repo: None,
             depends: Vec::new(),
             conflicts: Vec::new(),
             provides: Vec::new(),
+            replaces: Vec::new(),
             optdepends: Vec::new(),
         });
     }

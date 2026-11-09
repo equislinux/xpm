@@ -16,9 +16,11 @@ fn simple(name: &str, ver: &str) -> PackageCandidate {
     PackageCandidate {
         name: name.to_string(),
         version: Version::parse(ver),
+        repo: None,
         depends: vec![],
         conflicts: vec![],
         provides: vec![],
+        replaces: vec![],
         optdepends: vec![],
     }
 }
@@ -28,9 +30,11 @@ fn with_deps(name: &str, ver: &str, deps: &[&str]) -> PackageCandidate {
     PackageCandidate {
         name: name.to_string(),
         version: Version::parse(ver),
+        repo: None,
         depends: deps.iter().map(|d| DepConstraint::parse(d)).collect(),
         conflicts: vec![],
         provides: vec![],
+        replaces: vec![],
         optdepends: vec![],
     }
 }
@@ -45,9 +49,11 @@ fn with_deps_and_conflicts(
     PackageCandidate {
         name: name.to_string(),
         version: Version::parse(ver),
+        repo: None,
         depends: deps.iter().map(|d| DepConstraint::parse(d)).collect(),
         conflicts: conflicts.iter().map(|c| DepConstraint::parse(c)).collect(),
         provides: vec![],
+        replaces: vec![],
         optdepends: vec![],
     }
 }
@@ -371,6 +377,7 @@ fn assume_installed_candidates_parse_and_satisfy_dependencies() {
     let requirements = vec![super::plan::Requirement {
         name: "app".to_string(),
         version: None,
+        repo: None,
     }];
     let plan = resolve_closure_with_installed(candidates, assumed, &requirements)
         .expect("the assumed package satisfies the dependency");

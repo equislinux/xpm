@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
@@ -544,9 +544,4 @@ fn ignoregroup_skips_sysupgrade_packages() {
 
     let version = fs::read_to_string(fixture.local_db().join("kernel/version")).expect("version");
     assert_eq!(version.trim(), "1.0-1");
-}
-
-#[allow(dead_code)]
-fn _path_exists(path: &Path) -> bool {
-    path.exists()
 }
