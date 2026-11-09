@@ -147,7 +147,6 @@ pub struct Transaction {
     state: TransactionState,
     lock: Option<FileLock>,
     log_file: PathBuf,
-    #[allow(dead_code)]
     root_dir: PathBuf,
     local_db_dir: PathBuf,
     rollback_counter: usize,

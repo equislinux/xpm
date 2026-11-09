@@ -19,12 +19,16 @@ pub struct PackageCandidate {
     pub name: String,
     /// Package version.
     pub version: Version,
+    /// Repository the candidate comes from (`None` for installed packages).
+    pub repo: Option<String>,
     /// Run-time dependencies (ALPM `depend` entries).
     pub depends: Vec<DepConstraint>,
     /// Packages that conflict with this one.
     pub conflicts: Vec<DepConstraint>,
     /// Virtual packages provided by this candidate (ALPM `provides`).
     pub provides: Vec<DepConstraint>,
+    /// Packages replaced by this candidate (ALPM `replaces`).
+    pub replaces: Vec<DepConstraint>,
     /// Optional dependencies.
     pub optdepends: Vec<String>,
 }
@@ -80,6 +84,8 @@ pub struct PackagePool {
     pub(crate) favored: HashMap<NameId, SolvableId>,
     /// Solvables that represent already-installed packages.
     pub(crate) installed: HashSet<SolvableId>,
+    /// Repository name → priority (first candidate insertion order).
+    pub(crate) repo_ranks: HashMap<String, usize>,
 
     // ── Version sets ─────────────────────────────────────────
     /// VersionSetId → entry
@@ -106,6 +112,7 @@ impl PackagePool {
             name_to_solvables: HashMap::new(),
             favored: HashMap::new(),
             installed: HashSet::new(),
+            repo_ranks: HashMap::new(),
             version_sets: Vec::new(),
             version_set_unions: Vec::new(),
             strings: Vec::new(),
@@ -156,6 +163,10 @@ impl PackagePool {
     ///
     /// Returns the assigned `SolvableId`.
     pub fn add_candidate(&mut self, candidate: PackageCandidate) -> SolvableId {
+        if let Some(repo) = &candidate.repo {
+            let next_rank = self.repo_ranks.len();
+            self.repo_ranks.entry(repo.clone()).or_insert(next_rank);
+        }
         let name_id = self.intern_name(&candidate.name);
         let solvable_id = SolvableId::from_usize(self.solvables.len());
         self.solvables.push(candidate);
@@ -195,6 +206,13 @@ impl PackagePool {
     /// Preferred (installed) candidate for a name, if any.
     pub fn favored_for(&self, name_id: NameId) -> Option<SolvableId> {
         self.favored.get(&name_id).copied()
+    }
+
+    /// Priority of a repository, assigned by first candidate insertion order.
+    /// Candidates without a repository (installed packages) rank last.
+    pub fn repo_rank(&self, repo: Option<&str>) -> usize {
+        repo.and_then(|name| self.repo_ranks.get(name).copied())
+            .unwrap_or(usize::MAX)
     }
 
     /// Register a candidate under the names of the virtual packages it
@@ -303,9 +321,11 @@ mod tests {
         let sid = pool.add_candidate(PackageCandidate {
             name: "bash".to_string(),
             version: Version::parse("5.2-1"),
+            repo: None,
             depends: vec![],
             conflicts: vec![],
             provides: vec![],
+            replaces: vec![],
             optdepends: vec![],
         });
 
@@ -320,17 +340,21 @@ mod tests {
         let _s1 = pool.add_candidate(PackageCandidate {
             name: "bash".to_string(),
             version: Version::parse("5.1-1"),
+            repo: None,
             depends: vec![],
             conflicts: vec![],
             provides: vec![],
+            replaces: vec![],
             optdepends: vec![],
         });
         let _s2 = pool.add_candidate(PackageCandidate {
             name: "bash".to_string(),
             version: Version::parse("5.2-1"),
+            repo: None,
             depends: vec![],
             conflicts: vec![],
             provides: vec![],
+            replaces: vec![],
             optdepends: vec![],
         });
 

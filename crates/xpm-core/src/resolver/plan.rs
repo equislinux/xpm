@@ -15,32 +15,59 @@ use crate::resolver::provider::XpmProvider;
 use crate::resolver::types::{PackageCandidate, PackagePool};
 use crate::resolver::version::Version;
 
-/// A requested package: name plus an optional exact version (`name=version`).
+/// A requested package: name plus an optional exact version (`name=version`)
+/// and optional repository qualifier (`repo/name`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requirement {
     /// Requested package name (may be a virtual name provided by a package).
     pub name: String,
     /// Exact version when the request used `name=version`.
     pub version: Option<Version>,
+    /// Repository name when the request used `repo/name`.
+    pub repo: Option<String>,
 }
 
 impl Requirement {
-    /// Parse a CLI requirement: `foo` means any version, `foo=1.2-1` pins one.
+    /// Parse a CLI requirement:
+    ///
+    /// - `foo` means any version from any repository.
+    /// - `foo=1.2-1` pins one version.
+    /// - `extra/foo` restricts the request to a repository.
+    /// - `extra/foo=1.2-1` combines both.
     pub fn parse(spec: &str) -> XpmResult<Self> {
-        match spec.split_once('=') {
-            Some((name, version)) if !name.is_empty() && !version.is_empty() => Ok(Self {
-                name: name.to_string(),
-                version: Some(Version::parse(version)),
-            }),
-            Some(_) => Err(XpmError::Package(format!(
-                "invalid package requirement '{spec}' (expected name or name=version)"
-            ))),
-            None if !spec.is_empty() => Ok(Self {
-                name: spec.to_string(),
-                version: None,
-            }),
-            None => Err(XpmError::Package("empty package name".to_string())),
+        let (target, version) = match spec.split_once('=') {
+            Some((name, version)) if !name.is_empty() && !version.is_empty() => {
+                (name, Some(Version::parse(version)))
+            }
+            Some(_) => {
+                return Err(XpmError::Package(format!(
+                    "invalid package requirement '{spec}' (expected name, name=version, repo/name or repo/name=version)"
+                )));
+            }
+            None => (spec, None),
+        };
+
+        if target.is_empty() {
+            return Err(XpmError::Package("empty package name".to_string()));
         }
+
+        let (repo, name) = match target.split_once('/') {
+            Some((repo, name)) => {
+                if repo.is_empty() || name.is_empty() || name.contains('/') {
+                    return Err(XpmError::Package(format!(
+                        "invalid package requirement '{spec}' (expected repo/name)"
+                    )));
+                }
+                (Some(repo.to_string()), name.to_string())
+            }
+            None => (None, target.to_string()),
+        };
+
+        Ok(Self {
+            name,
+            version,
+            repo,
+        })
     }
 
     fn constraint(&self) -> DepConstraint {
@@ -55,6 +82,18 @@ impl Requirement {
                 op: None,
                 version: None,
             },
+        }
+    }
+
+    /// Human-readable requirement, including repository and version.
+    pub fn display(&self) -> String {
+        let base = match &self.repo {
+            Some(repo) => format!("{repo}/{}", self.name),
+            None => self.name.clone(),
+        };
+        match &self.version {
+            Some(version) => format!("{base}={version}"),
+            None => base,
         }
     }
 }
@@ -99,16 +138,88 @@ pub fn resolve_closure_with_installed(
 
     let explicit_names: HashSet<&str> = requirements.iter().map(|req| req.name.as_str()).collect();
 
+    // Repository-qualified requests (`repo/name`) restrict both the literal
+    // package and its repository. Providers are not considered for these
+    // requests: the user explicitly asked for a package in that repository.
+    // When the same name is also requested unqualified, the restriction is
+    // dropped for that name.
+    let mut repo_scoped: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut unscoped_names: HashSet<&str> = HashSet::new();
+    for requirement in requirements {
+        match requirement.repo.as_deref() {
+            Some(repo) => {
+                repo_scoped
+                    .entry(requirement.name.as_str())
+                    .or_default()
+                    .insert(repo);
+            }
+            None => {
+                unscoped_names.insert(requirement.name.as_str());
+            }
+        }
+    }
+    let repo_only: HashMap<&str, &HashSet<&str>> = repo_scoped
+        .iter()
+        .filter(|(name, _)| !unscoped_names.contains(*name))
+        .map(|(name, repos)| (*name, repos))
+        .collect();
+
+    for requirement in requirements.iter().filter(|req| req.repo.is_some()) {
+        let repo = requirement.repo.as_deref().unwrap_or_default();
+        let constraint = requirement.constraint();
+        let found = candidates.iter().any(|candidate| {
+            candidate.name == requirement.name
+                && candidate.repo.as_deref() == Some(repo)
+                && constraint.matches(&candidate.version)
+        });
+        if !found {
+            return Err(XpmError::PackageNotFound {
+                name: requirement.display(),
+            });
+        }
+    }
+
+    // Exclude candidates that conflict with an installed package. The solver
+    // does not model packages that remain installed but are not part of the
+    // solution, so this check has to happen before it runs. Explicitly
+    // requested names are skipped: the caller asked to replace/upgrade them,
+    // and the final dependency check will still report real conflicts.
+    let mut blocked: Vec<(PackageCandidate, String, DepConstraint)> = Vec::new();
+    let mut usable_candidates = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        match conflict_with_installed(&candidate, &installed, &explicit_names) {
+            Some((installed_name, conflict)) => {
+                blocked.push((candidate, installed_name, conflict));
+            }
+            None => usable_candidates.push(candidate),
+        }
+    }
+    let candidates = usable_candidates;
+
     let mut pool = PackagePool::new();
     for candidate in &candidates {
+        if let Some(repos) = repo_only.get(candidate.name.as_str()) {
+            if !candidate
+                .repo
+                .as_deref()
+                .is_some_and(|repo| repos.contains(repo))
+            {
+                continue;
+            }
+        }
         let solvable = pool.add_candidate(candidate.clone());
-        let provides = candidate.provides.clone();
+        let provides = filtered_provides(candidate, &repo_only);
         pool.add_provides(solvable, &provides);
     }
 
     for candidate in &installed {
+        // An installed package cannot satisfy `repo/name`; force the
+        // repository candidate so the request keeps its meaning.
+        if repo_only.contains_key(candidate.name.as_str()) {
+            continue;
+        }
         let solvable = pool.add_candidate(candidate.clone());
-        let provides = candidate.provides.clone();
+        let provides = filtered_provides(candidate, &repo_only);
         pool.add_provides(solvable, &provides);
         pool.mark_installed(solvable);
 
@@ -140,16 +251,25 @@ pub fn resolve_closure_with_installed(
     let mut requirement_ids = Vec::new();
     for requirement in requirements {
         let constraint = requirement.constraint();
-        let satisfiable = candidates.iter().chain(installed.iter()).any(|candidate| {
-            candidate.name == constraint.name
-                || candidate
-                    .provides
-                    .iter()
-                    .any(|provide| provide.name == constraint.name)
-        });
+        let satisfiable = candidates
+            .iter()
+            .chain(installed.iter())
+            .any(|candidate| requirement_satisfied_by(candidate, requirement));
         if !satisfiable {
+            if let Some((candidate, installed_name, conflict)) = blocked
+                .iter()
+                .find(|(candidate, _, _)| requirement_satisfied_by(candidate, requirement))
+            {
+                return Err(XpmError::DependencyConflict(format!(
+                    "cannot install {}: {} conflicts with installed package {} ('{}')",
+                    requirement.display(),
+                    candidate.name,
+                    installed_name,
+                    conflict
+                )));
+            }
             return Err(XpmError::PackageNotFound {
-                name: constraint.name.clone(),
+                name: requirement.display(),
             });
         }
         let name_id = pool.intern_name(&constraint.name);
@@ -172,6 +292,8 @@ pub fn resolve_closure_with_installed(
 
     let solved: Vec<usize> = solution.iter().map(|sid| sid.to_usize()).collect();
     let solved_set: HashSet<usize> = solved.iter().copied().collect();
+
+    check_solution_conflicts(&solved, &solved_set, &snapshot, &installed_indexes)?;
 
     // Index the solution by package name and by the virtual names provided.
     let mut by_name: HashMap<&str, usize> = HashMap::new();
@@ -208,6 +330,143 @@ pub fn resolve_closure_with_installed(
             (candidate, explicit, is_installed)
         })
         .collect())
+}
+
+/// Provides to register for a candidate, excluding names requested as
+/// `repo/name` (those must resolve to the literal package in that repository).
+fn filtered_provides(
+    candidate: &PackageCandidate,
+    repo_only: &HashMap<&str, &HashSet<&str>>,
+) -> Vec<DepConstraint> {
+    candidate
+        .provides
+        .iter()
+        .filter(|provide| !repo_only.contains_key(provide.name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Whether `candidate` satisfies a CLI requirement (name/provides, version and
+/// repository qualifier).
+fn requirement_satisfied_by(candidate: &PackageCandidate, requirement: &Requirement) -> bool {
+    let constraint = requirement.constraint();
+    match requirement.repo.as_deref() {
+        Some(repo) => {
+            candidate.repo.as_deref() == Some(repo)
+                && candidate.name == requirement.name
+                && constraint.matches(&candidate.version)
+        }
+        None => package_satisfies(candidate, &constraint),
+    }
+}
+
+/// ALPM `depcmp`: package name first, then `provides`. A versioned dependency
+/// only accepts a versioned provision whose version satisfies the constraint.
+fn package_satisfies(candidate: &PackageCandidate, dependency: &DepConstraint) -> bool {
+    if candidate.name == dependency.name && dependency.matches(&candidate.version) {
+        return true;
+    }
+
+    candidate.provides.iter().any(|provide| {
+        if provide.name != dependency.name {
+            return false;
+        }
+        match &dependency.version {
+            None => true,
+            Some(_) => provide
+                .version
+                .as_ref()
+                .is_some_and(|version| dependency.matches(version)),
+        }
+    })
+}
+
+/// Return the first installed package that `candidate` conflicts with, unless
+/// the installed package is explicitly requested in the same transaction or
+/// is replaced by the candidate.
+fn conflict_with_installed(
+    candidate: &PackageCandidate,
+    installed: &[PackageCandidate],
+    explicit_names: &HashSet<&str>,
+) -> Option<(String, DepConstraint)> {
+    for package in installed {
+        if package.name == candidate.name
+            || explicit_names.contains(package.name.as_str())
+            || candidate
+                .replaces
+                .iter()
+                .any(|replaces| package_satisfies(package, replaces))
+        {
+            continue;
+        }
+        if let Some(conflict) = candidate
+            .conflicts
+            .iter()
+            .find(|conflict| package_satisfies(package, conflict))
+        {
+            return Some((package.name.clone(), conflict.clone()));
+        }
+    }
+    None
+}
+
+/// Reject solutions where two packages that will be installed conflict with
+/// each other, or where a new package conflicts with a package that stays
+/// installed. Self-conflicting `provides`/`conflicts` pairs (e.g. systemd and
+/// udev) are skipped because ALPM excludes a package from its own conflict.
+fn check_solution_conflicts(
+    solved: &[usize],
+    solved_set: &HashSet<usize>,
+    snapshot: &[PackageCandidate],
+    installed_indexes: &HashSet<usize>,
+) -> XpmResult<()> {
+    for &index in solved {
+        if installed_indexes.contains(&index) {
+            continue;
+        }
+        let candidate = &snapshot[index];
+
+        for &other_index in solved {
+            if other_index == index {
+                continue;
+            }
+            let other = &snapshot[other_index];
+            if other.name == candidate.name {
+                continue;
+            }
+            if let Some(conflict) = candidate
+                .conflicts
+                .iter()
+                .find(|conflict| package_satisfies(other, conflict))
+            {
+                return Err(XpmError::DependencyConflict(format!(
+                    "installing {} conflicts with {} ('{}')",
+                    candidate.name, other.name, conflict
+                )));
+            }
+        }
+
+        for (other_index, other) in snapshot.iter().enumerate() {
+            if !installed_indexes.contains(&other_index)
+                || solved_set.contains(&other_index)
+                || other.name == candidate.name
+            {
+                continue;
+            }
+            if let Some(conflict) = candidate
+                .conflicts
+                .iter()
+                .find(|conflict| package_satisfies(other, conflict))
+            {
+                return Err(XpmError::DependencyConflict(format!(
+                    "installing {} conflicts with installed package {} ('{}')",
+                    candidate.name, other.name, conflict
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn intern_once(pool: &mut PackagePool, constraint: &DepConstraint, negated: bool) {
@@ -266,9 +525,11 @@ mod tests {
         PackageCandidate {
             name: name.to_string(),
             version: Version::parse(version),
+            repo: None,
             depends: deps.iter().map(|d| DepConstraint::parse(d)).collect(),
             conflicts: vec![],
             provides: provides.iter().map(|p| DepConstraint::parse(p)).collect(),
+            replaces: vec![],
             optdepends: vec![],
         }
     }
@@ -531,5 +792,181 @@ mod tests {
             Err(XpmError::Package(_))
         ));
         assert!(Requirement::parse("foo=1.0").is_ok());
+    }
+
+    #[test]
+    fn requirement_parser_accepts_repo_qualified_specs() {
+        let req = Requirement::parse("extra/power-profiles-daemon").unwrap();
+        assert_eq!(req.repo.as_deref(), Some("extra"));
+        assert_eq!(req.name, "power-profiles-daemon");
+        assert!(req.version.is_none());
+
+        let pinned = Requirement::parse("extra/power-profiles-daemon=0.30-1").unwrap();
+        assert_eq!(pinned.repo.as_deref(), Some("extra"));
+        assert_eq!(pinned.name, "power-profiles-daemon");
+        assert_eq!(pinned.version, Some(Version::parse("0.30-1")));
+
+        assert!(matches!(
+            Requirement::parse("extra/"),
+            Err(XpmError::Package(_))
+        ));
+        assert!(matches!(
+            Requirement::parse("/foo"),
+            Err(XpmError::Package(_))
+        ));
+    }
+
+    #[test]
+    fn exact_name_beats_provider() {
+        // power-profiles-daemon (real) vs tuned-ppd (provides it).
+        let candidates = vec![
+            candidate("power-profiles-daemon", "0.30-1", &[], &[]),
+            candidate("tuned-ppd", "2.28.0-1", &[], &["power-profiles-daemon"]),
+            candidate("tuned", "2.28.0-1", &[], &[]),
+        ];
+        let requests = vec![Requirement::parse("power-profiles-daemon").unwrap()];
+
+        let plan = resolve_closure(candidates, &requests).unwrap();
+        let names = plan_names(&plan);
+        assert_eq!(names, vec!["power-profiles-daemon=0.30-1"]);
+    }
+
+    #[test]
+    fn pinned_exact_name_beats_versioned_provider() {
+        let candidates = vec![
+            candidate("power-profiles-daemon", "0.30-1", &[], &[]),
+            candidate(
+                "tuned-ppd",
+                "2.28.0-1",
+                &[],
+                &["power-profiles-daemon=0.30-1"],
+            ),
+        ];
+        let requests = vec![Requirement::parse("power-profiles-daemon=0.30-1").unwrap()];
+
+        let plan = resolve_closure(candidates, &requests).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.name, "power-profiles-daemon");
+    }
+
+    #[test]
+    fn exact_name_beats_installed_provider() {
+        let candidates = vec![candidate("power-profiles-daemon", "0.30-1", &[], &[])];
+        let installed = vec![candidate(
+            "tuned-ppd",
+            "2.28.0-1",
+            &[],
+            &["power-profiles-daemon"],
+        )];
+        let requests = vec![Requirement::parse("power-profiles-daemon").unwrap()];
+
+        let plan = resolve_closure_with_installed(candidates, installed, &requests).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.name, "power-profiles-daemon");
+        assert!(!plan[0].2, "the repository package must be installed");
+    }
+
+    #[test]
+    fn provider_is_used_when_no_exact_name_exists() {
+        let candidates = vec![
+            candidate("provider-a", "1.0-1", &[], &["virtual"]),
+            candidate("provider-b", "2.0-1", &[], &["virtual"]),
+        ];
+        let requests = vec![Requirement::parse("virtual").unwrap()];
+
+        let plan = resolve_closure(candidates, &requests).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.name, "provider-b");
+        assert!(plan[0].1, "the provider is the explicit target");
+    }
+
+    #[test]
+    fn repo_qualified_request_selects_the_named_repo() {
+        let mut core = candidate("foo", "1.0-1", &[], &[]);
+        core.repo = Some("core".to_string());
+        let mut extra = candidate("foo", "1.0-1", &[], &[]);
+        extra.repo = Some("extra".to_string());
+
+        let requests = vec![Requirement::parse("extra/foo").unwrap()];
+        let plan = resolve_closure(vec![core, extra], &requests).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.repo.as_deref(), Some("extra"));
+    }
+
+    #[test]
+    fn repo_qualified_request_does_not_accept_providers() {
+        let mut provider = candidate("tuned-ppd", "2.28.0-1", &[], &["power-profiles-daemon"]);
+        provider.repo = Some("extra".to_string());
+
+        let requests = vec![Requirement::parse("extra/power-profiles-daemon").unwrap()];
+        let error = resolve_closure(vec![provider], &requests).unwrap_err();
+        assert!(matches!(error, XpmError::PackageNotFound { .. }));
+    }
+
+    #[test]
+    fn provider_conflicting_with_installed_is_not_selected() {
+        let mut conflicting = candidate("tuned-ppd", "2.28.0-1", &[], &["ppd-api"]);
+        conflicting.conflicts = vec![DepConstraint::parse("power-profiles-daemon")];
+        let alternative = candidate("other-ppd", "1.0-1", &[], &["ppd-api"]);
+        let installed = vec![candidate("power-profiles-daemon", "0.30-1", &[], &[])];
+
+        let requests = vec![Requirement::parse("ppd-api").unwrap()];
+        let plan =
+            resolve_closure_with_installed(vec![conflicting, alternative], installed, &requests)
+                .unwrap();
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.name, "other-ppd");
+        assert!(!plan[0].2);
+    }
+
+    #[test]
+    fn blocked_requirement_reports_the_installed_conflict() {
+        let mut conflicting = candidate("tuned-ppd", "2.28.0-1", &[], &["power-profiles-daemon"]);
+        conflicting.conflicts = vec![DepConstraint::parse("power-profiles-daemon")];
+        let installed = vec![candidate("power-profiles-daemon", "0.30-1", &[], &[])];
+
+        let requests = vec![Requirement::parse("tuned-ppd").unwrap()];
+        let error =
+            resolve_closure_with_installed(vec![conflicting], installed, &requests).unwrap_err();
+        match error {
+            XpmError::DependencyConflict(message) => {
+                assert!(message.contains("power-profiles-daemon"), "{message}");
+                assert!(message.contains("conflicts"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_tie_break_prefers_repository_priority_then_name() {
+        let mut core = candidate("zzz-core-provider", "1.0-1", &[], &["virtual"]);
+        core.repo = Some("core".to_string());
+        let mut extra = candidate("aaa-extra-provider", "1.0-1", &[], &["virtual"]);
+        extra.repo = Some("extra".to_string());
+
+        // `core` is inserted first, so it has repository priority over `extra`
+        // even though the other provider sorts first by name.
+        let requests = vec![Requirement::parse("virtual").unwrap()];
+        let plan = resolve_closure(vec![core, extra], &requests).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.name, "zzz-core-provider");
+        assert_eq!(plan[0].0.repo.as_deref(), Some("core"));
+    }
+
+    #[test]
+    fn self_providing_conflict_between_targets_is_reported() {
+        // tuned-ppd provides and conflicts power-profiles-daemon; the resolver
+        // skips the self-conflict, so the post-solve check must catch the pair.
+        let mut tuned_ppd = candidate("tuned-ppd", "2.28.0-1", &[], &["power-profiles-daemon"]);
+        tuned_ppd.conflicts = vec![DepConstraint::parse("power-profiles-daemon")];
+        let ppd = candidate("power-profiles-daemon", "0.30-1", &[], &[]);
+
+        let requests = vec![
+            Requirement::parse("tuned-ppd").unwrap(),
+            Requirement::parse("power-profiles-daemon").unwrap(),
+        ];
+        let error = resolve_closure(vec![tuned_ppd, ppd], &requests).unwrap_err();
+        assert!(matches!(error, XpmError::DependencyConflict(_)));
     }
 }

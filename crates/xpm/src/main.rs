@@ -479,10 +479,11 @@ fn confirm_replace(old: &str, repo: &str, new: &str, no_confirm: bool) -> Result
 }
 
 /// Build a resolver candidate from a sync database entry.
-fn resolver_candidate(entry: &RepoEntry) -> PackageCandidate {
+fn resolver_candidate(repo: &str, entry: &RepoEntry) -> PackageCandidate {
     PackageCandidate {
         name: entry.name.clone(),
         version: Version::parse(&entry.version),
+        repo: Some(repo.to_string()),
         depends: entry
             .depends
             .iter()
@@ -497,6 +498,11 @@ fn resolver_candidate(entry: &RepoEntry) -> PackageCandidate {
             .provides
             .iter()
             .map(|p| DepConstraint::parse(p))
+            .collect(),
+        replaces: entry
+            .replaces
+            .iter()
+            .map(|r| DepConstraint::parse(r))
             .collect(),
         optdepends: entry.opt_depends.clone(),
     }
@@ -999,7 +1005,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
                 format!("failed to parse sync db {}", display_rel_or_abs(&db_path))
             })?;
             for entry in db.entries {
-                candidates.push(resolver_candidate(&entry));
+                candidates.push(resolver_candidate(&repo.name, &entry));
                 sync_entries.push((repo.clone(), entry));
             }
         }
@@ -1060,6 +1066,34 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
                 )
             })?;
 
+        // Record explicit requests that are satisfied through `provides` so
+        // the user sees the substitution in both --print and normal output.
+        let substitutions: Vec<(String, String, Version)> = requirements
+            .iter()
+            .filter(|requirement| {
+                !plan
+                    .iter()
+                    .any(|(candidate, _, _)| candidate.name == requirement.name)
+            })
+            .filter_map(|requirement| {
+                plan.iter()
+                    .find(|(candidate, explicit, _)| {
+                        *explicit
+                            && candidate
+                                .provides
+                                .iter()
+                                .any(|provide| provide.name == requirement.name)
+                    })
+                    .map(|(candidate, _, _)| {
+                        (
+                            requirement.display(),
+                            candidate.name.clone(),
+                            candidate.version.clone(),
+                        )
+                    })
+            })
+            .collect();
+
         let mut already_satisfied = 0usize;
         // Map solved candidates back to their repository entry (exact version).
         for (candidate, explicit, is_installed) in plan {
@@ -1076,9 +1110,13 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
             let selected = sync_entries
                 .iter()
-                .find(|(_, entry)| {
+                .find(|(repo, entry)| {
                     entry.name == candidate.name
                         && Version::parse(&entry.version) == candidate.version
+                        && candidate
+                            .repo
+                            .as_deref()
+                            .is_none_or(|selected_repo| repo.name == selected_repo)
                 })
                 .cloned();
             let Some((repo, entry)) = selected else {
@@ -1098,6 +1136,9 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             resolved.len() - explicit_count,
             already_satisfied
         );
+        for (requested, actual, version) in &substitutions {
+            println!("   requested {requested} -> {actual} {version} (provides)");
+        }
     }
 
     if args.print {
@@ -1657,14 +1698,25 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         .collect();
     planned_names.extend(replacement_new.keys().cloned());
     let mut candidates = Vec::new();
-    for (_, entry) in remote_latest.values() {
-        candidates.push(resolver_candidate(entry));
+    // Walk the databases in repository priority order so provider ranking is
+    // deterministic (HashMap iteration is not).
+    for (repo, entry) in &all_sync_entries {
+        let is_latest =
+            remote_latest
+                .get(&entry.name)
+                .is_some_and(|(latest_repo, latest_entry)| {
+                    latest_repo.name == repo.name && latest_entry.version == entry.version
+                });
+        if is_latest {
+            candidates.push(resolver_candidate(&repo.name, entry));
+        }
     }
     let requirements: Vec<Requirement> = planned_names
         .iter()
         .map(|name| Requirement {
             name: name.clone(),
             version: None,
+            repo: None,
         })
         .collect();
     let closure: Vec<(PackageCandidate, bool)> = if assumed.is_empty() {
@@ -2024,9 +2076,11 @@ fn load_installed_candidates(local_db_dir: &Path) -> Result<Vec<PackageCandidate
         candidates.push(PackageCandidate {
             name,
             version: Version::parse(&version),
+            repo: None,
             depends: Vec::new(),
             conflicts: Vec::new(),
             provides,
+            replaces: Vec::new(),
             optdepends: Vec::new(),
         });
     }
@@ -3807,20 +3861,25 @@ USAGE:
 
 DESCRIPTION:
     Install one or more packages from the synchronized databases.
-    Dependencies are not resolved automatically yet; install them explicitly.
+    Dependencies are resolved automatically, including virtual `provides`.
+    Use `name=version` or `repo/name` to disambiguate a target.
 
 ARGUMENTS:
-    <PACKAGES>      One or more package names to install
+    <PACKAGES>      Package names, name=version pins or repo/name qualifiers
 
 OPTIONS:
     -w, --download-only     Download packages without installing
+    -p, --print             Print the resolved plan without installing
     --as-deps               Mark as installed as a dependency
     --as-explicit           Mark as explicitly installed
+    --needed                Skip packages already installed at that version
     --no-optional           Skip optional dependencies
 
 EXAMPLES:
     xpm install firefox
     xpm install vim neovim tmux
+    xpm install power-profiles-daemon
+    xpm install extra/power-profiles-daemon
     xpm S -w linux linux-headers
     xpm install --as-deps libfoo
 "#

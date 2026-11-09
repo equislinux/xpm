@@ -177,7 +177,7 @@ pub struct SyncArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct InstallArgs {
-    /// Package names to install.
+    /// Package names to install (`name`, `name=version`, `repo/name`).
     #[arg(required = true)]
     pub packages: Vec<String>,
 
