@@ -9,11 +9,14 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::error::{XpmError, XpmResult};
 use crate::hooks::{HookChain, HookContext, OperationType, ScriptletMode};
-use crate::package::PackageMeta;
+use crate::package::{PackageMeta, PackageMetadata};
+use crate::progress::{self, Phase};
 
 /// A filesystem-based lock to prevent concurrent xpm operations.
 pub struct FileLock {
@@ -154,6 +157,7 @@ pub struct Transaction {
     shell_integration: bool,
     save_configs: bool,
     scriptlet_mode: ScriptletMode,
+    metadata_cache: std::collections::HashMap<PathBuf, Arc<PackageMetadata>>,
 }
 
 impl Transaction {
@@ -182,6 +186,7 @@ impl Transaction {
             shell_integration: false,
             save_configs: true,
             scriptlet_mode: ScriptletMode::Auto,
+            metadata_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -203,6 +208,13 @@ impl Transaction {
 
     pub fn set_scriptlet_mode(&mut self, mode: ScriptletMode) {
         self.scriptlet_mode = mode;
+    }
+
+    /// Cache the metadata parsed while building the install plan. The hooks
+    /// reuse it so each package archive is decompressed once for metadata and
+    /// once for extraction instead of once per metadata consumer.
+    pub fn cache_package_metadata(&mut self, pkg_file: PathBuf, metadata: Arc<PackageMetadata>) {
+        self.metadata_cache.insert(pkg_file, metadata);
     }
 
     /// Add an install operation to the transaction.
@@ -317,6 +329,12 @@ impl Transaction {
     }
 
     /// Execute the transaction: write changes to filesystem.
+    ///
+    /// Pure installs without `.INSTALL` scriptlets and without shell shims are
+    /// independent: their hook chains touch separate package directories and
+    /// files already checked for conflicts. They are extracted in parallel in
+    /// consecutive batches; upgrades, removals and scriptlet packages remain
+    /// strictly sequential to preserve lifecycle ordering.
     pub fn commit(&mut self) -> XpmResult<()> {
         if self.state != TransactionState::Prepared {
             return Err(XpmError::Package(
@@ -324,12 +342,41 @@ impl Transaction {
             ));
         }
 
-        let total = self.operations.len();
+        let operations = self.operations.clone();
+        let total = operations.len();
+        progress::begin(Phase::Extract, total);
 
-        for (index, op) in self.operations.clone().into_iter().enumerate() {
-            print_operation_progress(index + 1, total, &op);
+        let mut index = 0;
+        while index < total {
+            let op = &operations[index];
+            if self.fast_install_metadata(op).is_some() {
+                let mut batch = Vec::new();
+                while index < total {
+                    let candidate = &operations[index];
+                    let Some(metadata) = self.fast_install_metadata(candidate) else {
+                        break;
+                    };
+                    batch.push((candidate.clone(), metadata));
+                    index += 1;
+                }
+                self.commit_parallel_batch(&batch)?;
+                for (op, _) in &batch {
+                    if let TransactionOp::Install {
+                        pkg_name,
+                        pkg_version,
+                        ..
+                    } = op
+                    {
+                        self.write_version(pkg_name, pkg_version)?;
+                        self.log(&format!("installed {} {}", pkg_name, pkg_version))?;
+                    }
+                    progress::advance(Phase::Extract);
+                }
+                continue;
+            }
 
-            match op {
+            print_operation_progress(index + 1, total, op);
+            match op.clone() {
                 TransactionOp::Install {
                     pkg_name,
                     pkg_version,
@@ -351,11 +398,101 @@ impl Transaction {
                     self.execute_upgrade(&pkg_name, &old_version, &new_version, &new_pkg_file)?;
                 }
             }
+            progress::advance(Phase::Extract);
+            index += 1;
         }
+        progress::finish(Phase::Extract);
 
         self.state = TransactionState::Committed;
         self.log("committed")?;
 
+        Ok(())
+    }
+
+    /// Metadata for a pure install that can safely be extracted in parallel.
+    fn fast_install_metadata(&self, op: &TransactionOp) -> Option<Arc<PackageMetadata>> {
+        if self.shell_integration || self.hooks_chain.is_none() {
+            return None;
+        }
+        let TransactionOp::Install { pkg_file, .. } = op else {
+            return None;
+        };
+        let metadata = self.metadata_cache.get(pkg_file)?;
+        // Any .INSTALL scriptlet keeps the package on the sequential path:
+        // pre/post hooks and package order must remain observable.
+        if metadata.install_script.is_some() {
+            return None;
+        }
+        Some(metadata.clone())
+    }
+
+    /// Extract a batch of pure installs using all available cores (capped).
+    fn commit_parallel_batch(
+        &self,
+        batch: &[(TransactionOp, Arc<PackageMetadata>)],
+    ) -> XpmResult<()> {
+        let Some(hooks) = self.hooks_chain.as_ref() else {
+            return Err(XpmError::Transaction(
+                "parallel install batch requires a hook chain".to_string(),
+            ));
+        };
+        let workers = extraction_workers(batch.len());
+        if workers <= 1 {
+            for (op, metadata) in batch {
+                run_fast_install(self, hooks, op, metadata)?;
+            }
+            return Ok(());
+        }
+
+        let next = AtomicUsize::new(0);
+        let errors: Mutex<Option<String>> = Mutex::new(None);
+        let root_dir = self.root_dir.clone();
+        let local_db_dir = self.local_db_dir.clone();
+        let save_configs = self.save_configs;
+        let scriptlet_mode = self.scriptlet_mode;
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((op, metadata)) = batch.get(index) else {
+                        break;
+                    };
+                    let result = run_fast_install_parts(
+                        hooks,
+                        &root_dir,
+                        &local_db_dir,
+                        save_configs,
+                        scriptlet_mode,
+                        op,
+                        metadata,
+                    );
+                    if let Err(err) = result {
+                        if let Ok(mut slot) = errors.lock() {
+                            if slot.is_none() {
+                                *slot = Some(format!("{err}"));
+                            }
+                        }
+                        break;
+                    }
+                });
+            }
+        });
+
+        let errors = errors
+            .into_inner()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(err) = errors {
+            return Err(XpmError::Transaction(format!(
+                "parallel install failed: {err}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_version(&self, pkg_name: &str, pkg_version: &str) -> XpmResult<()> {
+        let db_entry = self.local_db_dir.join(pkg_name);
+        fs::create_dir_all(&db_entry)?;
+        fs::write(db_entry.join("version"), pkg_version)?;
         Ok(())
     }
 
@@ -387,6 +524,7 @@ impl Transaction {
                 save_configs: self.save_configs,
                 shell_integration: self.shell_integration,
                 scriptlet_mode: self.scriptlet_mode,
+                metadata: self.metadata_cache.get(pkg_file).cloned(),
             };
             hooks.run(&context)?;
         }
@@ -419,6 +557,7 @@ impl Transaction {
                 save_configs: self.save_configs,
                 shell_integration: self.shell_integration,
                 scriptlet_mode: self.scriptlet_mode,
+                metadata: None,
             };
             hooks.run(&context)?;
         }
@@ -459,6 +598,7 @@ impl Transaction {
                 save_configs: self.save_configs,
                 shell_integration: self.shell_integration,
                 scriptlet_mode: self.scriptlet_mode,
+                metadata: self.metadata_cache.get(new_pkg_file).cloned(),
             };
             hooks.run(&context)?;
         } else {
@@ -521,7 +661,77 @@ impl Transaction {
     }
 }
 
+fn extraction_workers(batch_len: usize) -> usize {
+    let env_workers = std::env::var("XPM_EXTRACT_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4);
+    env_workers
+        .unwrap_or_else(|| available.min(8))
+        .min(batch_len)
+        .max(1)
+}
+
+fn run_fast_install(
+    tx: &Transaction,
+    hooks: &HookChain,
+    op: &TransactionOp,
+    metadata: &Arc<PackageMetadata>,
+) -> XpmResult<()> {
+    run_fast_install_parts(
+        hooks,
+        &tx.root_dir,
+        &tx.local_db_dir,
+        tx.save_configs,
+        tx.scriptlet_mode,
+        op,
+        metadata,
+    )
+}
+
+fn run_fast_install_parts(
+    hooks: &HookChain,
+    root_dir: &Path,
+    local_db_dir: &Path,
+    save_configs: bool,
+    scriptlet_mode: ScriptletMode,
+    op: &TransactionOp,
+    metadata: &Arc<PackageMetadata>,
+) -> XpmResult<()> {
+    let TransactionOp::Install {
+        pkg_name,
+        pkg_version,
+        pkg_file,
+        ..
+    } = op
+    else {
+        return Err(XpmError::Transaction(
+            "parallel batch contains a non-install operation".to_string(),
+        ));
+    };
+    let context = HookContext {
+        operation_type: OperationType::Install,
+        pkg_name: pkg_name.clone(),
+        pkg_version: pkg_version.clone(),
+        old_version: None,
+        pkg_file: Some(pkg_file.clone()),
+        root_dir: root_dir.to_path_buf(),
+        local_db_dir: local_db_dir.to_path_buf(),
+        save_configs,
+        shell_integration: false,
+        scriptlet_mode,
+        metadata: Some(metadata.clone()),
+    };
+    hooks.run(&context)
+}
+
 fn print_operation_progress(index: usize, total: usize, op: &TransactionOp) {
+    if !progress::verbose() {
+        return;
+    }
     match op {
         TransactionOp::Install {
             pkg_name,
@@ -888,5 +1098,69 @@ mod tests {
 
         assert_eq!(tx.operation_count(), 1);
         assert_eq!(tx.state(), TransactionState::Committed);
+    }
+
+    fn make_named_package(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
+        let pkg_path = dir.join(format!("{name}-1.0-1-x86_64.xp"));
+        let mut raw_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw_tar);
+            let pkginfo = format!(
+                "pkgname = {name}\npkgver = 1.0-1\npkgdesc = {name}\narch = x86_64\nsize = {}\n",
+                content.len()
+            );
+            let mut header = tar::Header::new_gnu();
+            header.set_path(".PKGINFO").unwrap();
+            header.set_size(pkginfo.len() as u64);
+            header.set_mode(0o644);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append(&header, pkginfo.as_bytes()).unwrap();
+
+            let mut header = tar::Header::new_gnu();
+            header.set_path(format!("usr/bin/{name}")).unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append(&header, content).unwrap();
+            builder.finish().unwrap();
+        }
+        std::fs::write(&pkg_path, zstd::encode_all(&raw_tar[..], 3).unwrap()).unwrap();
+        pkg_path
+    }
+
+    #[test]
+    fn parallel_install_batch_extracts_every_package() {
+        let (_tmp, root, local_db) = test_root();
+        let cache_dir = root.join("var/cache/xpm");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+
+        let packages = ["alpha", "beta", "gamma", "delta"];
+        let mut tx = Transaction::new(root.clone(), local_db.clone()).expect("create transaction");
+        tx.set_hooks(HookChain::default());
+        for name in packages {
+            let pkg = make_named_package(&cache_dir, name, name.as_bytes());
+            let metadata = Arc::new(crate::package::read_metadata(&pkg).expect("metadata"));
+            tx.cache_package_metadata(pkg.clone(), metadata);
+            tx.add_install(name.to_string(), "1.0-1".to_string(), pkg)
+                .expect("add install");
+        }
+
+        tx.prepare().expect("prepare");
+        tx.commit().expect("parallel commit");
+
+        for name in packages {
+            assert!(
+                root.join(format!("usr/bin/{name}")).is_file(),
+                "{name} must be extracted"
+            );
+            assert!(
+                local_db.join(name).join("version").is_file(),
+                "{name} must be recorded in the local database"
+            );
+        }
     }
 }

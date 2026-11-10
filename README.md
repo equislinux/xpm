@@ -208,6 +208,26 @@ xpm repo remove &lt;name&gt;
     </tbody>
 </table>
 
+<h2 align="center" id="performance">Performance</h2>
+
+<p><code>xpm install</code> parses each package archive once for metadata, then
+extracts pure installs (no <code>.INSTALL</code> scriptlets) in parallel across
+available cores. Downloads and signature checks use up to
+<code>parallel_downloads</code> workers (default 10). Progress is shown as a
+single combined line for download, verify and extract, so parallel workers do
+not interleave output.</p>
+
+<pre><code class="language-sh"># Compare an installed xpm with a local build (network-free):
+cargo build --release -p xpm
+scripts/bench-install-local.sh --old /usr/bin/xpm --new target/release/xpm
+
+# Override the extraction worker cap (default: min(available CPUs, 8)):
+XPM_EXTRACT_WORKERS=4 xpm install --needed ...
+</code></pre>
+
+<p>Set <code>XPM_NO_PROGRESS=1</code> or pass <code>--noprogressbar</code> to
+disable the combined progress line in scripts.</p>
+
 <h2 align="center" id="configuration">Configuration</h2>
 
 <p>Configuration file: <code>/etc/xpm.conf</code> (TOML format).</p>
@@ -220,7 +240,7 @@ db_path = "/var/lib/xpm/"
 cache_dir = "/var/cache/xpm/pkg/"
 gpg_dir = "/etc/xpm/gnupg/"
 sig_level = "optional"
-parallel_downloads = 5
+parallel_downloads = 10
 
 [[repo]]
 name = "x"
@@ -291,7 +311,7 @@ db_path = "/var/lib/xpm/"
 cache_dir = "/var/cache/xpm/pkg/"
 gpg_dir = "/etc/xpm/gnupg/"
 sig_level = "required"
-parallel_downloads = 5
+parallel_downloads = 10
 
 [[repo]]
 name = "x"

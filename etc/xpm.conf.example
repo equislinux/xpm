@@ -35,7 +35,7 @@ sig_level = "optional"
 color = true
 
 # Number of parallel downloads (minimum: 1)
-parallel_downloads = 5
+parallel_downloads = 10
 
 # Check available disk space before installing
 check_space = true

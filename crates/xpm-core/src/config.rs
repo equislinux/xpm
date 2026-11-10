@@ -146,7 +146,7 @@ impl Default for GeneralOptions {
             sig_level: SigLevel::Optional,
             database_sig_level: None,
             color: true,
-            parallel_downloads: 5,
+            parallel_downloads: 10,
             check_space: true,
             pacman_db: None,
             mirror_pacman: true,
@@ -352,7 +352,7 @@ mod tests {
         let config = XpmConfig::default();
         assert_eq!(config.options.root_dir, PathBuf::from("/"));
         assert_eq!(config.options.db_path, PathBuf::from("/var/lib/xpm/"));
-        assert_eq!(config.options.parallel_downloads, 5);
+        assert_eq!(config.options.parallel_downloads, 10);
         assert_eq!(config.repositories.len(), 1);
         assert_eq!(config.repositories[0].name, "x");
     }

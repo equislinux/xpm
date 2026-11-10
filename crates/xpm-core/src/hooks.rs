@@ -10,6 +10,7 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
@@ -59,6 +60,10 @@ pub struct HookContext {
     pub save_configs: bool,
     pub shell_integration: bool,
     pub scriptlet_mode: ScriptletMode,
+    /// Metadata parsed once by the install/upgrade loop. When present the
+    /// hooks avoid reopening the package archive just to read .PKGINFO,
+    /// .MTREE or .INSTALL.
+    pub metadata: Option<Arc<crate::package::PackageMetadata>>,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -100,14 +105,26 @@ impl Hook for FileExtractionHook {
         }
 
         // ── Metadata needed for config-file handling ────────────────────────
-        // `backup` marks configuration files; `new_hashes` is the integrity
-        // map of the incoming package. Upgrades also load the previous
-        // manifest, hashes and backup list to detect user modifications.
-        let meta = crate::package::read_metadata(pkg_file)?.meta;
+        // Use the metadata parsed by the install loop when available: this
+        // avoids decompressing the package several times per transaction.
+        let cached = context.metadata.as_ref();
+        let (meta, new_mtree, new_mtree_entries) = match cached {
+            Some(metadata) => (
+                metadata.meta.clone(),
+                metadata.mtree_raw.clone(),
+                metadata.mtree.clone(),
+            ),
+            None => {
+                let metadata = crate::package::read_metadata(pkg_file)?;
+                (metadata.meta, metadata.mtree_raw, metadata.mtree)
+            }
+        };
         let backup_paths: HashSet<String> = meta.backup.into_iter().collect();
-
-        let new_mtree = crate::package::reader::read_raw_entry(pkg_file, ".MTREE")?;
-        let new_hashes = mtree_hashes(new_mtree.as_deref());
+        let new_hashes = if let Some(metadata) = cached {
+            crate::local_db::mtree_hash_map(&metadata.mtree)
+        } else {
+            mtree_hashes(new_mtree.as_deref())
+        };
 
         let upgrading = context.operation_type == OperationType::Upgrade;
         let old_manifest = if upgrading {
@@ -255,20 +272,10 @@ impl Hook for FileExtractionHook {
         // Prefer the .MTREE manifest (files, directories and symlinks) in
         // pacman's `files` format; fall back to the extracted entries when the
         // package has no usable manifest.
-        let manifest = match &new_mtree {
-            Some(data) => match crate::package::mtree::parse_mtree(data) {
-                Ok(entries) if !entries.is_empty() => crate::local_db::mtree_paths(&entries),
-                Ok(_) => installed_files.clone(),
-                Err(e) => {
-                    tracing::warn!(
-                        package = %context.pkg_name,
-                        error = %e,
-                        "unreadable .MTREE; falling back to the extracted file list"
-                    );
-                    installed_files.clone()
-                }
-            },
-            None => installed_files.clone(),
+        let manifest = if new_mtree_entries.is_empty() {
+            installed_files.clone()
+        } else {
+            crate::local_db::mtree_paths(&new_mtree_entries)
         };
 
         let mut manifest = manifest;
@@ -313,7 +320,11 @@ impl Hook for FileExtractionHook {
         }
 
         // Persist .INSTALL scriptlet in local db for future lifecycle hooks.
-        if let Some(raw_install) = crate::package::reader::read_raw_entry(pkg_file, ".INSTALL")? {
+        let install_script = match cached {
+            Some(metadata) => metadata.install_script.clone(),
+            None => crate::package::reader::read_raw_entry(pkg_file, ".INSTALL")?,
+        };
+        if let Some(raw_install) = install_script {
             fs::create_dir_all(&pkg_dir)?;
             fs::write(pkg_dir.join("install"), raw_install)?;
         }
@@ -694,6 +705,12 @@ impl Hook for PostScriptletHook {
 }
 
 fn load_install_script(context: &HookContext) -> XpmResult<Option<Vec<u8>>> {
+    if let Some(metadata) = &context.metadata {
+        // Cached metadata is authoritative: a missing .INSTALL must not
+        // trigger another decompression of the package.
+        return Ok(metadata.install_script.clone());
+    }
+
     if let Some(pkg_file) = &context.pkg_file {
         if let Some(data) = crate::package::reader::read_raw_entry(pkg_file, ".INSTALL")? {
             return Ok(Some(data));
@@ -1001,19 +1018,29 @@ impl PacmanDbHook {
     }
 }
 
+static PACMAN_DB_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 impl Hook for PacmanDbHook {
     fn name(&self) -> &str {
         "pacman-db"
     }
 
     fn run(&self, context: &HookContext) -> XpmResult<()> {
+        // Package extraction runs in parallel now, but pacman's local database
+        // has a single writer lock. Serialize the mirror step inside the
+        // process instead of letting workers race for db.lck.
+        let lock = PACMAN_DB_WRITE_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = match lock.lock() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
         match context.operation_type {
             OperationType::Install | OperationType::Upgrade => {
                 let reason = crate::install_reason::InstallReason::read(
                     &context.local_db_dir,
                     &context.pkg_name,
                 );
-                crate::pacman_db::mirror_entry(
+                crate::pacman_db::mirror_entry_with_metadata(
                     &self.pacman_local,
                     &context.local_db_dir,
                     &context.pkg_name,
@@ -1021,6 +1048,7 @@ impl Hook for PacmanDbHook {
                     reason,
                     context.pkg_file.as_deref(),
                     &self.root_dir,
+                    context.metadata.as_deref(),
                 )
             }
             OperationType::Remove => {
@@ -1217,14 +1245,16 @@ impl Hook for MetadataLoadHook {
                     pkg_file.display()
                 )));
             }
-            // Fail early when the archive is unreadable or its .PKGINFO is
-            // invalid, before any file is written to the root.
-            crate::package::read_metadata(pkg_file).map_err(|e| {
-                XpmError::Package(format!(
-                    "invalid package metadata in {}: {e}",
-                    pkg_file.display()
-                ))
-            })?;
+            // The install loop already parsed the archive; only read it here
+            // for callers that did not provide cached metadata.
+            if context.metadata.is_none() {
+                crate::package::read_metadata(pkg_file).map_err(|e| {
+                    XpmError::Package(format!(
+                        "invalid package metadata in {}: {e}",
+                        pkg_file.display()
+                    ))
+                })?;
+            }
         }
         Ok(())
     }
@@ -1297,6 +1327,7 @@ mod tests {
             save_configs: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
+            metadata: None,
         };
 
         (root_tmp, db_tmp, ctx)
@@ -1691,6 +1722,7 @@ mod tests {
             save_configs: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
+            metadata: None,
         };
         FileExtractionHook.run(&ctx).expect("install v1");
     }
@@ -1707,6 +1739,7 @@ mod tests {
             save_configs: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
+            metadata: None,
         }
     }
 
@@ -1833,6 +1866,7 @@ mod tests {
             save_configs: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
+            metadata: None,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 
@@ -1868,6 +1902,7 @@ mod tests {
             save_configs: false,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
+            metadata: None,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 
@@ -1902,6 +1937,7 @@ mod tests {
             save_configs: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
+            metadata: None,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 
