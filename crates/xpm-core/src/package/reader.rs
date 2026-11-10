@@ -3,9 +3,12 @@
 //! Supports zstd (default), gzip, and xz compression. Auto-detects
 //! compression from magic bytes.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+
+use md5::{Digest, Md5};
 
 use crate::error::XpmError;
 use crate::package::buildinfo;
@@ -82,10 +85,24 @@ pub fn read_raw_entry(path: &Path, entry_name: &str) -> Result<Option<Vec<u8>>, 
 // ── Metadata reader ───────────────────────────────────────────
 
 /// Parsed metadata from a package archive.
+///
+/// A single pass over the archive also captures the file list, the raw
+/// `.MTREE` payload and the `.INSTALL` scriptlet so later phases do not need
+/// to decompress the package again just to inspect metadata.
+#[derive(Debug, Clone)]
 pub struct PackageMetadata {
     pub meta: PackageMeta,
     pub buildinfo: Option<BuildInfo>,
     pub mtree: Vec<MtreeEntry>,
+    /// Raw `.MTREE` bytes (stored byte-for-byte in the local database).
+    pub mtree_raw: Option<Vec<u8>>,
+    /// Raw `.INSTALL` scriptlet, when present.
+    pub install_script: Option<Vec<u8>>,
+    /// Relative file paths shipped by the package (directories end with `/`).
+    pub files: Vec<String>,
+    /// MD5 of packaged configuration files (the value pacman stores in its
+    /// `backup` file). Computed during the same metadata pass.
+    pub backup_md5: HashMap<String, String>,
 }
 
 /// Read and parse all metadata from a `.xp` or `.pkg.tar.zst` package.
@@ -95,18 +112,23 @@ pub fn read_metadata(path: &Path) -> Result<PackageMetadata, XpmError> {
     let mut pkginfo_data: Option<Vec<u8>> = None;
     let mut buildinfo_data: Option<Vec<u8>> = None;
     let mut mtree_data: Option<Vec<u8>> = None;
+    let mut install_script: Option<Vec<u8>> = None;
+    let mut files: Vec<String> = Vec::new();
+    let mut parsed_meta: Option<PackageMeta> = None;
+    let mut backup_md5: HashMap<String, String> = HashMap::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
         let entry_path = entry.path()?.to_path_buf();
         let name = entry_path.to_string_lossy().to_string();
+        let normalized = name.strip_prefix("./").unwrap_or(&name).to_string();
 
-        let normalized = name.strip_prefix("./").unwrap_or(&name);
-
-        match normalized {
+        match normalized.as_str() {
             ".PKGINFO" => {
                 let mut buf = Vec::new();
                 entry.read_to_end(&mut buf)?;
+                let meta = pkginfo::parse_pkginfo(&buf)?;
+                parsed_meta = Some(meta);
                 pkginfo_data = Some(buf);
             }
             ".BUILDINFO" => {
@@ -119,14 +141,50 @@ pub fn read_metadata(path: &Path) -> Result<PackageMetadata, XpmError> {
                 entry.read_to_end(&mut buf)?;
                 mtree_data = Some(buf);
             }
-            _ => {}
+            ".INSTALL" => {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                install_script = Some(buf);
+            }
+            _ => {
+                if normalized.starts_with('.') || normalized.is_empty() {
+                    continue;
+                }
+                if normalized.starts_with('/')
+                    || normalized.split('/').any(|component| component == "..")
+                {
+                    return Err(XpmError::Package(format!(
+                        "package contains an unsafe path: {normalized}"
+                    )));
+                }
+                let mut path = normalized;
+                let is_file = entry.header().entry_type().is_file();
+                if entry.header().entry_type().is_dir() && !path.ends_with('/') {
+                    path.push('/');
+                }
+                if is_file
+                    && parsed_meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.backup.iter().any(|item| item == &path))
+                {
+                    let mut bytes = Vec::new();
+                    entry.read_to_end(&mut bytes)?;
+                    backup_md5.insert(path.clone(), format!("{:x}", Md5::digest(&bytes)));
+                }
+                files.push(path);
+            }
         }
     }
+    files.sort();
+    files.dedup();
 
     let pkginfo_bytes =
         pkginfo_data.ok_or_else(|| XpmError::Package("package missing .PKGINFO".into()))?;
 
-    let meta = pkginfo::parse_pkginfo(&pkginfo_bytes)?;
+    let meta = match parsed_meta {
+        Some(meta) => meta,
+        None => pkginfo::parse_pkginfo(&pkginfo_bytes)?,
+    };
 
     let buildinfo = match buildinfo_data {
         Some(data) => Some(buildinfo::parse_buildinfo(&data)?),
@@ -134,7 +192,7 @@ pub fn read_metadata(path: &Path) -> Result<PackageMetadata, XpmError> {
     };
 
     let mtree_entries = match mtree_data {
-        Some(data) => mtree::parse_mtree(&data)?,
+        Some(ref data) => mtree::parse_mtree(data)?,
         None => Vec::new(),
     };
 
@@ -142,6 +200,10 @@ pub fn read_metadata(path: &Path) -> Result<PackageMetadata, XpmError> {
         meta,
         buildinfo,
         mtree: mtree_entries,
+        mtree_raw: mtree_data,
+        install_script,
+        files,
+        backup_md5,
     })
 }
 
@@ -405,5 +467,59 @@ mod tests {
     fn nonexistent_file_returns_error() {
         let result = read_metadata(Path::new("/nonexistent/package.xp"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_metadata_caches_files_scriptlet_mtree_and_backup_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("meta-1.0-1-x86_64.xp");
+        let mut raw_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw_tar);
+            let append = |builder: &mut tar::Builder<&mut Vec<u8>>,
+                          path: &str,
+                          content: &[u8],
+                          mode: u32| {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(content.len() as u64);
+                header.set_mode(mode);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_cksum();
+                builder.append(&header, content).unwrap();
+            };
+
+            let pkginfo = b"pkgname = meta\npkgver = 1.0-1\npkgdesc = meta\narch = x86_64\nsize = 6\nbackup = etc/app.conf\n";
+            append(&mut builder, ".PKGINFO", pkginfo, 0o644);
+            append(&mut builder, ".INSTALL", b"pre_install() { :; }\n", 0o644);
+            let mtree = b"#mtree\n./etc/app.conf type=file mode=0644 size=6 uid=0 gid=0\n";
+            append(&mut builder, ".MTREE", mtree, 0o644);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("etc/").unwrap();
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append(&header, &[][..]).unwrap();
+            append(&mut builder, "etc/app.conf", b"hello\n", 0o644);
+            append(&mut builder, "usr/bin/tool", b"bin\n", 0o755);
+            builder.finish().unwrap();
+        }
+        std::fs::write(&pkg, zstd::encode_all(&raw_tar[..], 3).unwrap()).unwrap();
+
+        let metadata = read_metadata(&pkg).unwrap();
+        assert!(metadata.files.contains(&"etc/app.conf".to_string()));
+        assert!(metadata.files.contains(&"usr/bin/tool".to_string()));
+        assert!(metadata.files.contains(&"etc/".to_string()));
+        assert!(metadata.install_script.is_some());
+        assert!(metadata.mtree_raw.is_some());
+        assert_eq!(metadata.mtree.len(), 1);
+        assert_eq!(
+            metadata.backup_md5.get("etc/app.conf"),
+            Some(&format!("{:x}", Md5::digest(b"hello\n")))
+        );
     }
 }

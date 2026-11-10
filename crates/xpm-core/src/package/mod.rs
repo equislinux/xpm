@@ -11,6 +11,6 @@ pub mod reader;
 pub mod types;
 pub mod validate;
 
-pub use reader::{list_files, read_metadata, read_raw_entry};
+pub use reader::{list_files, read_metadata, read_raw_entry, PackageMetadata};
 pub use types::{BuildInfo, MtreeEntry, MtreeFileType, PackageMeta};
 pub use validate::validate_integrity;

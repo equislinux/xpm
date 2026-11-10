@@ -14,7 +14,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
@@ -34,8 +34,9 @@ use xpm_core::install_reason::{mark_packages, retain_by_reason, InstallReason};
 use xpm_core::journal::{Journal, JournalPackage};
 use xpm_core::local_db;
 use xpm_core::orphans::{find_orphans, InstalledPackage};
-use xpm_core::package::{read_metadata, PackageMeta};
+use xpm_core::package::{read_metadata, PackageMeta, PackageMetadata};
 use xpm_core::progress::ParallelDownloadProgress;
+use xpm_core::progress::{self, Phase};
 use xpm_core::query;
 use xpm_core::replace::matches_ignore_group;
 use xpm_core::repo::RepoManager;
@@ -170,6 +171,10 @@ fn main() -> Result<()> {
         config.options.scriptlet_mode = xpm_core::hooks::ScriptletMode::Skip;
     }
 
+    // Combined progress for download/verify/extract. Disabled by the hidden
+    // pacman-compatible flag or XPM_NO_PROGRESS; it never corrupts logs.
+    progress::init(!cli.noprogressbar, cli.no_color, cli.verbose > 0);
+
     if let Some(root) = operation_root {
         if root != Path::new("/") {
             // `--sysroot` always relocates the standard paths into the guest
@@ -206,7 +211,7 @@ fn main() -> Result<()> {
     );
 
     // ── Dispatch subcommands ────────────────────────────────────────────
-    match &cli.command {
+    let result = match &cli.command {
         Command::Sync(args) => cmd_sync(&config, args),
         Command::Install(args) => cmd_install(&config, args, cli.no_confirm),
         Command::Build(args) => cmd_build(&config, args, cli.no_confirm),
@@ -231,7 +236,9 @@ fn main() -> Result<()> {
         Command::Clean(args) => cmd_clean(&config, args, cli.no_confirm),
         Command::FileDb(args) => cmd_file_db(&config, args),
         Command::Usage(args) => cmd_help(args),
-    }
+    };
+    progress::finish_all();
+    result
 }
 
 // ── Subcommand stubs ────────────────────────────────────────────────────────
@@ -526,6 +533,7 @@ struct InstalledRecord {
     groups: Vec<String>,
     reason: InstallReason,
     pkg_file: PathBuf,
+    metadata: Option<Arc<PackageMetadata>>,
 }
 
 fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
@@ -761,11 +769,12 @@ fn prefetch_downloads(
                 continue;
             }
         }
-        let mirror_count = urls.len();
-        if mirror_count > 0 {
-            // Spread concurrent workers across mirrors instead of making every
-            // package hammer the first server.
-            urls.rotate_left(index % mirror_count);
+        let server_count = repo.server.len();
+        if server_count > 1 && urls.len() >= server_count {
+            // Spread concurrent workers across the configured mirrors, but
+            // keep derived fallback URLs (native .xp) at the end so they can
+            // never be tried before a real repository server.
+            urls[..server_count].rotate_left(index % server_count);
         }
         jobs.push(DownloadJob {
             index,
@@ -780,6 +789,7 @@ fn prefetch_downloads(
     }
 
     let workers = (parallel_downloads.max(1) as usize).min(jobs.len());
+    progress::begin(Phase::Download, jobs.len());
     if workers == 1 {
         for job in jobs {
             let mirror =
@@ -791,7 +801,9 @@ fn prefetch_downloads(
                         )
                     })?;
             mirrors[job.index] = Some(mirror);
+            progress::advance(Phase::Download);
         }
+        progress::finish(Phase::Download);
         return Ok(mirrors);
     }
 
@@ -815,18 +827,14 @@ fn prefetch_downloads(
                 )
                 .map_err(|err| err.to_string());
                 progress.complete_job();
+                xpm_core::progress::advance(Phase::Download);
                 if let Ok(mut slots) = results.lock() {
                     slots[index] = Some(result);
                 }
             });
         }
-        while !progress.is_done() {
-            progress.render();
-            thread::sleep(std::time::Duration::from_millis(100));
-        }
-        progress.render();
     });
-    progress.finish();
+    xpm_core::progress::finish(Phase::Download);
 
     let results = results
         .into_inner()
@@ -903,11 +911,7 @@ fn verify_signatures_parallel(
     }
 
     let workers = (parallel.max(1) as usize).min(jobs.len());
-    println!(
-        ":: Verifying package signatures ({} package(s), {} worker(s))...",
-        jobs.len(),
-        workers
-    );
+    progress::begin(Phase::Verify, jobs.len());
     let next = AtomicUsize::new(0);
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -924,6 +928,7 @@ fn verify_signatures_parallel(
                     1,
                 )
                 .map_err(|err| err.to_string());
+                xpm_core::progress::advance(Phase::Verify);
                 if let Ok(mut slots) = results.lock() {
                     slots[job.index] = Some(result.map_err(|err| {
                         format!(
@@ -935,6 +940,7 @@ fn verify_signatures_parallel(
             });
         }
     });
+    xpm_core::progress::finish(Phase::Verify);
 
     Ok(results
         .into_inner()
@@ -958,8 +964,10 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     let mut local_metadata = Vec::new();
     for spec in &local_files {
         let path = Path::new(spec.as_str());
-        let metadata = read_metadata(path)
-            .with_context(|| format!("failed to read metadata from {}", path.display()))?;
+        let metadata = Arc::new(
+            read_metadata(path)
+                .with_context(|| format!("failed to read metadata from {}", path.display()))?,
+        );
         local_names.insert(metadata.meta.name.clone());
         local_deps.extend(metadata.meta.depends.iter().cloned());
         local_metadata.push((path.to_path_buf(), metadata));
@@ -1244,12 +1252,8 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         } else {
             println!("   local: {} ({} {})", path.display(), pkg_name, version);
         }
-        target_manifests.push(target_manifest(
-            &local_db_dir,
-            &pkg_name,
-            path,
-            &metadata.meta.backup,
-        )?);
+        tx.cache_package_metadata(path.to_path_buf(), metadata.clone());
+        target_manifests.push(target_manifest(&local_db_dir, &pkg_name, metadata)?);
         target_pkgs.push(install_target(&metadata.meta, &version));
 
         if is_upgrade {
@@ -1276,6 +1280,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             groups: metadata.meta.groups.clone(),
             reason: pkg_reason,
             pkg_file: path.to_path_buf(),
+            metadata: Some(metadata.clone()),
         });
     }
 
@@ -1309,14 +1314,12 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             anyhow::bail!("{err}");
         }
 
-        let metadata = read_metadata(&dest)
-            .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
-        target_manifests.push(target_manifest(
-            &local_db_dir,
-            &entry.name,
-            &dest,
-            &metadata.meta.backup,
-        )?);
+        let metadata = Arc::new(
+            read_metadata(&dest)
+                .with_context(|| format!("failed to read metadata from {}", dest.display()))?,
+        );
+        tx.cache_package_metadata(dest.clone(), metadata.clone());
+        target_manifests.push(target_manifest(&local_db_dir, &entry.name, &metadata)?);
         target_pkgs.push(install_target(&metadata.meta, &entry.version));
 
         let is_upgrade = installed_version.is_some();
@@ -1333,8 +1336,10 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             InstallReason::Dep
         };
 
-        println!("   downloaded: {}", dest.display());
-        println!("   source: {}", mirror);
+        if xpm_core::progress::verbose() {
+            println!("   downloaded: {}", dest.display());
+            println!("   source: {}", mirror);
+        }
 
         let mut journal_pkg = if is_upgrade {
             JournalPackage::upgrade(&entry.name, installed_version.unwrap(), &entry.version)
@@ -1356,6 +1361,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
             groups: metadata.meta.groups.clone(),
             reason: pkg_reason,
             pkg_file: dest.clone(),
+            metadata: Some(metadata.clone()),
         });
 
         // Add to transaction
@@ -1907,14 +1913,12 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             },
         )?;
 
-        let metadata = read_metadata(&dest)
-            .with_context(|| format!("failed to read metadata from {}", dest.display()))?;
-        target_manifests.push(target_manifest(
-            &local_db_dir,
-            &entry.name,
-            &dest,
-            &metadata.meta.backup,
-        )?);
+        let metadata = Arc::new(
+            read_metadata(&dest)
+                .with_context(|| format!("failed to read metadata from {}", dest.display()))?,
+        );
+        tx.cache_package_metadata(dest.clone(), metadata.clone());
+        target_manifests.push(target_manifest(&local_db_dir, &entry.name, &metadata)?);
         target_pkgs.push(install_target(&metadata.meta, &entry.version));
 
         // Replacements remove the old package first; the new package is a
@@ -1964,6 +1968,7 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             groups: metadata.meta.groups.clone(),
             reason: record_reason,
             pkg_file: dest.clone(),
+            metadata: Some(metadata.clone()),
         });
     }
 
@@ -2608,6 +2613,7 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
                     groups: metadata.meta.groups.clone(),
                     reason,
                     pkg_file: file.clone(),
+                    metadata: None,
                 });
             }
         }
@@ -3149,40 +3155,10 @@ fn install_target(meta: &PackageMeta, version: &str) -> depcheck::InstallTarget 
     }
 }
 
-fn package_file_list(pkg_file: &Path) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
-    for file in xpm_core::package::list_files(pkg_file)
-        .with_context(|| format!("failed to list files in {}", pkg_file.display()))?
-    {
-        let mut path = file.path.to_string_lossy().into_owned();
-        while let Some(stripped) = path.strip_prefix("./") {
-            path = stripped.to_string();
-        }
-        if path.is_empty() {
-            continue;
-        }
-        if path.starts_with('/') || path.split('/').any(|component| component == "..") {
-            anyhow::bail!(
-                "package {} contains an unsafe path: {}",
-                pkg_file.display(),
-                path
-            );
-        }
-        if file.is_dir && !path.ends_with('/') {
-            path.push('/');
-        }
-        paths.push(path);
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
-
 fn target_manifest(
     local_db_dir: &Path,
     name: &str,
-    pkg_file: &Path,
-    backups: &[String],
+    metadata: &PackageMetadata,
 ) -> Result<conflict::TargetManifest> {
     let old_files = if local_db_dir.join(name).is_dir() {
         local_db::read_files(local_db_dir, name)?
@@ -3191,8 +3167,8 @@ fn target_manifest(
     };
     Ok(conflict::TargetManifest {
         name: name.to_string(),
-        files: package_file_list(pkg_file)?,
-        backups: backups.to_vec(),
+        files: metadata.files.clone(),
+        backups: metadata.meta.backup.clone(),
         old_files,
     })
 }
@@ -3312,7 +3288,7 @@ fn mirror_pacman_records(config: &XpmConfig, records: &[InstalledRecord]) -> Res
     let mut failures = Vec::new();
 
     for record in records {
-        if let Err(err) = xpm_core::pacman_db::mirror_entry(
+        if let Err(err) = xpm_core::pacman_db::mirror_entry_with_metadata(
             &pacman_local,
             &xpm_local,
             &record.name,
@@ -3320,6 +3296,7 @@ fn mirror_pacman_records(config: &XpmConfig, records: &[InstalledRecord]) -> Res
             record.reason,
             Some(&record.pkg_file),
             &config.options.root_dir,
+            record.metadata.as_deref(),
         ) {
             failures.push(format!("{}: {err:#}", record.name));
         }
@@ -3757,7 +3734,7 @@ GENERAL OPTIONS:
     gpg_dir = "/etc/pacman.d/gnupg/"  # GPG keyring (shared with pacman;
                                       # falls back to /etc/xpm/gnupg)
     sig_level = "optional"            # required | optional | never
-    parallel_downloads = 5            # Concurrent downloads
+    parallel_downloads = 10           # Concurrent downloads
     check_space = true                # Check disk space
     color = true                      # Colored output
     architecture = "x86_64"           # System architecture

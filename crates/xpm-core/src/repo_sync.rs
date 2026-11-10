@@ -186,8 +186,16 @@ pub fn verify_remote_signature(
     }
 
     let sig_dest = signature_cache_path(artifact_path);
+    // Optional signatures (the official Arch databases) should be attempted
+    // once. Retrying every mirror for a file that is expected to be absent
+    // only floods the log and slows sync.
+    let attempts = if sig_level == SigLevel::Required {
+        retries
+    } else {
+        1
+    };
 
-    if let Err(err) = download_with_retries(sig_url, &sig_dest, retries, true, None) {
+    if let Err(err) = download_with_retries(sig_url, &sig_dest, attempts, true, None) {
         if sig_level == SigLevel::Required {
             return Err(XpmError::SignatureError(format!(
                 "signature required but could not be downloaded from {sig_url}: {err}"
@@ -275,7 +283,11 @@ pub fn package_download_candidates(
         let clean = url.trim();
         if clean.ends_with(".xp") {
             candidates.push(clean.to_string());
-        } else if clean.starts_with("https://github.com/") {
+        } else if clean.starts_with("https://github.com/") && filename.ends_with(".xp") {
+            // `%URL%` is the package homepage, not a download source. Only
+            // derive a GitHub release URL for native .xp artifacts; standard
+            // Arch .pkg.tar.zst packages are always served by the repository
+            // mirror and must not be rotated onto a bogus GitHub URL.
             let repo_url = clean.trim_end_matches('/');
             let tag = format!("{}-{}", entry.name, entry.version);
             candidates.push(format!("{repo_url}/releases/download/{tag}/{filename}"));
@@ -808,6 +820,30 @@ mod tests {
         .expect("corrupt mirror must be skipped");
         assert_eq!(selected, format!("file://{}", good.display()));
         assert_eq!(fs::read(dest).unwrap(), b"package-payload");
+    }
+
+    #[test]
+    fn package_candidates_do_not_use_homepage_for_arch_packages() {
+        let repo = Repository {
+            name: "extra".to_string(),
+            server: vec!["https://mirror.example/$repo/os/$arch".to_string()],
+            sig_level: None,
+            database_sig_level: None,
+        };
+        let entry = RepoEntry {
+            name: "brotli".to_string(),
+            version: "1.2.1-1".to_string(),
+            filename: Some("brotli-1.2.1-1-x86_64.pkg.tar.zst".to_string()),
+            sha256sum: None,
+            url: Some("https://github.com/google/brotli".to_string()),
+            ..Default::default()
+        };
+
+        let candidates = package_download_candidates(&repo, "x86_64", &entry);
+        assert_eq!(
+            candidates,
+            vec!["https://mirror.example/extra/os/x86_64/brotli-1.2.1-1-x86_64.pkg.tar.zst"]
+        );
     }
 
     #[test]

@@ -48,8 +48,55 @@ pub fn mirror_entry(
     pkg_file: Option<&Path>,
     root_dir: &Path,
 ) -> XpmResult<()> {
+    mirror_entry_impl(
+        pacman_local,
+        xpm_local,
+        name,
+        version,
+        reason,
+        pkg_file,
+        root_dir,
+        None,
+    )
+}
+
+/// Like [`mirror_entry`], but reuses metadata already parsed by the caller.
+/// The cached metadata also carries the packaged configuration-file MD5s, so
+/// the pacman database mirror does not decompress the package again.
+pub fn mirror_entry_with_metadata(
+    pacman_local: &Path,
+    xpm_local: &Path,
+    name: &str,
+    version: &str,
+    reason: InstallReason,
+    pkg_file: Option<&Path>,
+    root_dir: &Path,
+    metadata: Option<&crate::package::PackageMetadata>,
+) -> XpmResult<()> {
+    mirror_entry_impl(
+        pacman_local,
+        xpm_local,
+        name,
+        version,
+        reason,
+        pkg_file,
+        root_dir,
+        metadata,
+    )
+}
+
+fn mirror_entry_impl(
+    pacman_local: &Path,
+    xpm_local: &Path,
+    name: &str,
+    version: &str,
+    reason: InstallReason,
+    pkg_file: Option<&Path>,
+    root_dir: &Path,
+    metadata: Option<&crate::package::PackageMetadata>,
+) -> XpmResult<()> {
     validate_package_name(name)?;
-    let full_version = resolve_version(xpm_local, name, version, pkg_file)?;
+    let full_version = resolve_version(xpm_local, name, version, pkg_file, metadata)?;
     validate_version(&full_version)?;
     let entry_name = format!("{name}-{full_version}");
 
@@ -72,6 +119,7 @@ pub fn mirror_entry(
         reason,
         pkg_file,
         root_dir,
+        metadata,
     ) {
         cleanup_staging(&staging);
         return Err(err);
@@ -208,10 +256,14 @@ fn write_entry_contents(
     reason: InstallReason,
     pkg_file: Option<&Path>,
     root_dir: &Path,
+    metadata: Option<&crate::package::PackageMetadata>,
 ) -> XpmResult<()> {
-    let meta = match pkg_file {
-        Some(path) => Some(read_metadata(path)?.meta),
-        None => None,
+    let meta = match metadata {
+        Some(metadata) => Some(metadata.meta.clone()),
+        None => match pkg_file {
+            Some(path) => Some(read_metadata(path)?.meta),
+            None => None,
+        },
     };
 
     let mtree = local_db::read_mtree(xpm_local, name)?;
@@ -242,7 +294,8 @@ fn write_entry_contents(
     write_file_mode(&staging.join("desc"), desc.as_bytes())?;
 
     let files = collect_files(xpm_local, name)?;
-    let backups = collect_backup_hashes(xpm_local, name, meta.as_ref(), pkg_file, root_dir)?;
+    let backups =
+        collect_backup_hashes(xpm_local, name, meta.as_ref(), pkg_file, root_dir, metadata)?;
     write_file_mode(
         &staging.join("files"),
         render_files(&files, &backups).as_bytes(),
@@ -402,6 +455,7 @@ fn collect_backup_hashes(
     meta: Option<&PackageMeta>,
     pkg_file: Option<&Path>,
     root_dir: &Path,
+    metadata: Option<&crate::package::PackageMetadata>,
 ) -> XpmResult<Vec<(String, String)>> {
     let paths = match meta {
         Some(meta) => meta.backup.clone(),
@@ -427,7 +481,10 @@ fn collect_backup_hashes(
             continue;
         }
 
-        let hash = backup_md5(&path, pkg_file, root_dir)?;
+        let hash = match metadata.and_then(|metadata| metadata.backup_md5.get(&path)) {
+            Some(hash) => hash.clone(),
+            None => backup_md5(&path, pkg_file, root_dir)?,
+        };
         backups.push((path, hash));
     }
 
@@ -504,6 +561,7 @@ fn resolve_version(
     name: &str,
     version: &str,
     pkg_file: Option<&Path>,
+    metadata: Option<&crate::package::PackageMetadata>,
 ) -> XpmResult<String> {
     let requested = version.trim();
     if !requested.is_empty() {
@@ -512,6 +570,12 @@ fn resolve_version(
 
     if let Some(recorded) = local_db::read_version(xpm_local, name) {
         return Ok(recorded);
+    }
+
+    if let Some(metadata) = metadata {
+        if !metadata.meta.version.is_empty() {
+            return Ok(metadata.meta.full_version());
+        }
     }
 
     if let Some(pkg_file) = pkg_file {
