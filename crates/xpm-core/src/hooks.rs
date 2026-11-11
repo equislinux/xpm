@@ -251,6 +251,23 @@ impl Hook for FileExtractionHook {
         }
 
         for (target, source, attrs) in deferred_hardlinks {
+            // A package may ship a hardlink whose path already exists (for
+            // example a Qt tool re-hardlinking an installed binary). Pacman
+            // replaces the existing entry; fs::hard_link alone would fail
+            // with EEXIST. Remove only a non-directory entry.
+            match fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    return Err(XpmError::Package(format!(
+                        "refusing to replace directory {} with a hardlink",
+                        target.display()
+                    )));
+                }
+                Ok(_) => {
+                    fs::remove_file(&target)?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
             fs::hard_link(&source, &target).map_err(|err| {
                 XpmError::Package(format!(
                     "failed to create hardlink {} -> {}: {err}",
@@ -1954,5 +1971,63 @@ mod tests {
 
         let err = MetadataLoadHook.run(&ctx).expect_err("must fail");
         assert!(err.to_string().contains("invalid package metadata"));
+    }
+
+    #[test]
+    fn hardlink_replaces_an_existing_target() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (root, db_tmp, mut ctx) = test_context(OperationType::Install);
+        let package = db_tmp.path().join("hardlink-1.0-1-x86_64.xp");
+        let mut raw_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw_tar);
+            let pkginfo =
+                b"pkgname = hardlink\npkgver = 1.0-1\npkgdesc = test\narch = x86_64\nsize = 3\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_path(".PKGINFO").unwrap();
+            header.set_size(pkginfo.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &pkginfo[..]).unwrap();
+
+            let content = b"new";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("usr/bin/tool").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+
+            let mut header = tar::Header::new_gnu();
+            header.set_path("usr/bin/tool-link").unwrap();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_link_name("usr/bin/tool").unwrap();
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append(&header, &[][..]).unwrap();
+            builder.finish().unwrap();
+        }
+        fs::write(&package, zstd::encode_all(&raw_tar[..], 1).unwrap()).unwrap();
+
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        fs::write(root.path().join("usr/bin/tool-link"), b"old").unwrap();
+        ctx.pkg_name = "hardlink".to_string();
+        ctx.pkg_file = Some(package);
+
+        FileExtractionHook
+            .run(&ctx)
+            .expect("extract must replace the existing target");
+
+        let target = root.path().join("usr/bin/tool-link");
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        let source_meta = fs::metadata(root.path().join("usr/bin/tool")).unwrap();
+        let target_meta = fs::metadata(&target).unwrap();
+        assert_eq!(
+            source_meta.ino(),
+            target_meta.ino(),
+            "target must be a hardlink"
+        );
     }
 }
