@@ -89,6 +89,8 @@ fn template_dir(options: &BuildOptions) -> PathBuf {
 struct TemplateStamp {
     schema: u32,
     arch: String,
+    #[serde(default)]
+    xpm_version: String,
     created_at: u64,
     refreshed_at: u64,
 }
@@ -98,6 +100,7 @@ impl TemplateStamp {
         Self {
             schema: STAMP_SCHEMA,
             arch: arch.to_string(),
+            xpm_version: xpm_version(),
             created_at: now,
             refreshed_at: now,
         }
@@ -130,6 +133,7 @@ fn ensure_template(
         let stamp = TemplateStamp {
             schema: STAMP_SCHEMA,
             arch,
+            xpm_version: xpm_version(),
             created_at,
             refreshed_at: now,
         };
@@ -149,7 +153,10 @@ fn template_is_fresh(root: &Path, stamp_path: &Path, options: &BuildOptions) -> 
     let Some(stamp) = read_stamp(stamp_path) else {
         return false;
     };
-    if stamp.schema != STAMP_SCHEMA || stamp.arch != current_arch() {
+    if stamp.schema != STAMP_SCHEMA
+        || stamp.arch != current_arch()
+        || stamp.xpm_version != xpm_version()
+    {
         return false;
     }
     if options.chroot_ttl_days == 0 {
@@ -172,20 +179,10 @@ fn create_template(root: &Path) -> BuildResult<()> {
     })?;
     run_root("mkdir", [OsStr::new("-p"), parent.as_os_str()])?;
 
-    // A btrfs subvolume lets every build take an O(1) snapshot. Other
-    // filesystems fall back to reflink/overlay/copy in clone_template().
-    let subvolume = command_exists("btrfs")
-        && root_command("btrfs")
-            .args(["subvolume", "create"])
-            .arg(root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-    if !subvolume {
-        run_root("mkdir", [OsStr::new("-p"), root.as_os_str()])?;
-    }
+    // Keep the template as a plain directory. Builds still use reflink or
+    // overlayfs (or a copy), and `rm -rf` can always remove the template
+    // without btrfs-specific subvolume bookkeeping.
+    run_root("mkdir", [OsStr::new("-p"), root.as_os_str()])?;
 
     let xpm = current_xpm()?;
     eprintln!(
@@ -219,6 +216,10 @@ fn refresh_template(root: &Path, options: &BuildOptions) -> BuildResult<()> {
         let status = root_command(&xpm)
             .args(["--no-confirm", "--no-pacman-mirror", "--root"])
             .arg(root)
+            .arg("--dbpath")
+            .arg(root.join("var/lib/xpm"))
+            .arg("--cachedir")
+            .arg(root.join("var/cache/xpm/pkg"))
             .args(args)
             .status()
             .map_err(|err| BuildError::Command(format!("xpm {}: {err}", args.join(" "))))?;
@@ -233,10 +234,11 @@ fn refresh_template(root: &Path, options: &BuildOptions) -> BuildResult<()> {
         }
     };
 
-    // Refresh the keyring from the template's own database first; if the
-    // database is too old, the following sync can still use the new keyring.
-    run(&["install", "--needed", "--", "archlinux-keyring"])?;
+    // The template carries a public copy of the host keyring. Refresh it so a
+    // stale template can still verify current database signatures.
+    copy_host_keyring(root)?;
     run(&["sync", "--force"])?;
+    run(&["install", "--needed", "--", "archlinux-keyring"])?;
     run(&["upgrade"])?;
     // A group can gain members between snapshots; `upgrade` does not install
     // packages that were never present.
@@ -381,6 +383,48 @@ fn clone_template(template: &Path, work: &Path, lock: &TemplateLock) -> BuildRes
 
     write_marker(work, ".copy-kind", kind.as_str())?;
     Ok(kind)
+}
+
+fn copy_host_keyring(root: &Path) -> BuildResult<()> {
+    let host = Path::new("/etc/pacman.d/gnupg");
+    if !host.is_dir() {
+        return Ok(());
+    }
+    let target = root.join("etc/pacman.d/gnupg");
+    run_root("mkdir", [OsStr::new("-p"), target.as_os_str()])?;
+    for name in [
+        "pubring.gpg",
+        "pubring.kbx",
+        "trustdb.gpg",
+        "gpg.conf",
+        "common.conf",
+    ] {
+        let source = host.join(name);
+        let readable = root_command("test")
+            .args(["-f"])
+            .arg(&source)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if readable {
+            let status = root_command("cp")
+                .arg(&source)
+                .arg(target.join(name))
+                .status()
+                .map_err(|err| BuildError::Command(format!("copy keyring: {err}")))?;
+            if !status.success() {
+                return Err(BuildError::Command(format!(
+                    "could not copy keyring file {}",
+                    source.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn xpm_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 fn is_btrfs_subvolume(path: &Path) -> bool {
@@ -531,7 +575,7 @@ fn prepare_work(
     }
 
     if !options.preinstall.is_empty() {
-        let preinstall = work.join("preinstall");
+        let preinstall = root.join("preinstall");
         for package in &options.preinstall {
             let name = package.file_name().ok_or_else(|| {
                 BuildError::Command(format!("invalid preinstall path {}", package.display()))
@@ -783,7 +827,7 @@ fn collect_chroot_artifacts(
     options: &BuildOptions,
     artifact_uid: u32,
 ) -> BuildResult<Vec<BuiltPackage>> {
-    let pkgdest = work.join("pkgdest");
+    let pkgdest = work.join("root/pkgdest");
     fs::create_dir_all(&options.pkgdest).map_err(|source| BuildError::Io {
         path: options.pkgdest.display().to_string(),
         source,
@@ -851,12 +895,14 @@ fn cleanup_work(work: &Path, kind: CopyKind) {
     let root = work.join("root");
     let _ = root_command("umount").args(["-R"]).arg(&root).status();
     // Deleting a btrfs subvolume with `rm -rf` leaves an empty subvolume
-    // behind, so try the proper deletion first regardless of the recorded
-    // marker (a killed build may not have written it yet).
-    let _ = root_command("btrfs")
-        .args(["subvolume", "delete"])
-        .arg(&root)
-        .status();
+    // behind. Detect it instead of relying on the marker: a killed build may
+    // not have written the marker yet.
+    if is_btrfs_subvolume(&root) {
+        let _ = root_command("btrfs")
+            .args(["subvolume", "delete"])
+            .arg(&root)
+            .status();
+    }
     let _ = root_command("rm").args(["-rf"]).arg(work).status();
 }
 
@@ -982,10 +1028,12 @@ fn remove_tree(path: &Path) {
     if !path.exists() {
         return;
     }
-    let _ = root_command("btrfs")
-        .args(["subvolume", "delete"])
-        .arg(path)
-        .status();
+    if is_btrfs_subvolume(path) {
+        let _ = root_command("btrfs")
+            .args(["subvolume", "delete"])
+            .arg(path)
+            .status();
+    }
     let _ = root_command("rm").args(["-rf"]).arg(path).status();
 }
 
