@@ -92,11 +92,14 @@ printf 'copy\n' > "$TEMPLATE/work-999-dead/.copy-kind"
 touch "$TEMPLATE/work-999-dead/.lock"
 chmod 644 "$TEMPLATE/work-999-dead/.lock"
 
+printf 'fake preinstall\n' > "$WORK/preinstall.pkg.tar.zst"
+
 run_build() {
   local pkgdest=$1
   "$XPM_BIN" build "$SRC" \
     --chroot --chroot-dir "$BASE" \
     --chroot-install gtk3 --chroot-install nss --nodeps \
+    --preinstall "$WORK/preinstall.pkg.tar.zst" \
     --srcdest "$SRCDEST" --builddir "$BUILDDIR" \
     --pkgdest "$pkgdest" --json "$pkgdest/result.json"
 }
@@ -113,6 +116,7 @@ test ! -e "$TEMPLATE/work-999-dead" || fail "stale work directory was not remove
 test -d "$TPL_ROOT" || fail "template root was modified or removed"
 test -f "$TEMPLATE/template.json" || fail "template stamp was removed"
 grep -q 'gtk3 nss' "$HARNESS_LOG" || fail "chroot deps were not installed with xpm"
+grep -q '/preinstall/preinstall.pkg.tar.zst' "$HARNESS_LOG" || fail "preinstall paths were not passed as files"
 grep -q -- '--nodeps' "$HARNESS_LOG" || fail "makepkg did not receive --nodeps"
 grep -q 'makepkg' "$HARNESS_LOG" || fail "makepkg was not invoked"
 grep -q 'PKGEXT=.pkg.tar.zst' "$HARNESS_LOG" || fail "PKGEXT was not forced"

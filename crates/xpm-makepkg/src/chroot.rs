@@ -636,7 +636,7 @@ fn prepare_work(
             let name = package.file_name().ok_or_else(|| {
                 BuildError::Command(format!("invalid preinstall path {}", package.display()))
             })?;
-            command.arg("/preinstall").arg(name);
+            command.arg(format!("/preinstall/{}", name.to_string_lossy()));
         }
         let status = command
             .status()
