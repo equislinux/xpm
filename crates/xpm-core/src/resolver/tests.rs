@@ -376,6 +376,7 @@ fn assume_installed_candidates_parse_and_satisfy_dependencies() {
     let candidates = vec![with_deps("app", "1.0-1", &["virtual>=2"])];
     let requirements = vec![super::plan::Requirement {
         name: "app".to_string(),
+        op: None,
         version: None,
         repo: None,
     }];

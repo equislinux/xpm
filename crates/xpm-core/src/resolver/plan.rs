@@ -15,73 +15,75 @@ use crate::resolver::provider::XpmProvider;
 use crate::resolver::types::{PackageCandidate, PackagePool};
 use crate::resolver::version::Version;
 
-/// A requested package: name plus an optional exact version (`name=version`)
-/// and optional repository qualifier (`repo/name`).
+/// A requested package: a name plus an optional ALPM version constraint and
+/// optional repository qualifier (`repo/name`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requirement {
     /// Requested package name (may be a virtual name provided by a package).
     pub name: String,
-    /// Exact version when the request used `name=version`.
+    /// Comparison operator when the request carried a version constraint.
+    pub op: Option<Operator>,
+    /// Version when the request carried a constraint.
     pub version: Option<Version>,
     /// Repository name when the request used `repo/name`.
     pub repo: Option<String>,
 }
 
 impl Requirement {
-    /// Parse a CLI requirement:
+    /// Parse a CLI requirement using ALPM dependency syntax:
     ///
     /// - `foo` means any version from any repository.
-    /// - `foo=1.2-1` pins one version.
+    /// - `foo=1.2-1`, `foo>=1.2`, `foo>1.2`, `foo<=1.2` and `foo<1.2` are
+    ///   accepted; the same operators are used for local package dependencies.
     /// - `extra/foo` restricts the request to a repository.
-    /// - `extra/foo=1.2-1` combines both.
+    /// - `extra/foo>=1.2` combines both.
     pub fn parse(spec: &str) -> XpmResult<Self> {
-        let (target, version) = match spec.split_once('=') {
-            Some((name, version)) if !name.is_empty() && !version.is_empty() => {
-                (name, Some(Version::parse(version)))
-            }
-            Some(_) => {
-                return Err(XpmError::Package(format!(
-                    "invalid package requirement '{spec}' (expected name, name=version, repo/name or repo/name=version)"
-                )));
-            }
-            None => (spec, None),
-        };
-
-        if target.is_empty() {
-            return Err(XpmError::Package("empty package name".to_string()));
-        }
-
-        let (repo, name) = match target.split_once('/') {
+        let (repo, target) = match spec.split_once('/') {
             Some((repo, name)) => {
                 if repo.is_empty() || name.is_empty() || name.contains('/') {
                     return Err(XpmError::Package(format!(
                         "invalid package requirement '{spec}' (expected repo/name)"
                     )));
                 }
-                (Some(repo.to_string()), name.to_string())
+                (Some(repo.to_string()), name)
             }
-            None => (None, target.to_string()),
+            None => (None, spec),
         };
 
+        if target.is_empty() {
+            return Err(XpmError::Package("empty package name".to_string()));
+        }
+
+        let dependency = DepConstraint::parse(target);
+        if dependency.name.is_empty() {
+            return Err(XpmError::Package(format!(
+                "invalid package requirement '{spec}' (empty package name)"
+            )));
+        }
+        if dependency.op.is_some()
+            && dependency
+                .version
+                .as_ref()
+                .is_none_or(|version| version.to_string().is_empty())
+        {
+            return Err(XpmError::Package(format!(
+                "invalid package requirement '{spec}' (missing version after operator)"
+            )));
+        }
+
         Ok(Self {
-            name,
-            version,
+            name: dependency.name,
+            op: dependency.op,
+            version: dependency.version,
             repo,
         })
     }
 
     fn constraint(&self) -> DepConstraint {
-        match &self.version {
-            Some(version) => DepConstraint {
-                name: self.name.clone(),
-                op: Some(Operator::Eq),
-                version: Some(version.clone()),
-            },
-            None => DepConstraint {
-                name: self.name.clone(),
-                op: None,
-                version: None,
-            },
+        DepConstraint {
+            name: self.name.clone(),
+            op: self.op,
+            version: self.version.clone(),
         }
     }
 
@@ -91,9 +93,9 @@ impl Requirement {
             Some(repo) => format!("{repo}/{}", self.name),
             None => self.name.clone(),
         };
-        match &self.version {
-            Some(version) => format!("{base}={version}"),
-            None => base,
+        match (&self.op, &self.version) {
+            (Some(op), Some(version)) => format!("{base}{op}{version}"),
+            _ => base,
         }
     }
 }
@@ -936,6 +938,28 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_alpm_version_operators_in_requirements() {
+        let ge = Requirement::parse("foo>=1.2-1").unwrap();
+        assert_eq!(ge.name, "foo");
+        assert_eq!(ge.op, Some(Operator::Ge));
+        assert_eq!(ge.version.as_ref().unwrap().to_string(), "1.2-1");
+
+        let gt = Requirement::parse("extra/foo>2.0").unwrap();
+        assert_eq!(gt.repo.as_deref(), Some("extra"));
+        assert_eq!(gt.op, Some(Operator::Gt));
+        assert!(Requirement::parse("foo=").is_err());
+    }
+
+    #[test]
+    fn operator_requirement_matches_a_newer_installed_candidate() {
+        let pacman = candidate("pacman", "7.1.0-1", &[], &[]);
+        let requests = vec![Requirement::parse("pacman>6.1").unwrap()];
+        let plan = resolve_closure(vec![pacman], &requests).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.name, "pacman");
     }
 
     #[test]

@@ -1727,6 +1727,7 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         .iter()
         .map(|name| Requirement {
             name: name.clone(),
+            op: None,
             version: None,
             repo: None,
         })
