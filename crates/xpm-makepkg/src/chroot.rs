@@ -91,6 +91,8 @@ struct TemplateStamp {
     arch: String,
     #[serde(default)]
     xpm_version: String,
+    #[serde(default)]
+    config_hash: String,
     created_at: u64,
     refreshed_at: u64,
 }
@@ -101,10 +103,18 @@ impl TemplateStamp {
             schema: STAMP_SCHEMA,
             arch: arch.to_string(),
             xpm_version: xpm_version(),
+            config_hash: config_hash(),
             created_at: now,
             refreshed_at: now,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TemplateAction {
+    Fresh,
+    Refresh,
+    Recreate,
 }
 
 fn ensure_template(
@@ -113,57 +123,68 @@ fn ensure_template(
     options: &BuildOptions,
     lock: &TemplateLock,
 ) -> BuildResult<()> {
-    if template_is_fresh(root, stamp_path, options) {
+    if template_action(root, stamp_path, options) == TemplateAction::Fresh {
         return Ok(());
     }
 
     lock.exclusive()?;
     // Another builder may have refreshed the template while we waited.
-    if template_is_fresh(root, stamp_path, options) {
+    let action = template_action(root, stamp_path, options);
+    if action == TemplateAction::Fresh {
         return Ok(());
     }
 
     let arch = current_arch();
     let now = now_epoch();
-    if template_is_ready(root) {
-        refresh_template(root, options)?;
-        let created_at = read_stamp(stamp_path)
-            .map(|stamp| stamp.created_at)
-            .unwrap_or(now);
-        let stamp = TemplateStamp {
-            schema: STAMP_SCHEMA,
-            arch,
-            xpm_version: xpm_version(),
-            created_at,
-            refreshed_at: now,
-        };
-        write_stamp(stamp_path, &stamp)?;
-    } else {
-        create_template(root)?;
-        write_stamp(stamp_path, &TemplateStamp::new(&arch, now))?;
+    match action {
+        TemplateAction::Recreate => {
+            create_template(root)?;
+            write_stamp(stamp_path, &TemplateStamp::new(&arch, now))?;
+        }
+        TemplateAction::Refresh => {
+            refresh_template(root, options)?;
+            let created_at = read_stamp(stamp_path)
+                .map(|stamp| stamp.created_at)
+                .unwrap_or(now);
+            let stamp = TemplateStamp {
+                schema: STAMP_SCHEMA,
+                arch,
+                xpm_version: xpm_version(),
+                config_hash: config_hash(),
+                created_at,
+                refreshed_at: now,
+            };
+            write_stamp(stamp_path, &stamp)?;
+        }
+        TemplateAction::Fresh => {}
     }
 
     Ok(())
 }
 
-fn template_is_fresh(root: &Path, stamp_path: &Path, options: &BuildOptions) -> bool {
-    if options.chroot_refresh || !template_is_ready(root) {
-        return false;
+fn template_action(root: &Path, stamp_path: &Path, options: &BuildOptions) -> TemplateAction {
+    if !template_is_ready(root) {
+        return TemplateAction::Recreate;
     }
     let Some(stamp) = read_stamp(stamp_path) else {
-        return false;
+        // Ready legacy root without a stamp: refresh it and create the stamp.
+        return TemplateAction::Refresh;
     };
-    if stamp.schema != STAMP_SCHEMA
-        || stamp.arch != current_arch()
-        || stamp.xpm_version != xpm_version()
-    {
-        return false;
+    if stamp.schema != STAMP_SCHEMA || stamp.arch != current_arch() {
+        return TemplateAction::Recreate;
     }
-    if options.chroot_ttl_days == 0 {
-        return false;
+    if !stamp.config_hash.is_empty() && stamp.config_hash != config_hash() {
+        return TemplateAction::Recreate;
+    }
+    if options.chroot_refresh || stamp.xpm_version != xpm_version() || options.chroot_ttl_days == 0
+    {
+        return TemplateAction::Refresh;
     }
     let age = now_epoch().saturating_sub(stamp.refreshed_at);
-    age < options.chroot_ttl_days.saturating_mul(SECONDS_PER_DAY)
+    if age >= options.chroot_ttl_days.saturating_mul(SECONDS_PER_DAY) {
+        return TemplateAction::Refresh;
+    }
+    TemplateAction::Fresh
 }
 
 fn template_is_ready(root: &Path) -> bool {
@@ -425,6 +446,24 @@ fn copy_host_keyring(root: &Path) -> BuildResult<()> {
 
 fn xpm_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Hash the host configuration that `xpm bootstrap` copies into the template.
+/// A changed repository list must recreate the template, not just upgrade it.
+fn config_hash() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in [
+        Path::new("/etc/xpm.conf"),
+        Path::new("/etc/pacman.conf"),
+        Path::new("/etc/pacman.d/mirrorlist"),
+    ] {
+        if let Ok(bytes) = fs::read(path) {
+            path.hash(&mut hasher);
+            bytes.hash(&mut hasher);
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 fn is_btrfs_subvolume(path: &Path) -> bool {
@@ -700,10 +739,12 @@ fn install_helpers(root: &Path) -> BuildResult<()> {
 }
 
 fn mount_shared_paths(root: &Path, options: &BuildOptions, build_uid: u32) -> BuildResult<()> {
+    // The guest xpm config always uses the default cache/database paths, so
+    // bind there even when the host config overrides them.
     if let Some(cache) = &options.cache_dir {
         let cache = cache.clone();
         let _ = run_root("mkdir", [OsStr::new("-p"), cache.as_os_str()]);
-        let target = root.join(cache.strip_prefix("/").unwrap_or(&cache));
+        let target = root.join("var/cache/xpm/pkg");
         run_root("mkdir", [OsStr::new("-p"), target.as_os_str()])?;
         bind_mount(&cache, &target, false)?;
     }
@@ -711,7 +752,7 @@ fn mount_shared_paths(root: &Path, options: &BuildOptions, build_uid: u32) -> Bu
     if let Some(db_path) = &options.xpm_db_path {
         let sync = db_path.join("sync");
         if sync.is_dir() {
-            let target = root.join(sync.strip_prefix("/").unwrap_or(&sync));
+            let target = root.join("var/lib/xpm/sync");
             run_root("mkdir", [OsStr::new("-p"), target.as_os_str()])?;
             bind_mount(&sync, &target, true)?;
         }
@@ -1176,14 +1217,23 @@ mod tests {
         write_stamp(&stamp_path, &stamp).unwrap();
 
         let mut options = options();
-        assert!(template_is_fresh(&root, &stamp_path, &options));
+        assert_eq!(
+            template_action(&root, &stamp_path, &options),
+            TemplateAction::Fresh
+        );
 
         options.chroot_refresh = true;
-        assert!(!template_is_fresh(&root, &stamp_path, &options));
+        assert_ne!(
+            template_action(&root, &stamp_path, &options),
+            TemplateAction::Fresh
+        );
 
         options.chroot_refresh = false;
         options.chroot_ttl_days = 0;
-        assert!(!template_is_fresh(&root, &stamp_path, &options));
+        assert_ne!(
+            template_action(&root, &stamp_path, &options),
+            TemplateAction::Fresh
+        );
 
         options.chroot_ttl_days = 7;
         let stale = TemplateStamp {
@@ -1191,12 +1241,28 @@ mod tests {
             ..stamp
         };
         write_stamp(&stamp_path, &stale).unwrap();
-        assert!(!template_is_fresh(&root, &stamp_path, &options));
+        assert_ne!(
+            template_action(&root, &stamp_path, &options),
+            TemplateAction::Fresh
+        );
 
         let wrong_arch = TemplateStamp::new("not-this-arch", now_epoch());
         write_stamp(&stamp_path, &wrong_arch).unwrap();
         options.chroot_ttl_days = 7;
-        assert!(!template_is_fresh(&root, &stamp_path, &options));
+        assert_eq!(
+            template_action(&root, &stamp_path, &options),
+            TemplateAction::Recreate
+        );
+
+        let changed_config = TemplateStamp {
+            config_hash: "different".into(),
+            ..TemplateStamp::new(&current_arch(), now_epoch())
+        };
+        write_stamp(&stamp_path, &changed_config).unwrap();
+        assert_eq!(
+            template_action(&root, &stamp_path, &options),
+            TemplateAction::Recreate
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
