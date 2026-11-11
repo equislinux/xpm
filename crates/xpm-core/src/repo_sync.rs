@@ -13,6 +13,10 @@ use crate::signing::{verify_file, VerifyOutcome};
 use crate::{XpmError, XpmResult};
 use sha2::{Digest, Sha256};
 
+/// Database and signature downloads are small; a stalled mirror must fail
+/// over quickly instead of blocking the whole sync for the package timeout.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Result metadata for a repository sync operation.
 #[derive(Debug, Clone)]
 pub struct RepoSyncResult {
@@ -56,7 +60,16 @@ pub fn sync_repo_databases(
         let db_url = format!("{base}/{}.db", repo.name);
         let db_sig_url = format!("{db_url}.sig");
 
-        match download_with_retries(&db_url, &db_temp, retries, true, None, None) {
+        match download_with_retries(
+            &db_url,
+            &db_temp,
+            retries,
+            true,
+            None,
+            None,
+            Some(METADATA_TIMEOUT),
+            true,
+        ) {
             Ok(()) => {
                 if let Err(err) =
                     verify_remote_signature(&db_temp, &db_sig_url, sig_level, keyring_path, retries)
@@ -74,6 +87,8 @@ pub fn sync_repo_databases(
                     true,
                     None,
                     None,
+                    Some(METADATA_TIMEOUT),
+                    true,
                 ) {
                     Ok(()) => {
                         let files_sig_url = format!("{files_url}.sig");
@@ -196,14 +211,24 @@ pub fn verify_remote_signature(
         1
     };
 
-    if let Err(err) = download_with_retries(sig_url, &sig_dest, attempts, true, None, None) {
+    let sig_warn = sig_level == SigLevel::Required;
+    if let Err(err) = download_with_retries(
+        sig_url,
+        &sig_dest,
+        attempts,
+        true,
+        None,
+        None,
+        Some(METADATA_TIMEOUT),
+        sig_warn,
+    ) {
         if sig_level == SigLevel::Required {
             return Err(XpmError::SignatureError(format!(
                 "signature required but could not be downloaded from {sig_url}: {err}"
             )));
         }
 
-        tracing::warn!(
+        tracing::debug!(
             artifact = %artifact_path.display(),
             sig_url,
             error = %err,
@@ -218,7 +243,7 @@ pub fn verify_remote_signature(
             if sig_level == SigLevel::Required {
                 return Err(err);
             }
-            tracing::warn!(
+            tracing::debug!(
                 artifact = %artifact_path.display(),
                 error = %err,
                 "signature check failed in optional mode; continuing"
@@ -358,7 +383,16 @@ fn download_first_available_with_progress(
     for url in urls {
         // One attempt per mirror: the next candidate is the retry. Repeating a
         // dead/timing-out mirror delays failover and stalls the worker pool.
-        match download_with_retries(url, dest, 1, show_progress, progress, expected_sha256) {
+        match download_with_retries(
+            url,
+            dest,
+            1,
+            show_progress,
+            progress,
+            expected_sha256,
+            None,
+            true,
+        ) {
             Ok(()) => return Ok(url.clone()),
             Err(err) => {
                 tracing::warn!(
@@ -405,15 +439,21 @@ fn download_with_retries(
     show_progress: bool,
     progress: Option<&ParallelDownloadProgress>,
     expected_sha256: Option<&str>,
+    timeout: Option<Duration>,
+    warn: bool,
 ) -> XpmResult<()> {
     let attempts = retries.max(1);
     let mut last_error: Option<XpmError> = None;
 
     for attempt in 1..=attempts {
-        match download_once(url, dest, show_progress, progress, expected_sha256) {
+        match download_once(url, dest, show_progress, progress, expected_sha256, timeout) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                tracing::warn!(url, attempt, attempts, error = %err, "download attempt failed");
+                if warn {
+                    tracing::warn!(url, attempt, attempts, error = %err, "download attempt failed");
+                } else {
+                    tracing::debug!(url, attempt, attempts, error = %err, "optional download unavailable");
+                }
                 if non_retryable(&err) {
                     return Err(err);
                 }
@@ -457,6 +497,7 @@ fn download_once(
     show_progress: bool,
     tracker: Option<&ParallelDownloadProgress>,
     expected_sha256: Option<&str>,
+    timeout: Option<Duration>,
 ) -> XpmResult<()> {
     if let Some(path) = local_file_path(url) {
         tracing::debug!(url, source = %path.display(), "syncing database from local file mirror");
@@ -470,8 +511,11 @@ fn download_once(
         return Ok(());
     }
 
-    let mut response = http_client()
-        .get(url)
+    let mut request = http_client().get(url);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let mut response = request
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| XpmError::Database(format!("{url}: {e}")))?;
