@@ -1,0 +1,11 @@
+[package]
+name = "xpm-progress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared terminal progress rendering for xpm and xpm-aur"
+
+[dependencies]
+libc = { workspace = true }

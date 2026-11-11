@@ -22,7 +22,7 @@ pub mod orphans;
 pub mod package;
 pub mod pacman_conf;
 pub mod pacman_db;
-pub mod progress;
+pub use xpm_progress as progress;
 pub mod query;
 pub mod replace;
 pub mod repo;

@@ -251,13 +251,32 @@ pub struct BuildArgs {
     #[arg(long)]
     pub clean: bool,
 
-    /// Build inside a clean devtools chroot (requires devtools and sudo).
+    /// Build inside a clean chroot (shared base-devel template + arch-chroot).
     #[arg(long)]
     pub chroot: bool,
 
-    /// Chroot root/copy directory (default: /var/lib/archbuild/xpm-aur).
+    /// Base directory for the shared template and disposable build copies
+    /// (default: /var/lib/archbuild/xpm-aur).
     #[arg(long, value_name = "PATH")]
     pub chroot_dir: Option<PathBuf>,
+
+    /// Install an official package into the clean chroot before building.
+    /// Can be repeated.
+    #[arg(long = "chroot-install", value_name = "PKG")]
+    pub chroot_install: Vec<String>,
+
+    /// Pass --nodeps to makepkg in the chroot; install dependencies with
+    /// --chroot-install / --preinstall first.
+    #[arg(long)]
+    pub nodeps: bool,
+
+    /// Force a shared base-devel template refresh before building.
+    #[arg(long)]
+    pub chroot_refresh: bool,
+
+    /// Maximum age of the shared template in days (0 refreshes every build).
+    #[arg(long, value_name = "DAYS", default_value_t = 7)]
+    pub chroot_ttl: u64,
 
     /// Install the built packages with xpm after a successful build.
     #[arg(long)]

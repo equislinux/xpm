@@ -686,6 +686,12 @@ fn cmd_build(config: &XpmConfig, args: &cli::BuildArgs, no_confirm: bool) -> Res
             .clone()
             .unwrap_or_else(|| PathBuf::from("/var/lib/archbuild/xpm-aur")),
         preinstall: args.preinstall.clone(),
+        chroot_install: args.chroot_install.clone(),
+        chroot_nodeps: args.nodeps,
+        chroot_refresh: args.chroot_refresh,
+        chroot_ttl_days: args.chroot_ttl,
+        cache_dir: Some(config.options.cache_dir.clone()),
+        xpm_db_path: Some(config.options.db_path.clone()),
         extra_args: args.makepkg_args.clone(),
     };
 
