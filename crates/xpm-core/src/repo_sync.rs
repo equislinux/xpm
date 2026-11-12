@@ -13,6 +13,10 @@ use crate::signing::{verify_file, VerifyOutcome};
 use crate::{XpmError, XpmResult};
 use sha2::{Digest, Sha256};
 
+/// Database and signature downloads are small; a stalled mirror must fail
+/// over quickly instead of blocking the whole sync for the package timeout.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Result metadata for a repository sync operation.
 #[derive(Debug, Clone)]
 pub struct RepoSyncResult {
@@ -56,7 +60,16 @@ pub fn sync_repo_databases(
         let db_url = format!("{base}/{}.db", repo.name);
         let db_sig_url = format!("{db_url}.sig");
 
-        match download_with_retries(&db_url, &db_temp, retries, true, None) {
+        match download_with_retries(
+            &db_url,
+            &db_temp,
+            retries,
+            true,
+            None,
+            None,
+            Some(METADATA_TIMEOUT),
+            true,
+        ) {
             Ok(()) => {
                 if let Err(err) =
                     verify_remote_signature(&db_temp, &db_sig_url, sig_level, keyring_path, retries)
@@ -73,6 +86,9 @@ pub fn sync_repo_databases(
                     retries,
                     true,
                     None,
+                    None,
+                    Some(METADATA_TIMEOUT),
+                    true,
                 ) {
                     Ok(()) => {
                         let files_sig_url = format!("{files_url}.sig");
@@ -195,14 +211,24 @@ pub fn verify_remote_signature(
         1
     };
 
-    if let Err(err) = download_with_retries(sig_url, &sig_dest, attempts, true, None) {
+    let sig_warn = sig_level == SigLevel::Required;
+    if let Err(err) = download_with_retries(
+        sig_url,
+        &sig_dest,
+        attempts,
+        true,
+        None,
+        None,
+        Some(METADATA_TIMEOUT),
+        sig_warn,
+    ) {
         if sig_level == SigLevel::Required {
             return Err(XpmError::SignatureError(format!(
                 "signature required but could not be downloaded from {sig_url}: {err}"
             )));
         }
 
-        tracing::warn!(
+        tracing::debug!(
             artifact = %artifact_path.display(),
             sig_url,
             error = %err,
@@ -217,7 +243,7 @@ pub fn verify_remote_signature(
             if sig_level == SigLevel::Required {
                 return Err(err);
             }
-            tracing::warn!(
+            tracing::debug!(
                 artifact = %artifact_path.display(),
                 error = %err,
                 "signature check failed in optional mode; continuing"
@@ -357,23 +383,25 @@ fn download_first_available_with_progress(
     for url in urls {
         // One attempt per mirror: the next candidate is the retry. Repeating a
         // dead/timing-out mirror delays failover and stalls the worker pool.
-        match download_with_retries(url, dest, 1, show_progress, progress) {
-            Ok(()) => {
-                if let Some(expected) = expected_sha256 {
-                    if let Err(err) = verify_sha256(dest, expected) {
-                        let _ = fs::remove_file(dest);
-                        tracing::warn!(
-                            url,
-                            error = %err,
-                            "downloaded package failed checksum; trying next mirror"
-                        );
-                        last_error = Some(err);
-                        continue;
-                    }
-                }
-                return Ok(url.clone());
+        match download_with_retries(
+            url,
+            dest,
+            1,
+            show_progress,
+            progress,
+            expected_sha256,
+            None,
+            true,
+        ) {
+            Ok(()) => return Ok(url.clone()),
+            Err(err) => {
+                tracing::warn!(
+                    url,
+                    error = %err,
+                    "download failed or failed verification; trying next mirror"
+                );
+                last_error = Some(err);
             }
-            Err(err) => last_error = Some(err),
         }
     }
 
@@ -410,15 +438,22 @@ fn download_with_retries(
     retries: u32,
     show_progress: bool,
     progress: Option<&ParallelDownloadProgress>,
+    expected_sha256: Option<&str>,
+    timeout: Option<Duration>,
+    warn: bool,
 ) -> XpmResult<()> {
     let attempts = retries.max(1);
     let mut last_error: Option<XpmError> = None;
 
     for attempt in 1..=attempts {
-        match download_once(url, dest, show_progress, progress) {
+        match download_once(url, dest, show_progress, progress, expected_sha256, timeout) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                tracing::warn!(url, attempt, attempts, error = %err, "download attempt failed");
+                if warn {
+                    tracing::warn!(url, attempt, attempts, error = %err, "download attempt failed");
+                } else {
+                    tracing::debug!(url, attempt, attempts, error = %err, "optional download unavailable");
+                }
                 if non_retryable(&err) {
                     return Err(err);
                 }
@@ -461,14 +496,26 @@ fn download_once(
     dest: &Path,
     show_progress: bool,
     tracker: Option<&ParallelDownloadProgress>,
+    expected_sha256: Option<&str>,
+    timeout: Option<Duration>,
 ) -> XpmResult<()> {
     if let Some(path) = local_file_path(url) {
         tracing::debug!(url, source = %path.display(), "syncing database from local file mirror");
-        return copy_local_file(&path, dest, tracker);
+        copy_local_file(&path, dest, tracker)?;
+        if let Some(expected) = expected_sha256 {
+            if let Err(err) = verify_sha256(dest, expected) {
+                let _ = fs::remove_file(dest);
+                return Err(err);
+            }
+        }
+        return Ok(());
     }
 
-    let mut response = http_client()
-        .get(url)
+    let mut request = http_client().get(url);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let mut response = request
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| XpmError::Database(format!("{url}: {e}")))?;
@@ -481,51 +528,61 @@ fn download_once(
     if let (Some(total), Some(tracker)) = (total, tracker) {
         tracker.add_total(total);
     }
-    let temp_path = dest.with_extension("part");
-    let mut file = fs::File::create(&temp_path)?;
-    let mut downloaded: u64 = 0;
-    let mut buffer = [0u8; 65536];
-    let mut next_report: u64 = 25;
-    let mut progress = show_progress.then(|| DownloadProgress::new(dest));
-    let mut last_percent: Option<u64> = None;
+    let temp_path = unique_temp_path(dest);
+    let result = (|| -> XpmResult<()> {
+        let mut file = fs::File::create(&temp_path)?;
+        let mut downloaded: u64 = 0;
+        let mut buffer = [0u8; 65536];
+        let mut next_report: u64 = 25;
+        let mut progress = show_progress.then(|| DownloadProgress::new(dest));
+        let mut last_percent: Option<u64> = None;
 
-    loop {
-        let n = response
-            .read(&mut buffer)
-            .map_err(|e| XpmError::Database(format!("{url}: {e}")))?;
-        if n == 0 {
-            break;
-        }
+        loop {
+            let n = response
+                .read(&mut buffer)
+                .map_err(|e| XpmError::Database(format!("{url}: {e}")))?;
+            if n == 0 {
+                break;
+            }
 
-        file.write_all(&buffer[..n])?;
-        downloaded += n as u64;
-        if let Some(tracker) = tracker {
-            tracker.add_downloaded(n as u64);
-        }
+            file.write_all(&buffer[..n])?;
+            downloaded += n as u64;
+            if let Some(tracker) = tracker {
+                tracker.add_downloaded(n as u64);
+            }
 
-        if let Some(total) = total {
-            let percent = percentage(downloaded, total);
-            if last_percent != Some(percent) {
-                if let Some(progress) = progress.as_mut() {
-                    progress.update(downloaded, total);
+            if let Some(total) = total {
+                let percent = percentage(downloaded, total);
+                if last_percent != Some(percent) {
+                    if let Some(progress) = progress.as_mut() {
+                        progress.update(downloaded, total);
+                    }
+                    last_percent = Some(percent);
                 }
-                last_percent = Some(percent);
-            }
-            if percent >= next_report {
-                tracing::debug!(url, downloaded, total, percent, "download progress");
-                next_report = (next_report + 25).min(100);
+                if percent >= next_report {
+                    tracing::debug!(url, downloaded, total, percent, "download progress");
+                    next_report = (next_report + 25).min(100);
+                }
             }
         }
+
+        file.flush()?;
+        // Verify before publishing the file: a concurrent downloader or a
+        // broken mirror must never replace a valid cache entry with bad bytes.
+        if let Some(expected) = expected_sha256 {
+            verify_sha256(&temp_path, expected)?;
+        }
+        fs::rename(&temp_path, dest)?;
+        if let (Some(total), Some(progress)) = (total, progress.as_mut()) {
+            progress.finish(downloaded, total);
+        }
+        tracing::debug!(url, downloaded, dest = %dest.display(), "download complete");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
     }
-
-    file.flush()?;
-    fs::rename(&temp_path, dest)?;
-
-    if let (Some(total), Some(progress)) = (total, progress.as_mut()) {
-        progress.finish(downloaded, total);
-    }
-
-    tracing::debug!(url, downloaded, dest = %dest.display(), "download complete");
+    result?;
     Ok(())
 }
 
@@ -629,12 +686,29 @@ fn write_atomically(dest: &Path, bytes: &[u8]) -> XpmResult<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let temp_path = dest.with_extension("part");
-    let mut file = fs::File::create(&temp_path)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    fs::rename(&temp_path, dest)?;
-    Ok(())
+    let temp_path = unique_temp_path(dest);
+    let result = (|| -> XpmResult<()> {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        fs::rename(&temp_path, dest)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+/// Unique temp name so concurrent xpm/chroot processes can download the same
+/// package without sharing a `.part` file.
+fn unique_temp_path(dest: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    dest.with_extension(format!("part.{}.{nanos}", std::process::id()))
 }
 
 #[cfg(test)]

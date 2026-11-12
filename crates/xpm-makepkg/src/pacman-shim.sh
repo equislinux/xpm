@@ -4,6 +4,7 @@
 set -eu
 XPM=/usr/local/bin/xpm
 DB=/var/lib/xpm/local
+ARCH=$(cat /etc/xpm-arch 2>/dev/null || uname -m)
 
 list_pkgs() {
     if [ -d "$DB" ]; then
@@ -28,8 +29,7 @@ case "${1:-}" in
             [ -d "$dir" ] || continue
             ver=$(cat "$dir/version" 2>/dev/null || true)
             [ -n "$ver" ] || continue
-            arch="x86_64"
-            printf 'Name            : %s\nVersion         : %s\nArchitecture    : %s\n\n' "$name" "$ver" "$arch"
+            printf 'Name            : %s\nVersion         : %s\nArchitecture    : %s\n\n' "$name" "$ver" "$ARCH"
         done
         ;;
     -Qq)

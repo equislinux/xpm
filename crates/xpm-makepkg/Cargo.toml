@@ -9,5 +9,7 @@ description = "makepkg orchestration for xpm (build source packages, collect art
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+libc = { workspace = true }

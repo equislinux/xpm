@@ -10,7 +10,7 @@ const MIB: f64 = 1024.0 * 1024.0;
 /// Percentage of `downloaded` relative to `total`, clamped to 0..=100.
 ///
 /// A zero (or unknown) total reports zero instead of dividing by zero.
-pub(crate) fn percentage(downloaded: u64, total: u64) -> u64 {
+pub fn percentage(downloaded: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
     }
@@ -102,7 +102,7 @@ pub(crate) fn bar(percent: u64, width: usize) -> String {
 }
 
 /// Render a byte count in MiB with one decimal place.
-pub(crate) fn format_mib(bytes: u64) -> String {
+pub fn format_mib(bytes: u64) -> String {
     format!("{} MiB", mib_value(bytes))
 }
 
@@ -392,6 +392,49 @@ pub fn finish_all() {
     });
 }
 
+// ── Phase progress ───────────────────────────────────────────────────────────
+
+/// One bar per phase step, rendered with the same aligned label/bar layout as
+/// the package progress lines.
+///
+/// This is the shared implementation used by `xpm-aur` for its own phases
+/// (`resolve`, `checkout`, `state`, ...), so the helper never grows a second
+/// progress style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhaseProgress {
+    label_width: usize,
+    bar_width: usize,
+}
+
+impl PhaseProgress {
+    /// Build a layout for the labels in one transaction.
+    pub fn new<'a>(labels: impl IntoIterator<Item = &'a str>) -> Self {
+        let longest = labels
+            .into_iter()
+            .map(|label| label.chars().count())
+            .max()
+            .unwrap_or(12);
+        Self {
+            label_width: longest.clamp(12, 32),
+            bar_width: 20,
+        }
+    }
+
+    /// Render `label [xxxx----]  50%  phase`.
+    pub fn render(&self, label: &str, step: u64, total: u64, phase: &str) -> String {
+        let percent = percentage(step, total);
+        let label = align_label(label, self.label_width);
+        format!(
+            "{label} [{}] {percent:>3}%  {phase}",
+            bar(percent, self.bar_width)
+        )
+    }
+
+    pub fn print(&self, label: &str, step: u64, total: u64, phase: &str) {
+        eprintln!("{}", self.render(label, step, total, phase));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +532,28 @@ mod tests {
         let style = ProgressStyle::for_download();
         assert!(style.label_width >= 12);
         assert!(style.bar_width >= 10);
+    }
+
+    #[test]
+    fn phase_bars_share_one_column() {
+        let progress = PhaseProgress::new(["foo", "a-very-long-package"]);
+        let short = progress.render("foo", 1, 3, "building");
+        let long = progress.render("a-very-long-package", 1, 3, "building");
+        assert_eq!(short.find('['), long.find('['));
+    }
+
+    #[test]
+    fn phase_long_labels_are_truncated() {
+        let progress = PhaseProgress::new(["x"]);
+        let line = progress.render("a-very-long-package-name", 1, 3, "building");
+        assert!(line.starts_with("a-very-lon.."));
+        assert_eq!(line.find('['), Some(13));
+    }
+
+    #[test]
+    fn phase_zero_total_is_zero_percent() {
+        let progress = PhaseProgress::new(["x"]);
+        let line = progress.render("pkg", 3, 0, "idle");
+        assert!(line.contains("  0%"));
     }
 }
