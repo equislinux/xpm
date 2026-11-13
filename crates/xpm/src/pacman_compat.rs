@@ -462,7 +462,11 @@ fn parse_long_option(args: &[OsString], index: usize, flags: &mut Flags) -> Opti
             flags.nodeps = true;
             Some(index + 1)
         }
-        "--verbose" | "--no-pacman-mirror" | "--shell-integration" | "--no-shell-integration" => {
+        "--verbose"
+        | "--no-pacman-mirror"
+        | "--no-alpm-hooks"
+        | "--shell-integration"
+        | "--no-shell-integration" => {
             require_no_inline_value(inline_value)?;
             flags.globals.push(args[index].clone());
             Some(index + 1)

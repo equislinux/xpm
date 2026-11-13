@@ -95,10 +95,10 @@ impl ParallelDownloadProgress {
     }
 }
 
-/// Render an ASCII progress bar such as `xxxxxxxxxx----------`.
+/// Render an ASCII progress bar such as `//////////----------`.
 pub(crate) fn bar(percent: u64, width: usize) -> String {
     let filled = (percent.min(100) as usize).saturating_mul(width) / 100;
-    format!("{}{}", "x".repeat(filled), "-".repeat(width - filled))
+    format!("{}{}", "/".repeat(filled), "-".repeat(width - filled))
 }
 
 /// Render a byte count in MiB with one decimal place.
@@ -291,8 +291,7 @@ fn unified_line(state: &UnifiedState) -> Option<String> {
         .checked_div(all_total)
         .unwrap_or(0);
     let width = 20usize;
-    let filled = (percent.min(100) * width) / 100;
-    let bar = format!("{}{}", "#".repeat(filled), "-".repeat(width - filled));
+    let bar = bar(percent as u64, width);
     Some(format!(":: [{bar}] {percent:>3}%  {}", parts.join(" | ")))
 }
 
@@ -420,7 +419,7 @@ impl PhaseProgress {
         }
     }
 
-    /// Render `label [xxxx----]  50%  phase`.
+    /// Render `label [////----]  50%  phase`.
     pub fn render(&self, label: &str, step: u64, total: u64, phase: &str) -> String {
         let percent = percentage(step, total);
         let label = align_label(label, self.label_width);
@@ -456,9 +455,9 @@ mod tests {
     #[test]
     fn bar_fills_proportionally_and_clamps() {
         assert_eq!(bar(0, 20), "--------------------");
-        assert_eq!(bar(52, 20), "xxxxxxxxxx----------");
-        assert_eq!(bar(100, 20), "xxxxxxxxxxxxxxxxxxxx");
-        assert_eq!(bar(150, 20), "xxxxxxxxxxxxxxxxxxxx");
+        assert_eq!(bar(52, 20), "//////////----------");
+        assert_eq!(bar(100, 20), "////////////////////");
+        assert_eq!(bar(150, 20), "////////////////////");
         assert_eq!(bar(0, 0), "");
     }
 
@@ -470,7 +469,33 @@ mod tests {
     }
 
     #[test]
-    fn progress_line_matches_pacman_style() {
+    fn progress_bars_never_render_x_or_hash_fill() {
+        for percent in [0, 1, 50, 100] {
+            let rendered = bar(percent, 20);
+            assert!(!rendered.contains('x'), "unexpected x fill: {rendered}");
+            assert!(!rendered.contains('#'), "unexpected hash fill: {rendered}");
+        }
+        assert!(bar(50, 20).contains('/'));
+
+        let state = UnifiedState {
+            enabled: true,
+            tty: false,
+            verbose: false,
+            totals: [1, 1, 1],
+            done: [1, 1, 1],
+            last_draw: None,
+            started: true,
+        };
+        let line = unified_line(&state).expect("unified line");
+        assert!(!line.contains('#'), "unexpected hash fill: {line}");
+        assert!(
+            line.contains("[////////////////////]"),
+            "unexpected unified bar: {line}"
+        );
+    }
+
+    #[test]
+    fn progress_line_uses_slash_fill() {
         let line = ProgressStyle {
             label_width: 11,
             bar_width: 20,
@@ -478,7 +503,7 @@ mod tests {
         .render("pkg.tar.zst", 13 * 1024 * 1024, 26 * 1024 * 1024);
         assert_eq!(
             line,
-            "pkg.tar.zst [xxxxxxxxxx----------]  50%  13.0/26.0 MiB"
+            "pkg.tar.zst [//////////----------]  50%  13.0/26.0 MiB"
         );
     }
 

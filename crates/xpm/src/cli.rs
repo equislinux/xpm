@@ -28,7 +28,7 @@ pub struct Cli {
     #[arg(long, global = true, alias = "noconfirm")]
     pub no_confirm: bool,
 
-    /// Accepted for pacman/makepkg compatibility; xpm has no progress bar.
+    /// Disable the combined progress line (pacman/makepkg compatibility).
     #[arg(long, global = true, hide = true)]
     pub noprogressbar: bool,
 
@@ -55,6 +55,10 @@ pub struct Cli {
     /// Do not mirror transactions into pacman's local database.
     #[arg(long, global = true)]
     pub no_pacman_mirror: bool,
+
+    /// Do not execute pacman-style ALPM hooks for this transaction.
+    #[arg(long, global = true)]
+    pub no_alpm_hooks: bool,
 
     /// Enable ~/.local/bin shims and rc edits for non-root installs.
     #[arg(long, global = true)]
