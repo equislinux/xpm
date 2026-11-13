@@ -541,6 +541,7 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     boot.options.log_file = root.join("var/log/xpm.log");
     boot.options.pacman_db = None;
     boot.options.mirror_pacman = false;
+    boot.options.alpm_hooks = false;
     boot.options.shell_integration = false;
 
     println!(
@@ -617,7 +618,6 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     conf.push_str("log_file = \"/var/log/xpm.log\"\n");
     conf.push_str("gpg_dir = \"/etc/xpm/gnupg\"\n");
     conf.push_str("shell_integration = false\n");
-    conf.push_str("alpm_hooks = false\n");
     conf.push_str("mirror_pacman = false\n");
     conf.push_str(&format!(
         "parallel_downloads = {}\n",
