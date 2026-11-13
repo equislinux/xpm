@@ -9,9 +9,6 @@ ARCH=$(cat /etc/xpm-arch 2>/dev/null || uname -m)
 list_pkgs() {
     if [ -d "$DB" ]; then
         find "$DB" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
-    elif [ -d /var/lib/pacman/local ]; then
-        find /var/lib/pacman/local -mindepth 1 -maxdepth 1 -type d \
-            ! -name 'ALPM_DB_VERSION' -printf '%f\n' | sed 's/-[^-]*-[^-]*$//' | sort
     fi
 }
 
