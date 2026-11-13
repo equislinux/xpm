@@ -207,11 +207,14 @@ root_dir = "/"
 db_path = "/var/lib/xpm/"
 cache_dir = "/var/cache/xpm/pkg/"
 log_file = "/var/log/xpm.log"
-gpg_dir = "/etc/pacman.d/gnupg/"     # default del código
+gpg_dir = "/etc/xpm/gnupg/"     # default del código
 sig_level = "optional"               # optional | required | never
 color = true
 parallel_downloads = 5
 check_space = true
+# mirror_pacman = false              # opt-in pacman local DB mirror
+# pacman_db = "/var/lib/pacman"
+alpm_hooks = true                    # false skips pacman-style .hook files
 # architecture = "x86_64"            # autodetectado si no se define
 # hold_pkg = ["linux"]
 # ignore_pkg = [...]
@@ -228,8 +231,8 @@ Notas:
 - Si el archivo no existe, xpm cae a los defaults integrados (`XpmConfig::default`), cuyo único
   repositorio es `x` en `https://equislinux.github.io/x-repo/x/$arch`.
 - El directorio GPG se resuelve con `effective_gpg_dir()`: el `gpg_dir` configurado si existe,
-  luego `/etc/pacman.d/gnupg` (compartido con pacman) y luego `/etc/xpm/gnupg`. La vieja
-  discrepancia código/README ya no existe.
+  luego el keyring nativo `/etc/xpm/gnupg`. El keyring de pacman solo se usa si se configura
+  explícitamente.
 - La validación de config rechaza `parallel_downloads = 0`, nombres de repo vacíos y
   repositorios sin servidores.
 - `sig_level` puede definirse globalmente o por repositorio; el valor por repo gana si está

@@ -15,13 +15,17 @@ keeping a compatibility layer for the ecosystem that still expects pacman.
 - [x] xpm-aur installs build dependencies with xpm and runs `makepkg --nodeps`.
 - [x] The pacman shim covers `/usr/local/bin/pacman` and `/usr/bin/pacman`
       inside disposable roots.
+- [x] Native defaults use `/var/lib/xpm`, `/var/cache/xpm/pkg`, `/var/log/xpm.log`
+      and `/etc/xpm/gnupg`; pacman DB/keyring are explicit compatibility opt-ins.
+- [x] `--no-alpm-hooks` / `alpm_hooks = false` can skip pacman-style hooks that
+      shell out to pacman (for example mkinitcpio's `pacman -Qoq`).
 - [ ] `libalpm` is not used (and should not be required for normal operation).
 
 ## P0 — Remove pacman from the build bootstrap
 
 - [x] Add `xpm bootstrap --root DIR [packages...]`.
 - [x] Bootstrap an empty root with xpm: sync, filesystem, bash, then the rest.
-- [x] Use the host pacman keyring only for verification; never run pacman.
+- [x] Use the effective/native keyring for verification; never run pacman.
 - [x] Make `xpm build --chroot` use xpm bootstrap instead of `pacstrap`.
 - [x] Replace `pacman -U /preinstall/*` with xpm local-package install.
 - [x] Cache/reuse the bootstrap root; avoid creating base-devel per AUR base.
@@ -49,7 +53,8 @@ while generating `.BUILDINFO`; that is the next concrete blocker.
 - [x] Add a minimal `pacman` shim for makepkg (`-Qi`, `-Qq`, `-T`, `-S`, `-U`, `-R`); validate against a clean build.
 - [ ] Cover the commands used by makepkg and common AUR scripts (`-Q`, `-T`,
       `-Qq`, `-Qm`, `-U`, `-S`, `-R`, `-Sy`, `-Syu`, `--version`).
-- [ ] Keep pacman's local DB and keyring readable/writable for interoperability.
+- [ ] Keep pacman's local DB and keyring readable/writable when compatibility
+      mode is explicitly enabled.
 - [ ] Implement or validate `provides`, `replaces`, `conflicts`, `groups`,
       hooks and scriptlet semantics against pacman behavior.
 - [ ] Add an audit test that fails if new code shells out to pacman.

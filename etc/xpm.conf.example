@@ -21,8 +21,8 @@ cache_dir = "/var/cache/xpm/pkg/"
 # Log file location (default: /var/log/xpm.log)
 log_file = "/var/log/xpm.log"
 
-# GPG keyring directory (default: /etc/pacman.d/gnupg/)
-gpg_dir = "/etc/pacman.d/gnupg/"
+# GPG keyring directory (default: /etc/xpm/gnupg/)
+gpg_dir = "/etc/xpm/gnupg/"
 
 # System architecture (auto-detected if not set)
 # architecture = "x86_64"
@@ -39,6 +39,16 @@ parallel_downloads = 10
 
 # Check available disk space before installing
 check_space = true
+
+# Pacman compatibility is explicit and disabled by default.
+# Set mirror_pacman = true and pacman_db to keep pacman -Q in sync.
+# mirror_pacman = false
+# pacman_db = "/var/lib/pacman"
+
+# Execute pacman-style ALPM .hook files around transactions (default: true).
+# Set false for native installs that must not call pacman from a hook,
+# such as mkinitcpio's pacman -Qoq hook.
+alpm_hooks = true
 
 # Packages that should never be upgraded
 # hold_pkg = ["linux", "linux-headers"]

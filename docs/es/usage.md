@@ -18,6 +18,8 @@ Estas flags las acepta cualquier subcomando.
 | `--dbpath` | | `PATH` | Directorio de base de datos alternativo |
 | `--cachedir` | | `PATH` | Directorio de caché alternativo |
 | `--no-color` | | | Desactiva la salida con color |
+| `--no-pacman-mirror` | | | Desactiva el mirror opt-in a la base de datos de pacman |
+| `--no-alpm-hooks` | | | Omite los `.hook` estilo ALPM en esta transacción |
 
 La CLI está definida con `clap` y exige un subcomando (`arg_required_else_help = true`).
 
@@ -44,10 +46,12 @@ fallos de sync remoto se avisan sin abortar toda la ejecución.
 
 ### `install` — Instalar paquetes
 
-Alias: `S`. Instala uno o más paquetes por nombre desde las bases de datos sincronizadas.
+Alias: `S`. Instala uno o más paquetes por nombre desde las bases de datos sincronizadas, o
+directamente desde un archivo local `.xp` / `.pkg.tar.*`.
 
 ```bash
 xpm install <PACKAGES>... [OPTIONS]
+xpm install /ruta/al/paquete.pkg.tar.zst
 xpm S <PACKAGES>... [OPTIONS]
 ```
 

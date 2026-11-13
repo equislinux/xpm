@@ -17,6 +17,8 @@ These flags can be used with any subcommand.
 | `--dbpath` | — | `PATH` | Alternative database directory |
 | `--cachedir` | — | `PATH` | Alternative cache directory |
 | `--no-color` | — | — | Disable colored output |
+| `--no-pacman-mirror` | — | — | Disable the opt-in pacman local DB mirror |
+| `--no-alpm-hooks` | — | — | Skip pacman-style ALPM `.hook` execution for this transaction |
 
 ---
 
@@ -48,8 +50,9 @@ xpm Sy -f                 # Same as above, pacman-style
 ### `install` — Install Packages
 
 Install one or more packages from sync databases. Dependencies are resolved with the SAT
-solver. Arguments that point to an existing `.xp` file are installed straight from disk
-(`origin=local`) and may be mixed with repository package names (`name`, `name=version` or `name>=version`).
+solver. Arguments that point to an existing `.xp` or `.pkg.tar.*` archive (including
+`.pkg.tar.zst`) are installed straight from disk (`origin=local`) and may be mixed with
+repository package names (`name`, `name=version` or `name>=version`).
 
 ```bash
 xpm install <PACKAGES>... [OPTIONS]
@@ -153,10 +156,10 @@ Existing entries with the same version are skipped (repair mode).
 xpm sync-pacman-db [--pacman-db /var/lib/pacman]
 ```
 
-The mirror is also performed automatically after install, upgrade and remove
-when `/var/lib/pacman` exists and `root_dir` is `/`. Disable it with
-`--no-pacman-mirror`, or configure `pacman_db` / `mirror_pacman` in
-`/etc/xpm.conf`.
+The mirror is opt-in. It is not performed automatically in the native flow.
+Enable it explicitly with `mirror_pacman = true` (and optionally `pacman_db`)
+in `/etc/xpm.conf`; `--no-pacman-mirror` disables it for one invocation.
+`sync-pacman-db` still works as an explicit compatibility command.
 
 ---
 
@@ -493,6 +496,7 @@ removal (`--nosave` disables the latter).
 | `XPM_CACHE_DIR` | Override default cache directory |
 | `XPM_HOOKS_DIR` | Override the transaction-hook root (default `/usr/lib/xpm/hooks`) |
 | `XPM_ALPM_HOOKS_DIRS` | Colon-separated ALPM `.hook` directories (default `/usr/share/libalpm/hooks:/etc/pacman.d/hooks`) |
+| `XPM_NO_PROGRESS` | Disable progress rendering (`1`) |
 | `X_GEN_STATE` | Generations state directory (default `<root>/var/lib/x`) used by `history`/`diff` |
 | `NO_COLOR` | Disable colored output (standard) |
 | `RUST_LOG` | Set logging verbosity (e.g., `debug`, `trace`) |

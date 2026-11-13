@@ -255,11 +255,20 @@ fn refresh_template(root: &Path, options: &BuildOptions) -> BuildResult<()> {
         }
     };
 
-    // The template carries a public copy of the host keyring. Refresh it so a
-    // stale template can still verify current database signatures.
+    // The template carries a public copy of the native xpm keyring. Refresh
+    // it so a stale template can still verify current database signatures.
     copy_host_keyring(root)?;
     run(&["sync", "--force"])?;
-    run(&["install", "--needed", "--", "archlinux-keyring"])?;
+    // Keep the keyring package files current, but never run its scriptlet:
+    // archlinux-keyring's .INSTALL shells out to pacman-key.
+    run(&[
+        "install",
+        "--needed",
+        "--scriptlets",
+        "skip",
+        "--",
+        "archlinux-keyring",
+    ])?;
     run(&["upgrade"])?;
     // A group can gain members between snapshots; `upgrade` does not install
     // packages that were never present.
@@ -407,11 +416,11 @@ fn clone_template(template: &Path, work: &Path, lock: &TemplateLock) -> BuildRes
 }
 
 fn copy_host_keyring(root: &Path) -> BuildResult<()> {
-    let host = Path::new("/etc/pacman.d/gnupg");
+    let host = Path::new("/etc/xpm/gnupg");
     if !host.is_dir() {
         return Ok(());
     }
-    let target = root.join("etc/pacman.d/gnupg");
+    let target = root.join("etc/xpm/gnupg");
     run_root("mkdir", [OsStr::new("-p"), target.as_os_str()])?;
     for name in [
         "pubring.gpg",
@@ -453,15 +462,10 @@ fn xpm_version() -> String {
 fn config_hash() -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for path in [
-        Path::new("/etc/xpm.conf"),
-        Path::new("/etc/pacman.conf"),
-        Path::new("/etc/pacman.d/mirrorlist"),
-    ] {
-        if let Ok(bytes) = fs::read(path) {
-            path.hash(&mut hasher);
-            bytes.hash(&mut hasher);
-        }
+    let path = Path::new("/etc/xpm.conf");
+    if let Ok(bytes) = fs::read(path) {
+        path.hash(&mut hasher);
+        bytes.hash(&mut hasher);
     }
     format!("{:016x}", hasher.finish())
 }

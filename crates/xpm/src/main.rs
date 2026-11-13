@@ -23,8 +23,7 @@ use cli::{Cli, Command};
 use xpm_core::alpm_hooks::{self, HookOperation, HookTransaction, HookWhen};
 use xpm_core::cache::clean_cache;
 use xpm_core::check;
-use xpm_core::config::Repository;
-use xpm_core::config::SigLevel;
+use xpm_core::config::{Repository, SigLevel, DEFAULT_GPG_DIR, PACMAN_GPG_DIR};
 use xpm_core::conflict;
 use xpm_core::depcheck;
 use xpm_core::deptest::{self, InstalledDependency};
@@ -87,21 +86,10 @@ fn main() -> Result<()> {
     tracing::debug!("xpm v{}", env!("CARGO_PKG_VERSION"));
 
     // ── Load configuration ──────────────────────────────────────────────
-    // `--sysroot` behaves like pacman's: configuration is discovered inside
-    // the guest root. An explicit `--config` always wins and is loaded as-is.
-    let sysroot_config = cli.sysroot.as_ref().map(|root| {
-        let xpm_conf = root.join("etc/xpm.conf");
-        if xpm_conf.exists() {
-            xpm_conf
-        } else {
-            let pacman_conf = root.join("etc/pacman.conf");
-            if pacman_conf.exists() {
-                pacman_conf
-            } else {
-                xpm_conf
-            }
-        }
-    });
+    // `--sysroot` discovers xpm's own configuration inside the guest root.
+    // Pacman's configuration is only parsed when the caller passes it with
+    // `--config` explicitly.
+    let sysroot_config = cli.sysroot.as_ref().map(|root| root.join("etc/xpm.conf"));
     let config_path = cli
         .config
         .clone()
@@ -135,11 +123,6 @@ fn main() -> Result<()> {
             XpmConfig::load(&config_path)
                 .with_context(|| format!("failed to load config from {}", config_path.display()))?
         }
-    } else if cli.sysroot.is_none() && Path::new("/etc/pacman.conf").exists() {
-        XpmConfig::from_pacman(
-            xpm_core::pacman_conf::parse_pacman_conf(Path::new("/etc/pacman.conf"))
-                .context("failed to load /etc/pacman.conf")?,
-        )
     } else {
         XpmConfig::load_or_default(&config_path)
             .with_context(|| format!("failed to load config from {}", config_path.display()))?
@@ -158,6 +141,9 @@ fn main() -> Result<()> {
     }
     if cli.no_pacman_mirror {
         config.options.mirror_pacman = false;
+    }
+    if cli.no_alpm_hooks {
+        config.options.alpm_hooks = false;
     }
     config.options.shell_integration = cli.shell_integration && !cli.no_shell_integration;
     if let Some(mode) = &cli.scriptlets {
@@ -191,13 +177,17 @@ fn main() -> Result<()> {
             {
                 config.options.cache_dir = root.join("var/cache/xpm/pkg");
             }
-            if sysroot_active || config.options.gpg_dir == Path::new("/etc/pacman.d/gnupg/") {
+            if config.options.gpg_dir == Path::new(PACMAN_GPG_DIR) {
                 config.options.gpg_dir = root.join("etc/pacman.d/gnupg");
+            } else if sysroot_active || config.options.gpg_dir == Path::new(DEFAULT_GPG_DIR) {
+                config.options.gpg_dir = root.join("etc/xpm/gnupg");
             }
             if sysroot_active || config.options.log_file == Path::new("/var/log/xpm.log") {
                 config.options.log_file = root.join("var/log/xpm.log");
             }
-            if sysroot_active || config.options.pacman_db.is_none() {
+            // The pacman DB is only relocated when compatibility mirroring was
+            // explicitly enabled; the native flow never auto-discovers it.
+            if config.options.mirror_pacman && config.options.pacman_db.is_none() {
                 config.options.pacman_db = Some(root.join("var/lib/pacman"));
             }
         }
@@ -552,10 +542,6 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     boot.options.pacman_db = None;
     boot.options.mirror_pacman = false;
     boot.options.shell_integration = false;
-    if Path::new("/etc/pacman.d/gnupg").is_dir() {
-        // Verify against the host keyring; the new root has no keyring yet.
-        boot.options.gpg_dir = PathBuf::from("/etc/pacman.d/gnupg");
-    }
 
     println!(
         ":: Bootstrapping {} with xpm (no pacman/pacstrap)",
@@ -598,12 +584,13 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     boot.options.scriptlet_mode = xpm_core::hooks::ScriptletMode::Auto;
     cmd_install(&boot, &install, true)?;
 
-    // Copy only the public/trust material from the host pacman keyring. The
-    // chroot's xpm needs it for official build dependencies; private keys are
-    // deliberately never copied.
-    let host_gpg = Path::new("/etc/pacman.d/gnupg");
+    // Copy only the public/trust material from the effective host keyring.
+    // The chroot's xpm needs it for official build dependencies; private keys
+    // are deliberately never copied. The target always uses the native xpm
+    // keyring path, even when compatibility mode read the host pacman keyring.
+    let host_gpg = boot.options.effective_gpg_dir();
     if host_gpg.is_dir() {
-        let target_gpg = root.join("etc/pacman.d/gnupg");
+        let target_gpg = root.join("etc/xpm/gnupg");
         fs::create_dir_all(&target_gpg)?;
         for name in [
             "pubring.gpg",
@@ -628,8 +615,9 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     conf.push_str("db_path = \"/var/lib/xpm\"\n");
     conf.push_str("cache_dir = \"/var/cache/xpm/pkg\"\n");
     conf.push_str("log_file = \"/var/log/xpm.log\"\n");
-    conf.push_str("gpg_dir = \"/etc/pacman.d/gnupg\"\n");
+    conf.push_str("gpg_dir = \"/etc/xpm/gnupg\"\n");
     conf.push_str("shell_integration = false\n");
+    conf.push_str("alpm_hooks = false\n");
     conf.push_str("mirror_pacman = false\n");
     conf.push_str(&format!(
         "parallel_downloads = {}\n",
@@ -2291,6 +2279,11 @@ fn run_alpm_hooks(
     paths: &[(String, HookOperation)],
     when: HookWhen,
 ) -> Result<()> {
+    if !config.options.alpm_hooks {
+        tracing::debug!("ALPM hooks disabled for this transaction");
+        return Ok(());
+    }
+
     let transaction = HookTransaction {
         packages: packages
             .iter()
@@ -3275,6 +3268,14 @@ fn auto_pacman_local(config: &XpmConfig) -> Option<PathBuf> {
     if !config.options.mirror_pacman {
         return None;
     }
+    detect_pacman_local(config)
+}
+
+/// Find a pacman local database for explicit compatibility commands.
+///
+/// This does not enable the automatic mirror; `sync-pacman-db` is the explicit
+/// opt-in path and must keep working with `mirror_pacman = false`.
+fn detect_pacman_local(config: &XpmConfig) -> Option<PathBuf> {
     if let Some(db) = &config.options.pacman_db {
         return Some(db.join("local"));
     }
@@ -3577,7 +3578,7 @@ fn cmd_sync_pacman_db(config: &XpmConfig, args: &cli::SyncPacmanDbArgs) -> Resul
         .pacman_db
         .as_ref()
         .map(|db| db.join("local"))
-        .or_else(|| auto_pacman_local(config))
+        .or_else(|| detect_pacman_local(config))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "pacman database not found; pass --pacman-db or set `pacman_db` in the config"
@@ -3672,6 +3673,8 @@ GLOBAL FLAGS:
     --dbpath <PATH>         Alternative database directory
     --cachedir <PATH>       Alternative cache directory
     --no-color              Disable colored output
+    --no-pacman-mirror      Disable the opt-in pacman DB mirror
+    --no-alpm-hooks         Skip pacman-style .hook files
 
 PACMAN ALIASES:
     Sy → sync     S → install    R → remove     Su → upgrade
@@ -3738,13 +3741,15 @@ GENERAL OPTIONS:
     db_path = "/var/lib/xpm/"         # Database directory
     cache_dir = "/var/cache/xpm/pkg/" # Package cache
     log_file = "/var/log/xpm.log"     # Log file location
-    gpg_dir = "/etc/pacman.d/gnupg/"  # GPG keyring (shared with pacman;
-                                      # falls back to /etc/xpm/gnupg)
+    gpg_dir = "/etc/xpm/gnupg/"       # Native xpm GPG keyring
     sig_level = "optional"            # required | optional | never
     parallel_downloads = 10           # Concurrent downloads
     check_space = true                # Check disk space
     color = true                      # Colored output
     architecture = "x86_64"           # System architecture
+    alpm_hooks = true                 # false skips pacman-style .hook files
+    # mirror_pacman = false           # opt-in pacman local DB mirror
+    # pacman_db = "/var/lib/pacman"
 
 PACKAGE LISTS:
     hold_pkg = ["linux"]              # Never upgrade these

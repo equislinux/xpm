@@ -18,6 +18,8 @@ These flags are accepted by every subcommand.
 | `--dbpath` | | `PATH` | Alternative database directory |
 | `--cachedir` | | `PATH` | Alternative cache directory |
 | `--no-color` | | | Disable colored output |
+| `--no-pacman-mirror` | | | Disable the opt-in pacman local DB mirror |
+| `--no-alpm-hooks` | | | Skip pacman-style ALPM `.hook` execution for this transaction |
 
 The CLI is defined with `clap` and requires a subcommand (`arg_required_else_help = true`).
 
@@ -44,10 +46,12 @@ warned and do not abort the whole run.
 
 ### `install` — Install packages
 
-Alias: `S`. Installs one or more packages by name from the synchronized databases.
+Alias: `S`. Installs one or more packages by name from the synchronized databases, or
+directly from a local `.xp` / `.pkg.tar.*` archive.
 
 ```bash
 xpm install <PACKAGES>... [OPTIONS]
+xpm install /path/to/package.pkg.tar.zst
 xpm S <PACKAGES>... [OPTIONS]
 ```
 

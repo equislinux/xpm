@@ -11,11 +11,12 @@ const DEFAULT_ROOT_DIR: &str = "/";
 const DEFAULT_DB_PATH: &str = "/var/lib/xpm/";
 const DEFAULT_CACHE_DIR: &str = "/var/cache/xpm/pkg/";
 const DEFAULT_LOG_FILE: &str = "/var/log/xpm.log";
-/// Keyring shared with pacman (X Linux ships pacman's keyring).
-pub const DEFAULT_GPG_DIR: &str = "/etc/pacman.d/gnupg/";
-/// Native xpm keyring, used when the pacman one is absent (or by preference
-/// through the `gpg_dir` option).
+/// Native xpm keyring, used by default.
+pub const DEFAULT_GPG_DIR: &str = "/etc/xpm/gnupg/";
+/// Native xpm keyring alias kept for callers that used the old name.
 pub const XPM_GPG_DIR: &str = "/etc/xpm/gnupg/";
+/// Pacman keyring; only used when explicitly configured for compatibility.
+pub const PACMAN_GPG_DIR: &str = "/etc/pacman.d/gnupg/";
 const DEFAULT_CONFIG_PATH: &str = "/etc/xpm.conf";
 
 // ── Configuration structs ───────────────────────────────────────────────────
@@ -79,14 +80,20 @@ pub struct GeneralOptions {
     pub parallel_downloads: u32,
     /// Check available disk space before installing.
     pub check_space: bool,
-    /// pacman database directory used for the compatibility mirror.
+    /// Pacman database directory used by the explicit compatibility mirror
+    /// (`sync-pacman-db`) or when `mirror_pacman = true`.
     ///
-    /// When unset and `root_dir` is `/`, `/var/lib/pacman` is used if it
-    /// exists. Set to a path to mirror into a different database, or disable
-    /// the mirror with `mirror_pacman = false`.
+    /// It is never auto-discovered in the native flow. Set it explicitly to
+    /// mirror into a different database.
     pub pacman_db: Option<PathBuf>,
-    /// Mirror xpm transactions into pacman's local database.
+    /// Mirror xpm transactions into pacman's local database (opt-in).
     pub mirror_pacman: bool,
+    /// Execute pacman-style ALPM hooks around transactions.
+    ///
+    /// Disable this when a package ships a hook that shells out to pacman
+    /// (for example mkinitcpio's `pacman -Qoq` hook) and the transaction must
+    /// stay fully native.
+    pub alpm_hooks: bool,
     /// Create `~/.local/bin` shims and edit shell rc files for non-root roots.
     /// Disabled by default; requiring it is opt-in for development roots.
     pub shell_integration: bool,
@@ -98,15 +105,11 @@ impl GeneralOptions {
     /// Keyring directory actually used for signature verification.
     ///
     /// Resolution order: the configured `gpg_dir` when it exists, then the
-    /// pacman keyring, then the native xpm keyring, and finally the configured
-    /// value (which produces the most useful error message when nothing
-    /// exists yet).
+    /// native xpm keyring, and finally the configured value (which produces
+    /// the most useful error message when nothing exists yet). Pacman's
+    /// keyring is only used when it is configured explicitly.
     pub fn effective_gpg_dir(&self) -> PathBuf {
-        for candidate in [
-            self.gpg_dir.as_path(),
-            Path::new(DEFAULT_GPG_DIR),
-            Path::new(XPM_GPG_DIR),
-        ] {
+        for candidate in [self.gpg_dir.as_path(), Path::new(DEFAULT_GPG_DIR)] {
             if candidate.is_dir() {
                 return candidate.to_path_buf();
             }
@@ -116,9 +119,8 @@ impl GeneralOptions {
 
     /// Path of the keyring file inside [`Self::effective_gpg_dir`].
     ///
-    /// pacman's keyring may be a legacy `trustedkeys.gpg` file or GnuPG's
-    /// `pubring.gpg`; prefer whichever exists so xpm can use the same trust
-    /// store as pacman without a separate initialization step.
+    /// Prefer a legacy `trustedkeys.gpg` file or GnuPG's `pubring.gpg` inside
+    /// the effective keyring directory.
     pub fn keyring_path(&self) -> PathBuf {
         let dir = self.effective_gpg_dir();
         for candidate in ["trustedkeys.gpg", "pubring.gpg"] {
@@ -149,7 +151,8 @@ impl Default for GeneralOptions {
             parallel_downloads: 10,
             check_space: true,
             pacman_db: None,
-            mirror_pacman: true,
+            mirror_pacman: false,
+            alpm_hooks: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
         }
@@ -281,9 +284,9 @@ fn sig_check_to_level(check: crate::pacman_conf::SigCheck) -> SigLevel {
 impl XpmConfig {
     /// Build an xpm configuration from a parsed pacman.conf.
     ///
-    /// xpm keeps its own local database (`/var/lib/xpm`) and mirrors into the
-    /// pacman database from `pacman_db`; repositories, trust policy, cache,
-    /// keyring and architecture come from pacman.
+    /// xpm keeps its own local database (`/var/lib/xpm`). Repositories, trust
+    /// policy, cache, keyring and architecture come from the explicitly
+    /// supplied pacman.conf; pacman DB mirroring remains opt-in.
     pub fn from_pacman(pacman: crate::pacman_conf::PacmanConfig) -> Self {
         let global = pacman.options.sig_level;
         let database_level = sig_check_to_level(global.database_check());
@@ -314,7 +317,8 @@ impl XpmConfig {
             parallel_downloads: pacman.options.parallel_downloads.max(1),
             check_space: pacman.options.check_space,
             pacman_db: Some(pacman.options.db_path.clone()),
-            mirror_pacman: true,
+            mirror_pacman: false,
+            alpm_hooks: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
         };
@@ -353,6 +357,9 @@ mod tests {
         assert_eq!(config.options.root_dir, PathBuf::from("/"));
         assert_eq!(config.options.db_path, PathBuf::from("/var/lib/xpm/"));
         assert_eq!(config.options.parallel_downloads, 10);
+        assert_eq!(config.options.gpg_dir, PathBuf::from("/etc/xpm/gnupg/"));
+        assert!(!config.options.mirror_pacman);
+        assert!(config.options.alpm_hooks);
         assert_eq!(config.repositories.len(), 1);
         assert_eq!(config.repositories[0].name, "x");
     }
@@ -370,11 +377,12 @@ color = true
 parallel_downloads = 3
 check_space = true
 
-# Mirror xpm transactions into pacman's local database so pacman -Q and the
-# generation tooling keep seeing xpm-managed packages. Auto-detected at
-# /var/lib/pacman when root_dir is "/" unless set here.
+# Opt-in pacman compatibility. The native flow does not auto-discover
+# /var/lib/pacman; enable the mirror explicitly when pacman -Q or legacy
+# tooling must see xpm-managed packages.
 # pacman_db = "/var/lib/pacman"
-# mirror_pacman = true
+# mirror_pacman = false
+# alpm_hooks = true          # false skips pacman-style .hook execution
 # shell_integration = false
 # scriptlet_mode = "auto"   # auto | skip | require
 
@@ -392,8 +400,25 @@ server = ["https://mirror.example.com/archlinux/extra/os/x86_64"]
 
         let config = XpmConfig::load(tmpfile.path()).unwrap();
         assert_eq!(config.options.parallel_downloads, 3);
+        assert!(!config.options.mirror_pacman);
         assert_eq!(config.repositories.len(), 2);
         assert_eq!(config.repositories[0].name, "core");
+    }
+
+    #[test]
+    fn alpm_hooks_can_be_disabled_in_config() {
+        let toml_content = r#"
+[options]
+alpm_hooks = false
+
+[[repo]]
+name = "x"
+server = ["https://example/$repo/$arch"]
+"#;
+        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+        tmpfile.write_all(toml_content.as_bytes()).unwrap();
+        let config = XpmConfig::load(tmpfile.path()).unwrap();
+        assert!(!config.options.alpm_hooks);
     }
 
     #[test]
@@ -447,6 +472,7 @@ server = ["https://mirror.example.com/archlinux/extra/os/x86_64"]
             config.options.pacman_db.as_deref(),
             Some(Path::new("/var/lib/pacman/"))
         );
+        assert!(!config.options.mirror_pacman);
         assert_eq!(config.repositories.len(), 2);
         assert_eq!(config.repositories[0].name, "x");
         assert_eq!(config.repositories[0].sig_level, Some(SigLevel::Required));
@@ -476,8 +502,9 @@ server = ["https://mirror.example.com/archlinux/extra/os/x86_64"]
 
         assert_eq!(options.effective_gpg_dir(), tmp.path());
         assert_eq!(options.keyring_path(), tmp.path().join("trustedkeys.gpg"));
-        assert_eq!(DEFAULT_GPG_DIR, "/etc/pacman.d/gnupg/");
+        assert_eq!(DEFAULT_GPG_DIR, "/etc/xpm/gnupg/");
         assert_eq!(XPM_GPG_DIR, "/etc/xpm/gnupg/");
+        assert_eq!(PACMAN_GPG_DIR, "/etc/pacman.d/gnupg/");
     }
 
     #[test]

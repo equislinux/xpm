@@ -152,7 +152,7 @@ rollback.
 | Resolver wired into the CLI | Done for `install` (repo names + local `.xp`) and `upgrade` (dependency closure); `rollback`/`diff` implemented |
 | Stub commands (`query`, `files`, ...) | `query` (including `--orphans`), `files`, `info`, `search`, `history`, `diff` and `rollback` implemented |
 | Transaction hardening (`.pacnew`, hooks, rollback tests) | Done: config-file management, ALPM hooks, upgrade/rollback CLI journeys |
-| Config keyring path inconsistency | Resolved: `effective_gpg_dir()` prefers the configured directory, then pacman's keyring, then `/etc/xpm/gnupg` |
+| Config keyring path inconsistency | Resolved: `effective_gpg_dir()` prefers the configured directory, then the native `/etc/xpm/gnupg`; pacman's keyring is explicit only |
 
 The **journal + hooks** slice lands on top of the resolver: `install` resolves
 the closure before journaling, and the journal records what was done.
