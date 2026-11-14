@@ -28,7 +28,7 @@ pub struct Cli {
     #[arg(long, global = true, alias = "noconfirm")]
     pub no_confirm: bool,
 
-    /// Disable the combined progress line (pacman/makepkg compatibility).
+    /// Disable per-phase progress rendering (pacman/makepkg compatibility).
     #[arg(long, global = true, hide = true)]
     pub noprogressbar: bool,
 

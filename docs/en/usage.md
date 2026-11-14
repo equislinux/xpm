@@ -225,6 +225,12 @@ xpm usage <command>          # help for a specific command (sync, install, remov
 
 `xpm <command> --help` also works through clap.
 
+## Progress bars
+
+Progress is split by phase: downloads use `x`, while verification, install,
+upgrade and removal use `/`. The combined
+`:: [bar] download | verify | extract` line is gone.
+
 ## Pacman-style aliases
 
 | Alias | Maps to | Pacman equivalent |

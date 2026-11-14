@@ -488,6 +488,23 @@ removal (`--nosave` disables the latter).
 
 ---
 
+## Progress Bars
+
+Progress is rendered per phase, never as one combined
+`download | verify | extract` line:
+
+| Phase | Fill | Example |
+|------|------|---------|
+| Downloads (per package and aggregate) | `x` | `[xxxxxxxxxx----------]` |
+| Verification | `/` | `Verifying signatures [//////////----------]` |
+| Install/upgrade | `/` | `Installing packages [//////////----------]` |
+| Removal | `/` | `Removing packages [//////////----------]` |
+| xpm-aur sync/resolve | `x` | `[xxxxxxxxxx----------]` |
+| xpm-aur checkout/build/install | `/` | `[//////////----------]` |
+
+`--noprogressbar` (pacman-compatible) and `XPM_NO_PROGRESS=1` disable
+rendering.
+
 ## Environment Variables
 
 | Variable | Description |
