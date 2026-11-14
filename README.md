@@ -19,6 +19,7 @@
     <li><a href="#quick-install-published-package">Quick Install (Published Package)</a></li>
     <li><a href="#build-from-source">Build From Source</a></li>
     <li><a href="#usage">Usage</a></li>
+    <li><a href="#progress-bars">Progress Bars</a></li>
     <li><a href="#pacman-style-aliases">Pacman-Style Aliases</a></li>
     <li><a href="#global-flags">Global Flags</a></li>
     <li><a href="#configuration">Configuration</a></li>
@@ -122,6 +123,27 @@ xpm repo add &lt;name&gt; &lt;url&gt;
 xpm repo remove &lt;name&gt;
 </code></pre>
 
+<h3 align="center" id="progress-bars">Progress Bars</h3>
+
+<p>Progress is split into independent phases; there is no combined
+<code>download | verify | extract</code> line.</p>
+
+<ul>
+    <li><strong>Downloads</strong> (per package and the aggregate
+      <code>Downloading packages</code> line) use <code>x</code> fill:
+      <code>[xxxxxxxxxx----------]</code>.</li>
+    <li><strong>Verification</strong> uses <code>/</code> fill:
+      <code>Verifying signatures [//////////----------]</code>.</li>
+    <li><strong>Install/upgrade</strong> uses a separate
+      <code>Installing packages</code> bar with <code>/</code> fill.</li>
+    <li><strong>Removal</strong> uses a separate
+      <code>Removing packages</code> bar with <code>/</code> fill.</li>
+</ul>
+
+<p><code>--noprogressbar</code> or <code>XPM_NO_PROGRESS=1</code> disables
+rendering. <code>xpm-aur</code> uses <code>x</code> for <code>sync</code>/
+<code>resolve</code> and <code>/</code> for build/install phases.</p>
+
 <h3 align="center" id="pacman-style-aliases">Pacman-Style Aliases</h3>
 
 <table>
@@ -213,9 +235,9 @@ xpm repo remove &lt;name&gt;
 <p><code>xpm install</code> parses each package archive once for metadata, then
 extracts pure installs (no <code>.INSTALL</code> scriptlets) in parallel across
 available cores. Downloads and signature checks use up to
-<code>parallel_downloads</code> workers (default 10). Progress is shown as a
-single combined line for download, verify and extract, so parallel workers do
-not interleave output.</p>
+<code>parallel_downloads</code> workers (default 10). Progress is rendered per
+phase (download, verify, install/remove) so parallel workers do not interleave
+output and each phase has a distinct bar.</p>
 
 <pre><code class="language-sh"># Compare an installed xpm with a local build (network-free):
 cargo build --release -p xpm
@@ -226,7 +248,7 @@ XPM_EXTRACT_WORKERS=4 xpm install --needed ...
 </code></pre>
 
 <p>Set <code>XPM_NO_PROGRESS=1</code> or pass <code>--noprogressbar</code> to
-disable the combined progress line in scripts.</p>
+disable phase progress in scripts.</p>
 
 <h2 align="center" id="configuration">Configuration</h2>
 
