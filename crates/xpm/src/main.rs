@@ -585,6 +585,20 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     boot.options.scriptlet_mode = xpm_core::hooks::ScriptletMode::Auto;
     cmd_install(&boot, &install, true)?;
 
+    // ALPM hooks are disabled while bootstrapping (some of them call pacman).
+    // Run the essential finalizers explicitly: ca-certificates is required by
+    // curl/makepkg inside the build chroot, and ldconfig/sysusers/tmpfiles keep
+    // the template usable.
+    let finalize = "if command -v update-ca-trust >/dev/null 2>&1; then update-ca-trust; fi; if command -v ldconfig >/dev/null 2>&1; then ldconfig; fi; if command -v systemd-sysusers >/dev/null 2>&1; then systemd-sysusers; fi; if command -v systemd-tmpfiles >/dev/null 2>&1; then systemd-tmpfiles --create; fi";
+    let status = std::process::Command::new("arch-chroot")
+        .arg(&root)
+        .args(["sh", "-c", finalize])
+        .status()
+        .with_context(|| format!("failed to finalize bootstrap root {}", root.display()))?;
+    if !status.success() {
+        anyhow::bail!("xpm bootstrap finalization failed with status {status}");
+    }
+
     // Copy only the public/trust material from the effective host keyring.
     // The chroot's xpm needs it for official build dependencies; private keys
     // are deliberately never copied. The target always uses the native xpm
