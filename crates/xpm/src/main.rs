@@ -35,7 +35,7 @@ use xpm_core::local_db;
 use xpm_core::orphans::{find_orphans, InstalledPackage};
 use xpm_core::package::{read_metadata, PackageMeta, PackageMetadata};
 use xpm_core::progress::ParallelDownloadProgress;
-use xpm_core::progress::{self, Phase};
+use xpm_core::progress::{self, BarFill, OperationProgress};
 use xpm_core::query;
 use xpm_core::replace::matches_ignore_group;
 use xpm_core::repo::RepoManager;
@@ -157,8 +157,8 @@ fn main() -> Result<()> {
         config.options.scriptlet_mode = xpm_core::hooks::ScriptletMode::Skip;
     }
 
-    // Combined progress for download/verify/extract. Disabled by the hidden
-    // pacman-compatible flag or XPM_NO_PROGRESS; it never corrupts logs.
+    // Per-phase progress. Disabled by the hidden pacman-compatible flag or
+    // XPM_NO_PROGRESS; it never corrupts logs.
     progress::init(!cli.noprogressbar, cli.no_color, cli.verbose > 0);
 
     if let Some(root) = operation_root {
@@ -797,7 +797,6 @@ fn prefetch_downloads(
     }
 
     let workers = (parallel_downloads.max(1) as usize).min(jobs.len());
-    progress::begin(Phase::Download, jobs.len());
     if workers == 1 {
         for job in jobs {
             let mirror =
@@ -809,9 +808,7 @@ fn prefetch_downloads(
                         )
                     })?;
             mirrors[job.index] = Some(mirror);
-            progress::advance(Phase::Download);
         }
-        progress::finish(Phase::Download);
         return Ok(mirrors);
     }
 
@@ -835,14 +832,12 @@ fn prefetch_downloads(
                 )
                 .map_err(|err| err.to_string());
                 progress.complete_job();
-                xpm_core::progress::advance(Phase::Download);
                 if let Ok(mut slots) = results.lock() {
                     slots[index] = Some(result);
                 }
             });
         }
     });
-    xpm_core::progress::finish(Phase::Download);
 
     let results = results
         .into_inner()
@@ -919,7 +914,11 @@ fn verify_signatures_parallel(
     }
 
     let workers = (parallel.max(1) as usize).min(jobs.len());
-    progress::begin(Phase::Verify, jobs.len());
+    let verify_progress = Arc::new(OperationProgress::new(
+        "Verifying signatures",
+        jobs.len(),
+        BarFill::Slash,
+    ));
     let next = AtomicUsize::new(0);
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -936,7 +935,7 @@ fn verify_signatures_parallel(
                     1,
                 )
                 .map_err(|err| err.to_string());
-                xpm_core::progress::advance(Phase::Verify);
+                verify_progress.advance();
                 if let Ok(mut slots) = results.lock() {
                     slots[job.index] = Some(result.map_err(|err| {
                         format!(
@@ -948,7 +947,7 @@ fn verify_signatures_parallel(
             });
         }
     });
-    xpm_core::progress::finish(Phase::Verify);
+    verify_progress.finish();
 
     Ok(results
         .into_inner()

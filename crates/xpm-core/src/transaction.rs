@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use crate::error::{XpmError, XpmResult};
 use crate::hooks::{HookChain, HookContext, OperationType, ScriptletMode};
 use crate::package::{PackageMeta, PackageMetadata};
-use crate::progress::{self, Phase};
+use crate::progress::{self, BarFill, OperationProgress};
 
 /// A filesystem-based lock to prevent concurrent xpm operations.
 pub struct FileLock {
@@ -344,7 +344,28 @@ impl Transaction {
 
         let operations = self.operations.clone();
         let total = operations.len();
-        progress::begin(Phase::Extract, total);
+        let install_total = operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    TransactionOp::Install { .. } | TransactionOp::Upgrade { .. }
+                )
+            })
+            .count();
+        let remove_total = operations
+            .iter()
+            .filter(|op| matches!(op, TransactionOp::Remove { .. }))
+            .count();
+        let (label, progress_total) = if remove_total == 0 {
+            ("Installing packages", install_total)
+        } else if install_total == 0 {
+            ("Removing packages", remove_total)
+        } else {
+            ("Applying package changes", total)
+        };
+        let operation_progress = (progress_total > 0)
+            .then(|| OperationProgress::new(label, progress_total, BarFill::Slash));
 
         let mut index = 0;
         while index < total {
@@ -370,7 +391,9 @@ impl Transaction {
                         self.write_version(pkg_name, pkg_version)?;
                         self.log(&format!("installed {} {}", pkg_name, pkg_version))?;
                     }
-                    progress::advance(Phase::Extract);
+                    if let Some(progress) = &operation_progress {
+                        progress.advance();
+                    }
                 }
                 continue;
             }
@@ -398,10 +421,14 @@ impl Transaction {
                     self.execute_upgrade(&pkg_name, &old_version, &new_version, &new_pkg_file)?;
                 }
             }
-            progress::advance(Phase::Extract);
+            if let Some(progress) = &operation_progress {
+                progress.advance();
+            }
             index += 1;
         }
-        progress::finish(Phase::Extract);
+        if let Some(progress) = &operation_progress {
+            progress.finish();
+        }
 
         self.state = TransactionState::Committed;
         self.log("committed")?;

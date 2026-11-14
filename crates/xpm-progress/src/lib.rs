@@ -3,7 +3,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 const MIB: f64 = 1024.0 * 1024.0;
 
@@ -95,10 +94,32 @@ impl ParallelDownloadProgress {
     }
 }
 
-/// Render an ASCII progress bar such as `//////////----------`.
-pub(crate) fn bar(percent: u64, width: usize) -> String {
+/// Fill glyph used by a progress phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BarFill {
+    /// Network/download phases: `xxxxxxxxxx----------`.
+    Cross,
+    /// Verification, build, install and removal phases: `//////////----------`.
+    Slash,
+}
+
+impl BarFill {
+    fn glyph(self) -> char {
+        match self {
+            BarFill::Cross => 'x',
+            BarFill::Slash => '/',
+        }
+    }
+}
+
+/// Render an ASCII progress bar with the requested fill glyph.
+pub(crate) fn bar(percent: u64, width: usize, fill: BarFill) -> String {
     let filled = (percent.min(100) as usize).saturating_mul(width) / 100;
-    format!("{}{}", "/".repeat(filled), "-".repeat(width - filled))
+    format!(
+        "{}{}",
+        fill.glyph().to_string().repeat(filled),
+        "-".repeat(width - filled)
+    )
 }
 
 /// Render a byte count in MiB with one decimal place.
@@ -115,6 +136,7 @@ pub fn format_mib(bytes: u64) -> String {
 pub struct ProgressStyle {
     pub label_width: usize,
     pub bar_width: usize,
+    pub fill: BarFill,
 }
 
 impl ProgressStyle {
@@ -127,6 +149,7 @@ impl ProgressStyle {
         Self {
             label_width,
             bar_width,
+            fill: BarFill::Cross,
         }
     }
 
@@ -146,7 +169,7 @@ pub fn format_progress_with(
     let label = align_label(label, style.label_width);
     format!(
         "{label} [{}] {percent:>3}%  {}/{} MiB",
-        bar(percent, style.bar_width),
+        bar(percent, style.bar_width, style.fill),
         mib_value(downloaded),
         mib_value(total),
     )
@@ -189,206 +212,155 @@ fn mib_value(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / MIB)
 }
 
-// ── Unified install progress ─────────────────────────────────────────────────
+// ── Progress settings and per-phase counters ─────────────────────────────────
 
-/// Phases that share one progress line during a package transaction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    Download,
-    Verify,
-    Extract,
-}
-
-impl Phase {
-    fn index(self) -> usize {
-        match self {
-            Phase::Download => 0,
-            Phase::Verify => 1,
-            Phase::Extract => 2,
-        }
-    }
-}
-
-struct UnifiedState {
+/// Process-wide progress settings.
+struct ProgressSettings {
     enabled: bool,
     tty: bool,
     verbose: bool,
-    totals: [usize; 3],
-    done: [usize; 3],
-    last_draw: Option<Instant>,
-    started: bool,
 }
 
-static UNIFIED: OnceLock<Mutex<UnifiedState>> = OnceLock::new();
+static SETTINGS: OnceLock<Mutex<ProgressSettings>> = OnceLock::new();
 
-fn unified() -> &'static Mutex<UnifiedState> {
-    UNIFIED.get_or_init(|| {
-        Mutex::new(UnifiedState {
+fn settings() -> &'static Mutex<ProgressSettings> {
+    SETTINGS.get_or_init(|| {
+        Mutex::new(ProgressSettings {
             enabled: false,
             tty: false,
             verbose: false,
-            totals: [0; 3],
-            done: [0; 3],
-            last_draw: None,
-            started: false,
         })
     })
 }
 
-fn with_unified<T>(f: impl FnOnce(&mut UnifiedState) -> T) -> T {
-    let mut guard = match unified().lock() {
+fn with_settings<T>(f: impl FnOnce(&mut ProgressSettings) -> T) -> T {
+    let mut guard = match settings().lock() {
         Ok(guard) => guard,
         Err(poison) => poison.into_inner(),
     };
     f(&mut guard)
 }
 
-/// Enable the combined progress line for this process.
-///
-/// `enabled` is the user-facing switch (`--noprogressbar` disables it);
-/// `XPM_NO_PROGRESS=1` disables it for scripts/tests. On a TTY the line is
-/// redrawn in place; otherwise short summary lines are emitted periodically
-/// so redirected installer logs stay readable and never interleave a
-/// carriage-return stream from parallel workers.
+/// Enable progress rendering for this process.
 pub fn init(enabled: bool, _no_color: bool, verbose: bool) {
     let enabled = enabled && std::env::var_os("XPM_NO_PROGRESS").is_none();
-    with_unified(|state| {
+    with_settings(|state| {
         state.enabled = enabled;
         state.tty = io::stderr().is_terminal();
         state.verbose = verbose;
-        state.totals = [0; 3];
-        state.done = [0; 3];
-        state.last_draw = None;
-        state.started = false;
     });
 }
 
 /// Whether detailed per-package lines (downloads, extraction) should print.
 pub fn verbose() -> bool {
-    with_unified(|state| state.verbose)
+    with_settings(|state| state.verbose)
 }
 
-fn unified_line(state: &UnifiedState) -> Option<String> {
-    let mut parts = Vec::new();
-    let mut done_total = 0usize;
-    let mut all_total = 0usize;
-    for (index, name) in ["download", "verify", "extract"].iter().enumerate() {
-        if state.totals[index] == 0 {
-            continue;
-        }
-        done_total += state.done[index];
-        all_total += state.totals[index];
-        parts.push(format!(
-            "{name} {}/{}",
-            state.done[index], state.totals[index]
-        ));
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    let percent = done_total
-        .saturating_mul(100)
-        .checked_div(all_total)
-        .unwrap_or(0);
-    let width = 20usize;
-    let bar = bar(percent as u64, width);
-    Some(format!(":: [{bar}] {percent:>3}%  {}", parts.join(" | ")))
-}
-
-fn draw_unified(state: &mut UnifiedState, force: bool) {
-    if !state.enabled {
-        return;
-    }
-    if !state.tty && !force {
-        if let Some(last) = state.last_draw {
-            if last.elapsed() < Duration::from_secs(2) {
-                return;
-            }
-        }
-    }
-    let Some(line) = unified_line(state) else {
-        return;
-    };
-    let mut stderr = io::stderr();
-    if state.tty {
-        let _ = write!(stderr, "\r\x1b[2K{line}");
-    } else {
-        let _ = writeln!(stderr, "{line}");
-    }
-    let _ = stderr.flush();
-    state.last_draw = Some(Instant::now());
-}
-
-/// Mark the beginning of a phase and set its total task count.
-pub fn begin(phase: Phase, total: usize) {
-    with_unified(|state| {
-        let index = phase.index();
-        state.totals[index] = total;
-        state.done[index] = 0;
-        state.started = true;
-        draw_unified(state, true);
-    });
-}
-
-/// Mark one task in `phase` as complete.
-pub fn advance(phase: Phase) {
-    with_unified(|state| {
-        let index = phase.index();
-        if state.done[index] < state.totals[index] {
-            state.done[index] += 1;
-        }
-        draw_unified(state, false);
-    });
-}
-
-/// Mark a phase as complete (also when some tasks were skipped/cached).
-pub fn finish(phase: Phase) {
-    with_unified(|state| {
-        let index = phase.index();
-        if state.totals[index] > 0 {
-            state.done[index] = state.totals[index];
-            draw_unified(state, true);
-        }
-    });
-}
-
-/// Print a persistent message without corrupting an active progress line.
+/// Print a persistent message.
 pub fn message(msg: impl AsRef<str>) {
-    with_unified(|state| {
-        let mut stderr = io::stderr();
-        if state.enabled && state.tty {
-            let _ = write!(stderr, "\r\x1b[2K");
-        }
-        let _ = writeln!(stderr, "{}", msg.as_ref());
-        let _ = stderr.flush();
-        draw_unified(state, true);
-    });
+    eprintln!("{}", msg.as_ref());
 }
 
-/// Print a warning through the same synchronized writer as the progress line.
+/// Print a warning.
 pub fn warn(msg: impl AsRef<str>) {
-    with_unified(|state| {
-        let mut stderr = io::stderr();
-        if state.enabled && state.tty {
-            let _ = write!(stderr, "\r\x1b[2K");
-        }
-        let _ = writeln!(stderr, "warning: {}", msg.as_ref());
-        let _ = stderr.flush();
-        draw_unified(state, true);
-    });
+    eprintln!("warning: {}", msg.as_ref());
 }
 
-/// Finish the combined progress display. Safe to call multiple times.
+/// Finish any active progress state. Safe to call multiple times.
 pub fn finish_all() {
-    with_unified(|state| {
-        if state.enabled && state.tty && state.started {
-            let mut stderr = io::stderr();
-            let _ = writeln!(stderr);
-            let _ = stderr.flush();
+    with_settings(|state| {
+        if state.enabled && state.tty {
+            let _ = writeln!(io::stderr());
         }
-        state.started = false;
         state.enabled = false;
     });
+}
+
+/// A standalone count-based bar for one transaction phase.
+///
+/// Each instance owns its line; there is deliberately no combined
+/// download/verify/extract renderer. Network phases use [`BarFill::Cross`] and
+/// verification/install/remove phases use [`BarFill::Slash`].
+pub struct OperationProgress {
+    label: String,
+    fill: BarFill,
+    total: usize,
+    done: AtomicUsize,
+    enabled: bool,
+    tty: bool,
+    last_len: Mutex<usize>,
+}
+
+impl OperationProgress {
+    pub fn new(label: impl Into<String>, total: usize, fill: BarFill) -> Self {
+        let (enabled, tty) = with_settings(|state| (state.enabled, state.tty));
+        let progress = Self {
+            label: label.into(),
+            fill,
+            total,
+            done: AtomicUsize::new(0),
+            enabled,
+            tty,
+            last_len: Mutex::new(0),
+        };
+        progress.draw(false);
+        progress
+    }
+
+    pub fn advance(&self) {
+        let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        if done <= self.total {
+            self.draw(false);
+        }
+    }
+
+    pub fn finish(&self) {
+        if self.total > 0 {
+            self.done.store(self.total, Ordering::Relaxed);
+            self.draw(true);
+        }
+    }
+
+    fn line(&self) -> Option<String> {
+        let total = self.total;
+        if total == 0 {
+            return None;
+        }
+        let done = self.done.load(Ordering::Relaxed).min(total);
+        let percent = percentage(done as u64, total as u64);
+        let width = 20usize;
+        Some(format!(
+            "{} [{}] {:>3}%  {}/{}",
+            self.label,
+            bar(percent, width, self.fill),
+            percent,
+            done,
+            total
+        ))
+    }
+
+    fn draw(&self, force: bool) {
+        if !self.enabled {
+            return;
+        }
+        let Some(line) = self.line() else {
+            return;
+        };
+        let mut stderr = io::stderr();
+        if self.tty {
+            let _ = write!(stderr, "\r\x1b[2K{line}");
+        } else if force {
+            let _ = writeln!(stderr, "{line}");
+        }
+        let _ = stderr.flush();
+        if self.tty {
+            let mut last = match self.last_len.lock() {
+                Ok(guard) => guard,
+                Err(poison) => poison.into_inner(),
+            };
+            *last = line.chars().count();
+        }
+    }
 }
 
 // ── Phase progress ───────────────────────────────────────────────────────────
@@ -403,6 +375,7 @@ pub fn finish_all() {
 pub struct PhaseProgress {
     label_width: usize,
     bar_width: usize,
+    fill: BarFill,
 }
 
 impl PhaseProgress {
@@ -416,7 +389,20 @@ impl PhaseProgress {
         Self {
             label_width: longest.clamp(12, 32),
             bar_width: 20,
+            fill: BarFill::Slash,
         }
+    }
+
+    /// Network setup phases (`sync`, `resolve`): cross fill.
+    pub fn new_network<'a>(labels: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut progress = Self::new(labels);
+        progress.fill = BarFill::Cross;
+        progress
+    }
+
+    /// Build/install phases (`checkout`, `building`, `installing`): slash fill.
+    pub fn new_build<'a>(labels: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::new(labels)
     }
 
     /// Render `label [////----]  50%  phase`.
@@ -425,7 +411,7 @@ impl PhaseProgress {
         let label = align_label(label, self.label_width);
         format!(
             "{label} [{}] {percent:>3}%  {phase}",
-            bar(percent, self.bar_width)
+            bar(percent, self.bar_width, self.fill)
         )
     }
 
@@ -454,11 +440,11 @@ mod tests {
 
     #[test]
     fn bar_fills_proportionally_and_clamps() {
-        assert_eq!(bar(0, 20), "--------------------");
-        assert_eq!(bar(52, 20), "//////////----------");
-        assert_eq!(bar(100, 20), "////////////////////");
-        assert_eq!(bar(150, 20), "////////////////////");
-        assert_eq!(bar(0, 0), "");
+        assert_eq!(bar(0, 20, BarFill::Slash), "--------------------");
+        assert_eq!(bar(52, 20, BarFill::Slash), "//////////----------");
+        assert_eq!(bar(100, 20, BarFill::Slash), "////////////////////");
+        assert_eq!(bar(150, 20, BarFill::Slash), "////////////////////");
+        assert_eq!(bar(0, 0, BarFill::Slash), "");
     }
 
     #[test]
@@ -469,42 +455,42 @@ mod tests {
     }
 
     #[test]
-    fn progress_bars_never_render_x_or_hash_fill() {
-        for percent in [0, 1, 50, 100] {
-            let rendered = bar(percent, 20);
-            assert!(!rendered.contains('x'), "unexpected x fill: {rendered}");
-            assert!(!rendered.contains('#'), "unexpected hash fill: {rendered}");
-        }
-        assert!(bar(50, 20).contains('/'));
-
-        let state = UnifiedState {
-            enabled: true,
-            tty: false,
-            verbose: false,
-            totals: [1, 1, 1],
-            done: [1, 1, 1],
-            last_draw: None,
-            started: true,
-        };
-        let line = unified_line(&state).expect("unified line");
-        assert!(!line.contains('#'), "unexpected hash fill: {line}");
-        assert!(
-            line.contains("[////////////////////]"),
-            "unexpected unified bar: {line}"
-        );
-    }
-
-    #[test]
-    fn progress_line_uses_slash_fill() {
+    fn download_bars_use_cross_fill() {
+        assert_eq!(bar(0, 20, BarFill::Cross), "--------------------");
+        assert_eq!(bar(52, 20, BarFill::Cross), "xxxxxxxxxx----------");
+        assert_eq!(bar(100, 20, BarFill::Cross), "xxxxxxxxxxxxxxxxxxxx");
+        assert!(!bar(50, 20, BarFill::Cross).contains('#'));
         let line = ProgressStyle {
             label_width: 11,
             bar_width: 20,
+            fill: BarFill::Cross,
         }
         .render("pkg.tar.zst", 13 * 1024 * 1024, 26 * 1024 * 1024);
         assert_eq!(
             line,
-            "pkg.tar.zst [//////////----------]  50%  13.0/26.0 MiB"
+            "pkg.tar.zst [xxxxxxxxxx----------]  50%  13.0/26.0 MiB"
         );
+    }
+
+    #[test]
+    fn operation_bars_use_slash_fill() {
+        assert_eq!(bar(52, 20, BarFill::Slash), "//////////----------");
+        assert!(!bar(50, 20, BarFill::Slash).contains('x'));
+        let progress = OperationProgress::new("Verifying signatures", 2, BarFill::Slash);
+        let line = progress.line().expect("operation line");
+        assert!(line.contains("[--------------------]"));
+        progress.advance();
+        progress.advance();
+        let line = progress.line().expect("operation line");
+        assert!(line.contains("[////////////////////]"));
+    }
+
+    #[test]
+    fn phase_progress_selects_fill_by_phase_type() {
+        let network = PhaseProgress::new_network(["sync"]);
+        assert!(network.render("sync", 1, 2, "databases").contains('x'));
+        let build = PhaseProgress::new_build(["pkg"]);
+        assert!(build.render("pkg", 1, 2, "building").contains('/'));
     }
 
     #[test]
@@ -524,6 +510,7 @@ mod tests {
         let line = ProgressStyle {
             label_width: 11,
             bar_width: 20,
+            fill: BarFill::Cross,
         }
         .render("empty", 0, 0);
         assert_eq!(line, "empty       [--------------------]   0%  0.0/0.0 MiB");
@@ -534,6 +521,7 @@ mod tests {
         let style = ProgressStyle {
             label_width: 16,
             bar_width: 12,
+            fill: BarFill::Cross,
         };
         let short = style.render("vim", 1, 2);
         let long = style.render("linux-firmware", 1, 2);
@@ -546,6 +534,7 @@ mod tests {
         let style = ProgressStyle {
             label_width: 10,
             bar_width: 10,
+            fill: BarFill::Cross,
         };
         let line = style.render("a-very-long-package-name", 1, 2);
         assert!(line.starts_with("a-very-l.. ["));
