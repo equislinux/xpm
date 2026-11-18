@@ -216,6 +216,10 @@ fn query_exact_search_quiet_owner_and_foreign() {
     assert!(owner.status.success(), "{}", stderr(&owner));
     assert_eq!(stdout(&owner), "/usr/bin/hello is owned by hello 1.0-1\n");
 
+    let owner_quiet = fixture.run(&["-Qoq", "--", "/usr/bin/hello"]);
+    assert!(owner_quiet.status.success(), "{}", stderr(&owner_quiet));
+    assert_eq!(stdout(&owner_quiet), "hello\n");
+
     let owner_dir = fixture.run(&["query", "--owner", "usr/bin/"]);
     assert!(owner_dir.status.success(), "{}", stderr(&owner_dir));
     assert!(stdout(&owner_dir).contains("hello"));
@@ -352,6 +356,46 @@ fn check_fast_and_full_report_statuses() {
         stderr(&unknown).contains("does-not-exist"),
         "{}",
         stderr(&unknown)
+    );
+}
+
+#[test]
+fn check_repair_rebuilds_corrupted_manifest() {
+    let fixture = Fixture::new();
+    fixture.add_package("systemd", "262.1-1");
+    let empty_hash = sha256_hex(b"");
+    fixture.write_mtree(
+        "systemd",
+        &format!(
+            "#mtree\n\
+             ./usr type=dir mode=0755 uid=0 gid=0\n\
+             ./usr/lib type=dir mode=0755 uid=0 gid=0\n\
+             ./usr/lib/system-systemd\\134x2dcryptsetup.slice type=file mode=0644 size=0 sha256digest={empty_hash} uid=0 gid=0\n"
+        ),
+    );
+    fixture.write_files(
+        "systemd",
+        &[
+            "usr/",
+            "usr/lib/",
+            "usr/lib/system-systemd/x2dcryptsetup.slice",
+        ],
+    );
+
+    let repaired = fixture.run(&["check", "--repair", "systemd"]);
+    assert!(repaired.status.success(), "{}", stderr(&repaired));
+    let out = stdout(&repaired);
+    assert!(out.contains("repaired systemd"), "{out}");
+
+    let files =
+        fs::read_to_string(fixture.local_db().join("systemd").join("files")).expect("read files");
+    assert!(
+        files.contains("usr/lib/system-systemd\\x2dcryptsetup.slice"),
+        "{files}"
+    );
+    assert!(
+        !files.contains("usr/lib/system-systemd/x2dcryptsetup.slice"),
+        "{files}"
     );
 }
 

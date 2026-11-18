@@ -52,8 +52,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
-    /// Do not mirror transactions into pacman's local database.
-    #[arg(long, global = true)]
+    /// Deprecated no-op: xpm never writes pacman's local database.
+    #[arg(long, global = true, hide = true)]
     pub no_pacman_mirror: bool,
 
     /// Do not execute pacman-style ALPM hooks for this transaction.
@@ -136,10 +136,6 @@ pub enum Command {
     /// Import installed packages from pacman's local database.
     #[command(name = "import-pacman")]
     ImportPacman(ImportArgs),
-
-    /// Rewrite pacman's local database from xpm's database.
-    #[command(name = "sync-pacman-db")]
-    SyncPacmanDb(SyncPacmanDbArgs),
 
     /// Verify installed files against the local database [-Qk/-Qkk].
     #[command(visible_alias = "Qk")]
@@ -429,6 +425,11 @@ pub struct CheckArgs {
     #[arg(long)]
     pub full: bool,
 
+    /// Rebuild the `files` manifest from the stored .MTREE. This repairs
+    /// corrupted ownership lists without touching installed files.
+    #[arg(long, conflicts_with = "full")]
+    pub repair: bool,
+
     /// Installed packages to check (default: all).
     pub packages: Vec<String>,
 }
@@ -619,13 +620,6 @@ pub struct ImportArgs {
     /// Overwrite entries that already exist in the xpm database.
     #[arg(long)]
     pub force: bool,
-}
-
-#[derive(Debug, clap::Args)]
-pub struct SyncPacmanDbArgs {
-    /// pacman database directory (default: configured or auto-detected).
-    #[arg(long, value_name = "PATH")]
-    pub pacman_db: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]

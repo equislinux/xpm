@@ -18,7 +18,6 @@ Estas flags las acepta cualquier subcomando.
 | `--dbpath` | | `PATH` | Directorio de base de datos alternativo |
 | `--cachedir` | | `PATH` | Directorio de caché alternativo |
 | `--no-color` | | | Desactiva la salida con color |
-| `--no-pacman-mirror` | | | Desactiva el mirror opt-in a la base de datos de pacman |
 | `--no-alpm-hooks` | | | Omite los `.hook` estilo ALPM en esta transacción |
 
 La CLI está definida con `clap` y exige un subcomando (`arg_required_else_help = true`).

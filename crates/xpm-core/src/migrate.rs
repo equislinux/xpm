@@ -171,41 +171,51 @@ fn read_files(
     desc_sections: &HashMap<String, Vec<String>>,
 ) -> XpmResult<(Vec<String>, Vec<String>)> {
     let files_path = dir.join("files");
-    if files_path.is_file() {
-        let raw = fs::read_to_string(&files_path)?;
-        let sections = parse_alpm_sections(&raw);
+    let sections = if files_path.is_file() {
+        Some(parse_alpm_sections(&fs::read_to_string(&files_path)?))
+    } else {
+        None
+    };
+
+    let backups = sections
+        .as_ref()
+        .and_then(|sections| sections.get("BACKUP"))
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|line| {
+                    line.split_once('\t')
+                        .or_else(|| line.split_once('\0'))
+                        .map(|(path, _)| path)
+                        .unwrap_or(line)
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| desc_sections.get("BACKUP").cloned())
+        .unwrap_or_default();
+
+    // Prefer the stored .MTREE: pacman's `files` list can be stale or carry
+    // path-escaping damage from older tools, while the mtree is the package's
+    // canonical payload manifest. Fall back to `files` when no usable mtree
+    // exists (very old databases).
+    if let Ok(raw) = fs::read(dir.join("mtree")) {
+        if let Ok(entries) = crate::package::mtree::parse_mtree(&raw) {
+            let files = local_db::mtree_paths(&entries);
+            if !files.is_empty() {
+                return Ok((files, backups));
+            }
+        }
+    }
+
+    if let Some(sections) = sections {
         let files = sections.get("FILES").cloned().unwrap_or_default();
-        let backups = sections
-            .get("BACKUP")
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|line| {
-                        line.split_once('\t')
-                            .or_else(|| line.split_once('\0'))
-                            .map(|(path, _)| path)
-                            .unwrap_or(line)
-                            .to_string()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         if !files.is_empty() {
             return Ok((files, backups));
         }
     }
 
-    // Fallback: derive the manifest from .MTREE when `files` is missing.
-    let backups = desc_sections.get("BACKUP").cloned().unwrap_or_default();
-    let raw = fs::read(dir.join("mtree")).ok();
-    let files = match raw {
-        Some(raw) => match crate::package::mtree::parse_mtree(&raw) {
-            Ok(entries) => local_db::mtree_paths(&entries),
-            Err(_) => Vec::new(),
-        },
-        None => Vec::new(),
-    };
-    Ok((files, backups))
+    Ok((Vec::new(), backups))
 }
 
 fn safe_component(value: &str) -> bool {
@@ -280,6 +290,39 @@ mod tests {
                 "usr/bin/foo".to_string(),
                 "etc/foo.conf".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn import_prefers_mtree_over_mangled_files() {
+        let tmp = TempDir::new().expect("tmp");
+        let pacman = tmp.path().join("pacman");
+        let dest = tmp.path().join("xpm");
+        write_pacman_entry(
+            &pacman,
+            "systemd",
+            "262.1-1",
+            &desc("systemd", "262.1-1", "0"),
+            "%FILES%\nusr/lib/systemd/system-systemd/x2dcryptsetup.slice\n",
+        );
+        fs::write(
+            pacman.join("systemd-262.1-1").join("mtree"),
+            "#mtree\n\
+             ./usr type=dir mode=0755 uid=0 gid=0\n\
+             ./usr/lib type=dir mode=0755 uid=0 gid=0\n\
+             ./usr/lib/system-systemd\\134x2dcryptsetup.slice type=file mode=0644 size=0 sha256digest=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 uid=0 gid=0\n",
+        )
+        .expect("mtree");
+
+        import_pacman_local(&pacman, &dest, false).expect("import");
+        let files = local_db::read_files(&dest, "systemd").expect("files");
+        assert!(
+            files.contains(&"usr/lib/system-systemd\\x2dcryptsetup.slice".to_string()),
+            "{files:?}"
+        );
+        assert!(
+            !files.contains(&"usr/lib/systemd/system-systemd/x2dcryptsetup.slice".to_string()),
+            "{files:?}"
         );
     }
 

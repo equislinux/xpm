@@ -17,7 +17,6 @@ These flags can be used with any subcommand.
 | `--dbpath` | — | `PATH` | Alternative database directory |
 | `--cachedir` | — | `PATH` | Alternative cache directory |
 | `--no-color` | — | — | Disable colored output |
-| `--no-pacman-mirror` | — | — | Disable the opt-in pacman local DB mirror |
 | `--no-alpm-hooks` | — | — | Skip pacman-style ALPM `.hook` execution for this transaction |
 
 ---
@@ -146,20 +145,27 @@ xpm import-pacman [--from /var/lib/pacman/local] [--force]
 | `--from PATH` | pacman local database directory (default `/var/lib/pacman/local`) |
 | `--force` | Overwrite entries that already exist |
 
-### `sync-pacman-db` — Mirror xpm into pacman
+xpm never writes pacman's local database during normal operations. The
+`import-pacman` command is a one-way migration; ALPM hooks that query
+`pacman -Q...` run with a temporary query shim backed by xpm's database.
 
-Write pacman-compatible local database entries for packages managed by xpm, so
-`pacman -Q`, the generation hooks and other pacman-based tooling see them.
-Existing entries with the same version are skipped (repair mode).
+---
+
+### `check` — Verify or Repair Installed Files
+
+Verify installed files against the local database, or rebuild a corrupted
+`files` manifest from the package's stored `.MTREE`. Repairing manifests does
+not touch installed files.
 
 ```bash
-xpm sync-pacman-db [--pacman-db /var/lib/pacman]
+xpm check [--full] [PACKAGE...]
+xpm check --repair [PACKAGE...]
 ```
 
-The mirror is opt-in. It is not performed automatically in the native flow.
-Enable it explicitly with `mirror_pacman = true` (and optionally `pacman_db`)
-in `/etc/xpm.conf`; `--no-pacman-mirror` disables it for one invocation.
-`sync-pacman-db` still works as an explicit compatibility command.
+| Flag | Description |
+|------|-------------|
+| `--full` | Also verify `.MTREE` hashes, modes and symlink targets |
+| `--repair` | Rewrite `files` manifests from `.MTREE` (cannot be combined with `--full`) |
 
 ---
 

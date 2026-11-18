@@ -158,6 +158,7 @@ pub struct Transaction {
     save_configs: bool,
     scriptlet_mode: ScriptletMode,
     metadata_cache: std::collections::HashMap<PathBuf, Arc<PackageMetadata>>,
+    transaction_paths: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 impl Transaction {
@@ -187,6 +188,7 @@ impl Transaction {
             save_configs: true,
             scriptlet_mode: ScriptletMode::Auto,
             metadata_cache: std::collections::HashMap::new(),
+            transaction_paths: None,
         })
     }
 
@@ -208,6 +210,14 @@ impl Transaction {
 
     pub fn set_scriptlet_mode(&mut self, mode: ScriptletMode) {
         self.scriptlet_mode = mode;
+    }
+
+    /// Register the file paths shipped by every target in this transaction.
+    ///
+    /// Upgrade cleanup uses this to avoid deleting a path that another target
+    /// is taking over, regardless of commit order.
+    pub fn set_transaction_paths(&mut self, paths: Arc<std::collections::HashSet<String>>) {
+        self.transaction_paths = Some(paths);
     }
 
     /// Cache the metadata parsed while building the install plan. The hooks
@@ -552,6 +562,7 @@ impl Transaction {
                 shell_integration: self.shell_integration,
                 scriptlet_mode: self.scriptlet_mode,
                 metadata: self.metadata_cache.get(pkg_file).cloned(),
+                transaction_paths: self.transaction_paths.clone(),
             };
             hooks.run(&context)?;
         }
@@ -585,6 +596,7 @@ impl Transaction {
                 shell_integration: self.shell_integration,
                 scriptlet_mode: self.scriptlet_mode,
                 metadata: None,
+                transaction_paths: self.transaction_paths.clone(),
             };
             hooks.run(&context)?;
         }
@@ -626,6 +638,7 @@ impl Transaction {
                 shell_integration: self.shell_integration,
                 scriptlet_mode: self.scriptlet_mode,
                 metadata: self.metadata_cache.get(new_pkg_file).cloned(),
+                transaction_paths: self.transaction_paths.clone(),
             };
             hooks.run(&context)?;
         } else {
@@ -751,6 +764,7 @@ fn run_fast_install_parts(
         shell_integration: false,
         scriptlet_mode,
         metadata: Some(metadata.clone()),
+        transaction_paths: None,
     };
     hooks.run(&context)
 }

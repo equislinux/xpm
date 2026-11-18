@@ -50,6 +50,11 @@ impl Entry {
         self.depends = depends.iter().map(|dep| dep.to_string()).collect();
         self
     }
+
+    fn with_files(mut self, files: &[&str]) -> Self {
+        self.files = files.iter().map(|file| file.to_string()).collect();
+        self
+    }
 }
 
 impl Fixture {
@@ -544,4 +549,43 @@ fn ignoregroup_skips_sysupgrade_packages() {
 
     let version = fs::read_to_string(fixture.local_db().join("kernel/version")).expect("version");
     assert_eq!(version.trim(), "1.0-1");
+}
+#[test]
+fn upgrade_allows_a_file_to_move_to_another_package() {
+    let fixture = Fixture::new();
+    fixture.publish(
+        "core",
+        &[Entry::new("openssl", "1.0-1").with_files(&["usr/lib/libcrypto.so.3"])],
+    );
+    assert_success(&fixture.run(&["sync"]));
+    assert_success(&fixture.run(&["install", "openssl"]));
+    assert!(fixture.root.join("usr/lib/libcrypto.so.3").exists());
+
+    fixture.publish(
+        "core",
+        &[
+            Entry::new("openssl", "2.0-1")
+                .with_files(&["usr/lib/libcrypto.so.4"])
+                .with_depends(&["openssl-compat"]),
+            Entry::new("openssl-compat", "1.0-1").with_files(&["usr/lib/libcrypto.so.3"]),
+        ],
+    );
+
+    let upgrade = fixture.run(&["upgrade"]);
+    assert_success(&upgrade);
+
+    let moved = fixture.root.join("usr/lib/libcrypto.so.3");
+    assert!(moved.exists(), "the moved file must survive the upgrade");
+    assert_eq!(
+        fs::read_to_string(&moved).expect("read moved file").trim(),
+        "openssl-compat"
+    );
+
+    let owner = fixture.run(&["-Qo", "/usr/lib/libcrypto.so.3"]);
+    assert_success(&owner);
+    assert!(
+        stdout(&owner).contains("owned by openssl-compat 1.0-1"),
+        "{}",
+        stdout(&owner)
+    );
 }

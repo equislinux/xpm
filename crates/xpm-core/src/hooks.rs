@@ -10,7 +10,7 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
@@ -64,6 +64,10 @@ pub struct HookContext {
     /// hooks avoid reopening the package archive just to read .PKGINFO,
     /// .MTREE or .INSTALL.
     pub metadata: Option<Arc<crate::package::PackageMetadata>>,
+    /// File paths shipped by every target in the transaction. Upgrade cleanup
+    /// must not delete a file that another target is taking over (for example
+    /// a library moving from `openssl` to `openssl-3`).
+    pub transaction_paths: Option<Arc<HashSet<String>>>,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -601,6 +605,17 @@ fn cleanup_stale_files(
             continue;
         }
 
+        // Another target in the same transaction is taking this path over
+        // (for example `openssl` -> `openssl-3`). Keep it even when the
+        // current package no longer ships it; commit order must not matter.
+        if context
+            .transaction_paths
+            .as_ref()
+            .is_some_and(|paths| paths.contains(old_path))
+        {
+            continue;
+        }
+
         // Shell shims live outside the root and are only symlinks.
         if let Some(abs) = old_path.strip_prefix("@ABS:") {
             let _ = fs::remove_file(abs);
@@ -1016,65 +1031,6 @@ impl Hook for LocalDbHook {
     }
 }
 
-/// Mirror package database changes into pacman's local database.
-///
-/// Added to the transaction only when a pacman database is configured; runs
-/// after [`LocalDbHook`] so xpm's metadata is available and before the ALPM
-/// post-transaction hooks, keeping generation captures consistent.
-pub struct PacmanDbHook {
-    pacman_local: PathBuf,
-    root_dir: PathBuf,
-}
-
-impl PacmanDbHook {
-    pub fn new(pacman_local: PathBuf, root_dir: PathBuf) -> Self {
-        Self {
-            pacman_local,
-            root_dir,
-        }
-    }
-}
-
-static PACMAN_DB_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-impl Hook for PacmanDbHook {
-    fn name(&self) -> &str {
-        "pacman-db"
-    }
-
-    fn run(&self, context: &HookContext) -> XpmResult<()> {
-        // Package extraction runs in parallel now, but pacman's local database
-        // has a single writer lock. Serialize the mirror step inside the
-        // process instead of letting workers race for db.lck.
-        let lock = PACMAN_DB_WRITE_LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = match lock.lock() {
-            Ok(guard) => guard,
-            Err(poison) => poison.into_inner(),
-        };
-        match context.operation_type {
-            OperationType::Install | OperationType::Upgrade => {
-                let reason = crate::install_reason::InstallReason::read(
-                    &context.local_db_dir,
-                    &context.pkg_name,
-                );
-                crate::pacman_db::mirror_entry_with_metadata(
-                    &self.pacman_local,
-                    &context.local_db_dir,
-                    &context.pkg_name,
-                    &context.pkg_version,
-                    reason,
-                    context.pkg_file.as_deref(),
-                    &self.root_dir,
-                    context.metadata.as_deref(),
-                )
-            }
-            OperationType::Remove => {
-                crate::pacman_db::remove_entry(&self.pacman_local, &context.pkg_name)
-            }
-        }
-    }
-}
-
 /// Remove package files from filesystem.
 pub struct FileRemovalHook;
 
@@ -1345,6 +1301,7 @@ mod tests {
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
             metadata: None,
+            transaction_paths: None,
         };
 
         (root_tmp, db_tmp, ctx)
@@ -1740,6 +1697,7 @@ mod tests {
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
             metadata: None,
+            transaction_paths: None,
         };
         FileExtractionHook.run(&ctx).expect("install v1");
     }
@@ -1757,6 +1715,7 @@ mod tests {
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
             metadata: None,
+            transaction_paths: None,
         }
     }
 
@@ -1856,6 +1815,37 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_keeps_file_taken_over_by_another_target() {
+        let tmp = TempDir::new().expect("tmp");
+        let root = tmp.path().join("root");
+        let db = tmp.path().join("db");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&db).expect("db");
+
+        install_v1(
+            &root,
+            &db,
+            "1.0-1",
+            &[("usr/lib/libcrypto.so.3", b"moved library")],
+            &[],
+        );
+
+        let pkg =
+            write_config_package(&db, "hello", "2.0-1", &[("usr/share/new.txt", b"new")], &[]);
+        let mut ctx = upgrade_context(&root, &db, pkg, "1.0-1", "2.0-1");
+        ctx.transaction_paths = Some(Arc::new(HashSet::from([
+            "usr/lib/libcrypto.so.3".to_string()
+        ])));
+        FileExtractionHook.run(&ctx).expect("upgrade");
+
+        assert!(
+            root.join("usr/lib/libcrypto.so.3").exists(),
+            "file moved to another target must not be removed"
+        );
+        assert!(root.join("usr/share/new.txt").exists());
+    }
+
+    #[test]
     fn remove_keeps_modified_config_as_pacsave() {
         let tmp = TempDir::new().expect("tmp");
         let root = tmp.path().join("root");
@@ -1884,6 +1874,7 @@ mod tests {
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
             metadata: None,
+            transaction_paths: None,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 
@@ -1920,6 +1911,7 @@ mod tests {
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
             metadata: None,
+            transaction_paths: None,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 
@@ -1955,6 +1947,7 @@ mod tests {
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
             metadata: None,
+            transaction_paths: None,
         };
         FileRemovalHook.run(&ctx).expect("remove");
 

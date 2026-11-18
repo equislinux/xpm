@@ -84,7 +84,6 @@ sig_level = "never"
 color = false
 parallel_downloads = 10
 shell_integration = false
-mirror_pacman = false
 
 [[repo]]
 name = "bench"
