@@ -37,7 +37,7 @@ impl Fixture {
             &config,
             format!(
                 "[options]\nroot_dir = \"{}\"\ndb_path = \"{}\"\ncache_dir = \"{}\"\n\
-                 sig_level = \"never\"\nmirror_pacman = false\nalpm_hooks = false\n",
+                 sig_level = \"never\"\nalpm_hooks = false\n",
                 root.display(),
                 db_path.display(),
                 cache_dir.display()

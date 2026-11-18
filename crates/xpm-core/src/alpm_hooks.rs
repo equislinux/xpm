@@ -31,15 +31,20 @@
 //! triggers cover the generation hooks.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{XpmError, XpmResult};
 
 /// Environment variable overriding the hook directories (colon-separated),
 /// used by tests and by non-standard installations.
 pub const ENV_HOOK_DIRS: &str = "XPM_ALPM_HOOKS_DIRS";
+
+/// Set to `0` to stop xpm from putting its pacman query shim on the hook PATH.
+pub const ENV_PACMAN_SHIM: &str = "XPM_PACMAN_SHIM";
 
 /// Default hook directories, in priority order (later wins by file name).
 pub const DEFAULT_HOOK_DIRS: &[&str] = &["/usr/share/libalpm/hooks", "/etc/pacman.d/hooks"];
@@ -486,6 +491,108 @@ fn chroot_command(command: &mut Command, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A temporary directory with a `pacman` script that delegates to xpm.
+///
+/// Arch ALPM hooks (notably mkinitcpio) query installed packages through
+/// `pacman -Q...`. xpm owns the local database, so hooks must query it
+/// directly instead of a stale pacman database. Prepending this directory to
+/// PATH during hook execution keeps those hooks working without writing
+/// pacman's database. The shim is only installed for host-root transactions;
+/// chrooted hooks keep the guest's own tools.
+struct PacmanShim {
+    dir: PathBuf,
+}
+
+impl PacmanShim {
+    fn new(db_path: &Path) -> Option<Self> {
+        if std::env::var_os(ENV_PACMAN_SHIM).is_some_and(|value| value == "0") {
+            return None;
+        }
+        let xpm = std::env::current_exe().ok()?;
+        if !xpm.is_file() {
+            return None;
+        }
+        let xpm = xpm.to_str()?;
+        let db_path = db_path.to_str()?;
+        let script = format!(
+            "#!/bin/sh\nexec {} --dbpath {} \"$@\"\n",
+            shell_quote(xpm),
+            shell_quote(db_path)
+        );
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir();
+        for attempt in 0..8 {
+            let dir = base.join(format!(
+                "xpm-pacman-shim-{}-{stamp}-{attempt}",
+                std::process::id()
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+                    }
+                    let shim = dir.join("pacman");
+                    let installed = fs::write(&shim, script.as_bytes())
+                        .and_then(|()| {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                fs::set_permissions(&shim, fs::Permissions::from_mode(0o700))
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                Ok(())
+                            }
+                        })
+                        .is_ok();
+                    if installed {
+                        return Some(Self { dir });
+                    }
+                    let _ = fs::remove_dir_all(&dir);
+                    return None;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    fn path_env(&self) -> OsString {
+        let inherited = std::env::var_os("PATH").unwrap_or_else(|| {
+            OsString::from("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        });
+        let mut path = self.dir.as_os_str().to_os_string();
+        path.push(":");
+        path.push(inherited);
+        path
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+impl Drop for PacmanShim {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Runs every hook that matches `tx` for `when`, in lexical order.
 ///
 /// `installed` answers whether a `Depends` package is present. Hook output is
@@ -496,8 +603,15 @@ pub fn run_hooks(
     when: HookWhen,
     tx: &HookTransaction<'_>,
     root: &Path,
+    db_path: &Path,
     mut installed: impl FnMut(&str) -> bool,
 ) -> XpmResult<Vec<HookFailure>> {
+    let chroot = root != Path::new("/") && std::env::var_os("XPM_ALPM_HOOKS_NO_CHROOT").is_none();
+    let shim = if chroot {
+        None
+    } else {
+        PacmanShim::new(db_path)
+    };
     let mut failures = Vec::new();
 
     for hook in hooks {
@@ -528,9 +642,10 @@ pub fn run_hooks(
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]);
         command.env("XPM_ALPM_HOOK", &hook.name);
+        if let Some(shim) = &shim {
+            command.env("PATH", shim.path_env());
+        }
         command.current_dir("/");
-        let chroot =
-            root != Path::new("/") && std::env::var_os("XPM_ALPM_HOOKS_NO_CHROOT").is_none();
         if chroot {
             if let Err(error) = chroot_command(&mut command, root) {
                 failures.push(HookFailure {
@@ -881,6 +996,7 @@ NeedsTargets
             HookWhen::PreTransaction,
             &tx,
             Path::new("/"),
+            Path::new("/var/lib/xpm"),
             |_| true,
         )
         .expect("run");
@@ -919,6 +1035,7 @@ NeedsTargets
             HookWhen::PreTransaction,
             &tx,
             Path::new("/"),
+            Path::new("/var/lib/xpm"),
             |_| true,
         )
         .expect("run");
@@ -934,6 +1051,18 @@ NeedsTargets
             PathBuf::from("/mnt/target/usr/share/libalpm/hooks")
         );
         assert_eq!(dirs[1], PathBuf::from("/mnt/target/etc/pacman.d/hooks"));
+    }
+
+    #[test]
+    fn pacman_shim_exposes_a_pacman_query_entrypoint() {
+        let shim = PacmanShim::new(Path::new("/var/lib/xpm")).expect("shim");
+        let shim_path = shim.dir.join("pacman");
+        let script = std::fs::read_to_string(&shim_path).expect("pacman shim");
+        assert!(script.contains("--dbpath '/var/lib/xpm'"), "{script}");
+        let path = shim.path_env();
+        assert!(path
+            .to_string_lossy()
+            .starts_with(&shim.dir.to_string_lossy().to_string()));
     }
 
     #[test]

@@ -40,14 +40,10 @@ parallel_downloads = 10
 # Check available disk space before installing
 check_space = true
 
-# Pacman compatibility is explicit and disabled by default.
-# Set mirror_pacman = true and pacman_db to keep pacman -Q in sync.
-# mirror_pacman = false
-# pacman_db = "/var/lib/pacman"
-
 # Execute pacman-style ALPM .hook files around transactions (default: true).
-# Set false for native installs that must not call pacman from a hook,
-# such as mkinitcpio's pacman -Qoq hook.
+# xpm gives hooks a temporary pacman query shim backed by its own database, so
+# hook scripts that call `pacman -Q...` do not need a synced pacman database.
+# Set XPM_PACMAN_SHIM=0 to disable that shim.
 alpm_hooks = true
 
 # Packages that should never be upgraded

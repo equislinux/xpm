@@ -21,7 +21,6 @@ pub mod migrate;
 pub mod orphans;
 pub mod package;
 pub mod pacman_conf;
-pub mod pacman_db;
 pub use xpm_progress as progress;
 pub mod query;
 pub mod replace;

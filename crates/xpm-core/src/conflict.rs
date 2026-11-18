@@ -5,7 +5,7 @@
 //! against every other target, then each target is checked against the
 //! filesystem using the installed package manifests for ownership.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -141,14 +141,75 @@ struct PreparedTarget<'a> {
     backups: HashSet<String>,
 }
 
+struct OwnerIndex {
+    by_path: HashMap<String, Vec<String>>,
+}
+
+impl OwnerIndex {
+    fn new(installed: &[PreparedInstalled]) -> Self {
+        let mut by_path: HashMap<String, Vec<String>> = HashMap::new();
+        for package in installed {
+            for path in &package.files {
+                by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .push(package.name.clone());
+            }
+        }
+        Self { by_path }
+    }
+
+    fn find(&self, path: &str, removed: &HashSet<String>) -> Owners {
+        let directory = format!("{path}/");
+        let mut owners = Owners::default();
+        for key in [path, directory.as_str()] {
+            let Some(names) = self.by_path.get(key) else {
+                continue;
+            };
+            for name in names {
+                owners.any = true;
+                if !removed.contains(name) {
+                    owners.remaining = Some(name.clone());
+                    return owners;
+                }
+            }
+        }
+        owners.all_removed = owners.any;
+        owners
+    }
+}
+
 /// Finds all file conflicts for the given targets.
+///
+/// This is the compatibility wrapper for callers that do not replace any
+/// installed package (plain installs). Upgrades and replacements must use
+/// [`check_file_conflicts_with_removals`] so files moving from an old package
+/// to another package in the same transaction are not reported as conflicts.
 pub fn check_file_conflicts(
     root: &Path,
     installed: &[InstalledManifest],
     targets: &[TargetManifest],
     overwrite: &OverwritePatterns,
 ) -> XpmResult<Vec<FileConflict>> {
+    check_file_conflicts_with_removals(root, installed, targets, &HashSet::new(), overwrite)
+}
+
+/// Finds all file conflicts, treating the files of packages named in
+/// `removed` as transferable to other targets in the same transaction.
+///
+/// `removed` contains every installed package whose old version is going away
+/// (upgrades, replacements and removals). A path owned by one of those packages
+/// is free for another target to claim, unless a package outside the
+/// transaction still owns it. This mirrors libalpm's `removed_files` handling.
+pub fn check_file_conflicts_with_removals(
+    root: &Path,
+    installed: &[InstalledManifest],
+    targets: &[TargetManifest],
+    removed: &HashSet<String>,
+    overwrite: &OverwritePatterns,
+) -> XpmResult<Vec<FileConflict>> {
     let installed = prepare_installed(installed)?;
+    let owners = OwnerIndex::new(&installed);
     let targets = prepare_targets(targets)?;
 
     let mut conflicts = Vec::new();
@@ -160,7 +221,7 @@ pub fn check_file_conflicts(
     }
 
     for target in &targets {
-        find_filesystem_conflicts(root, &installed, target, overwrite, &mut conflicts);
+        find_filesystem_conflicts(root, &owners, target, removed, overwrite, &mut conflicts);
     }
 
     conflicts.sort_by(|left, right| {
@@ -323,8 +384,9 @@ fn find_target_conflicts(
 
 fn find_filesystem_conflicts(
     root: &Path,
-    installed: &[PreparedInstalled],
+    owners: &OwnerIndex,
     target: &PreparedTarget<'_>,
+    removed: &HashSet<String>,
     overwrite: &OverwritePatterns,
     conflicts: &mut Vec<FileConflict>,
 ) {
@@ -354,13 +416,13 @@ fn find_filesystem_conflicts(
         };
         let rooted_lookup = root.join(lookup);
         let rooted_lookup_str = rooted_lookup.to_string_lossy();
-        let owner = find_owner(installed, lookup);
+        let owners = owners.find(lookup, removed);
 
         if incoming_directory && !filesystem_directory {
             if target.old_files.contains(lookup) {
                 continue;
             }
-            if target.backups.contains(lookup) && owner.is_none() {
+            if target.backups.contains(lookup) && !owners.any {
                 continue;
             }
             if overwrite.matches(lookup, &rooted_lookup_str) {
@@ -373,11 +435,11 @@ fn find_filesystem_conflicts(
             {
                 continue;
             }
-            if target.backups.contains(lookup) && owner.is_none() {
+            if target.backups.contains(lookup) && !owners.any {
                 continue;
             }
         } else {
-            if target.backups.contains(lookup) && owner.is_none() {
+            if target.backups.contains(lookup) && !owners.any {
                 continue;
             }
             if overwrite.matches(lookup, &rooted_lookup_str) {
@@ -385,7 +447,15 @@ fn find_filesystem_conflicts(
             }
         }
 
-        let kind = if owner.is_some() {
+        // The file is leaving with a package that is upgraded, replaced or
+        // removed in this same transaction: another target may take it over.
+        // If a package outside the transaction still owns it, it stays a
+        // conflict (reported below with that package's name).
+        if owners.all_removed {
+            continue;
+        }
+
+        let kind = if owners.remaining.is_some() {
             ConflictKind::FilesystemOwned
         } else {
             ConflictKind::FilesystemUnowned
@@ -395,17 +465,20 @@ fn find_filesystem_conflicts(
             target: target.manifest.name.clone(),
             path: rooted_lookup_str.into_owned(),
             kind,
-            owner,
+            owner: owners.remaining,
             other_target: None,
         });
     }
 }
 
-fn find_owner(installed: &[PreparedInstalled], path: &str) -> Option<String> {
-    installed
-        .iter()
-        .find(|package| package.files.contains(path))
-        .map(|package| package.name.clone())
+#[derive(Debug, Default)]
+struct Owners {
+    /// First owner that is not leaving in this transaction.
+    remaining: Option<String>,
+    /// At least one installed package lists the path.
+    any: bool,
+    /// There is an owner and every owner is leaving in this transaction.
+    all_removed: bool,
 }
 
 fn dir_belongsto_pkgs(root: &Path, directory: &str, owned: &HashSet<String>) -> bool {
@@ -715,6 +788,101 @@ mod tests {
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].owner.as_deref(), Some("imported"));
         assert_eq!(conflicts[0].kind, ConflictKind::FilesystemOwned);
+    }
+
+    #[test]
+    fn file_transferred_from_upgraded_package_is_not_a_conflict() {
+        let temp = TempDir::new().expect("tempdir");
+        write_file(temp.path(), "usr/lib/libcrypto.so.3");
+
+        let old = installed("openssl", &["usr/lib/libcrypto.so.3"]);
+        let mut upgrade = target("openssl", &[]);
+        upgrade.old_files.push("usr/lib/libcrypto.so.3".to_string());
+        let compat = target("openssl-3", &["usr/lib/libcrypto.so.3"]);
+        let removed = HashSet::from(["openssl".to_string()]);
+
+        let conflicts = check_file_conflicts_with_removals(
+            temp.path(),
+            &[old],
+            &[upgrade, compat],
+            &removed,
+            &overwrite(&[]),
+        )
+        .expect("check conflicts");
+
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+    }
+
+    #[test]
+    fn file_transfer_does_not_hide_a_remaining_owner() {
+        let temp = TempDir::new().expect("tempdir");
+        write_file(temp.path(), "usr/lib/libshared.so");
+
+        let leaving = installed("leaving", &["usr/lib/libshared.so"]);
+        let remaining = installed("remaining", &["usr/lib/libshared.so"]);
+        let incoming = target("new", &["usr/lib/libshared.so"]);
+        let removed = HashSet::from(["leaving".to_string()]);
+
+        let conflicts = check_file_conflicts_with_removals(
+            temp.path(),
+            &[leaving, remaining],
+            &[incoming],
+            &removed,
+            &overwrite(&[]),
+        )
+        .expect("check conflicts");
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].kind, ConflictKind::FilesystemOwned);
+        assert_eq!(conflicts[0].owner.as_deref(), Some("remaining"));
+    }
+
+    #[test]
+    fn file_still_shipped_by_upgraded_owner_remains_target_conflict() {
+        let temp = TempDir::new().expect("tempdir");
+        write_file(temp.path(), "usr/lib/libboth.so");
+
+        let old = installed("owner", &["usr/lib/libboth.so"]);
+        let mut upgrade = target("owner", &["usr/lib/libboth.so"]);
+        upgrade.old_files.push("usr/lib/libboth.so".to_string());
+        let incoming = target("new", &["usr/lib/libboth.so"]);
+        let removed = HashSet::from(["owner".to_string()]);
+
+        let conflicts = check_file_conflicts_with_removals(
+            temp.path(),
+            &[old],
+            &[upgrade, incoming],
+            &removed,
+            &overwrite(&[]),
+        )
+        .expect("check conflicts");
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].kind, ConflictKind::TargetTarget);
+    }
+
+    #[test]
+    fn backslash_paths_are_ordinary_bytes() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = "usr/lib/systemd/system/system-systemd\\x2dcryptsetup.slice";
+        write_file(temp.path(), path);
+
+        let old = installed("systemd", &[path]);
+        let mut upgrade = target("systemd", &[]);
+        upgrade.old_files.push(path.to_string());
+        let incoming = target("systemd-slices", &[path]);
+        let removed = HashSet::from(["systemd".to_string()]);
+
+        let conflicts = check_file_conflicts_with_removals(
+            temp.path(),
+            &[old],
+            &[upgrade, incoming],
+            &removed,
+            &overwrite(&[]),
+        )
+        .expect("check conflicts");
+
+        assert!(conflicts.is_empty(), "{conflicts:?}");
     }
 
     #[test]

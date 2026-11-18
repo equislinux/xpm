@@ -80,14 +80,6 @@ pub struct GeneralOptions {
     pub parallel_downloads: u32,
     /// Check available disk space before installing.
     pub check_space: bool,
-    /// Pacman database directory used by the explicit compatibility mirror
-    /// (`sync-pacman-db`) or when `mirror_pacman = true`.
-    ///
-    /// It is never auto-discovered in the native flow. Set it explicitly to
-    /// mirror into a different database.
-    pub pacman_db: Option<PathBuf>,
-    /// Mirror xpm transactions into pacman's local database (opt-in).
-    pub mirror_pacman: bool,
     /// Execute pacman-style ALPM hooks around transactions.
     ///
     /// Disable this when a package ships a hook that shells out to pacman
@@ -150,8 +142,6 @@ impl Default for GeneralOptions {
             color: true,
             parallel_downloads: 10,
             check_space: true,
-            pacman_db: None,
-            mirror_pacman: false,
             alpm_hooks: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
@@ -316,8 +306,6 @@ impl XpmConfig {
             color: matches!(pacman.options.color, crate::pacman_conf::ColorMode::Always),
             parallel_downloads: pacman.options.parallel_downloads.max(1),
             check_space: pacman.options.check_space,
-            pacman_db: Some(pacman.options.db_path.clone()),
-            mirror_pacman: false,
             alpm_hooks: true,
             shell_integration: false,
             scriptlet_mode: ScriptletMode::Auto,
@@ -358,7 +346,6 @@ mod tests {
         assert_eq!(config.options.db_path, PathBuf::from("/var/lib/xpm/"));
         assert_eq!(config.options.parallel_downloads, 10);
         assert_eq!(config.options.gpg_dir, PathBuf::from("/etc/xpm/gnupg/"));
-        assert!(!config.options.mirror_pacman);
         assert!(config.options.alpm_hooks);
         assert_eq!(config.repositories.len(), 1);
         assert_eq!(config.repositories[0].name, "x");
@@ -377,11 +364,6 @@ color = true
 parallel_downloads = 3
 check_space = true
 
-# Opt-in pacman compatibility. The native flow does not auto-discover
-# /var/lib/pacman; enable the mirror explicitly when pacman -Q or legacy
-# tooling must see xpm-managed packages.
-# pacman_db = "/var/lib/pacman"
-# mirror_pacman = false
 # alpm_hooks = true          # false skips pacman-style .hook execution
 # shell_integration = false
 # scriptlet_mode = "auto"   # auto | skip | require
@@ -400,7 +382,6 @@ server = ["https://mirror.example.com/archlinux/extra/os/x86_64"]
 
         let config = XpmConfig::load(tmpfile.path()).unwrap();
         assert_eq!(config.options.parallel_downloads, 3);
-        assert!(!config.options.mirror_pacman);
         assert_eq!(config.repositories.len(), 2);
         assert_eq!(config.repositories[0].name, "core");
     }
@@ -468,11 +449,6 @@ server = ["https://example/$repo/$arch"]
         assert_eq!(config.options.architecture.as_deref(), Some("x86_64"));
         assert_eq!(config.options.parallel_downloads, 3);
         assert_eq!(config.options.ignore_pkg, vec!["foo".to_string()]);
-        assert_eq!(
-            config.options.pacman_db.as_deref(),
-            Some(Path::new("/var/lib/pacman/"))
-        );
-        assert!(!config.options.mirror_pacman);
         assert_eq!(config.repositories.len(), 2);
         assert_eq!(config.repositories[0].name, "x");
         assert_eq!(config.repositories[0].sig_level, Some(SigLevel::Required));

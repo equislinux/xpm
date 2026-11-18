@@ -128,6 +128,11 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to load config from {}", config_path.display()))?
     };
 
+    // The host keyring must remain reachable for `bootstrap`: the target root
+    // is empty, so it cannot verify the signed [x] database until the host
+    // public keyring is copied into it.
+    let host_gpg_dir = config.options.gpg_dir.clone();
+
     // Apply CLI overrides. An explicit --root wins over --sysroot.
     let operation_root = cli.root.as_deref().or(cli.sysroot.as_deref());
     config.apply_overrides(
@@ -139,9 +144,8 @@ fn main() -> Result<()> {
     if cli.no_color {
         config.options.color = false;
     }
-    if cli.no_pacman_mirror {
-        config.options.mirror_pacman = false;
-    }
+    // Accepted for compatibility with older xpm-makepkg builds and scripts.
+    let _ = cli.no_pacman_mirror;
     if cli.no_alpm_hooks {
         config.options.alpm_hooks = false;
     }
@@ -185,11 +189,6 @@ fn main() -> Result<()> {
             if sysroot_active || config.options.log_file == Path::new("/var/log/xpm.log") {
                 config.options.log_file = root.join("var/log/xpm.log");
             }
-            // The pacman DB is only relocated when compatibility mirroring was
-            // explicitly enabled; the native flow never auto-discovers it.
-            if config.options.mirror_pacman && config.options.pacman_db.is_none() {
-                config.options.pacman_db = Some(root.join("var/lib/pacman"));
-            }
         }
     }
 
@@ -205,7 +204,7 @@ fn main() -> Result<()> {
         Command::Sync(args) => cmd_sync(&config, args),
         Command::Install(args) => cmd_install(&config, args, cli.no_confirm),
         Command::Build(args) => cmd_build(&config, args, cli.no_confirm),
-        Command::Bootstrap(args) => cmd_bootstrap(&config, args),
+        Command::Bootstrap(args) => cmd_bootstrap(&config, args, &host_gpg_dir),
         Command::Remove(args) => cmd_remove(&config, args, cli.no_confirm),
         Command::Upgrade(args) => cmd_upgrade(&config, args, cli.no_confirm),
         Command::Query(args) => cmd_query(&config, args),
@@ -217,7 +216,6 @@ fn main() -> Result<()> {
         Command::Rollback(args) => cmd_rollback(&config, args, cli.no_confirm),
         Command::Diff(args) => cmd_diff(&config, args),
         Command::ImportPacman(args) => cmd_import_pacman(&config, args),
-        Command::SyncPacmanDb(args) => cmd_sync_pacman_db(&config, args),
         Command::Check(args) => cmd_check(&config, args),
         Command::Mark(args) => cmd_mark(&config, args),
         Command::Deptest(args) => cmd_deptest(&config, args),
@@ -516,17 +514,52 @@ struct UpgradePlanItem {
 
 struct InstalledRecord {
     name: String,
-    version: String,
     repo: String,
     depends: Vec<String>,
     provides: Vec<String>,
     groups: Vec<String>,
     reason: InstallReason,
-    pkg_file: PathBuf,
-    metadata: Option<Arc<PackageMetadata>>,
 }
 
-fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
+/// Copies only public trust material from the host keyring into a bootstrap
+/// root. Private key directories are never copied.
+fn copy_public_keyring(host_gpg: &Path, target_gpg: &Path) -> Result<()> {
+    if !host_gpg.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(target_gpg)?;
+    for name in [
+        "pubring.gpg",
+        "pubring.kbx",
+        "trustdb.gpg",
+        "trustedkeys.gpg",
+        "gpg.conf",
+        "common.conf",
+    ] {
+        let source = host_gpg.join(name);
+        if source.is_file() {
+            fs::copy(&source, target_gpg.join(name))
+                .with_context(|| format!("failed to copy keyring file {}", source.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn bootstrap_config(config: &XpmConfig, root: &Path, host_gpg_dir: &Path) -> XpmConfig {
+    let mut boot = config.clone();
+    boot.options.root_dir = root.to_path_buf();
+    // The target is empty: syncing and installing must use the host keyring.
+    // The public part is copied into the target at the end of the bootstrap.
+    boot.options.gpg_dir = host_gpg_dir.to_path_buf();
+    boot.options.db_path = root.join("var/lib/xpm");
+    boot.options.cache_dir = root.join("var/cache/xpm/pkg");
+    boot.options.log_file = root.join("var/log/xpm.log");
+    boot.options.alpm_hooks = false;
+    boot.options.shell_integration = false;
+    boot
+}
+
+fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs, host_gpg_dir: &Path) -> Result<()> {
     let root = config.options.root_dir.clone();
     if root == Path::new("/") {
         anyhow::bail!("xpm bootstrap: pass an empty target with --root DIR");
@@ -534,15 +567,7 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     fs::create_dir_all(root.join("var/lib/xpm"))
         .with_context(|| format!("failed to create {}", root.join("var/lib/xpm").display()))?;
 
-    let mut boot = config.clone();
-    boot.options.root_dir = root.clone();
-    boot.options.db_path = root.join("var/lib/xpm");
-    boot.options.cache_dir = root.join("var/cache/xpm/pkg");
-    boot.options.log_file = root.join("var/log/xpm.log");
-    boot.options.pacman_db = None;
-    boot.options.mirror_pacman = false;
-    boot.options.alpm_hooks = false;
-    boot.options.shell_integration = false;
+    let mut boot = bootstrap_config(config, &root, host_gpg_dir);
 
     println!(
         ":: Bootstrapping {} with xpm (no pacman/pacstrap)",
@@ -604,23 +629,7 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     // are deliberately never copied. The target always uses the native xpm
     // keyring path, even when compatibility mode read the host pacman keyring.
     let host_gpg = boot.options.effective_gpg_dir();
-    if host_gpg.is_dir() {
-        let target_gpg = root.join("etc/xpm/gnupg");
-        fs::create_dir_all(&target_gpg)?;
-        for name in [
-            "pubring.gpg",
-            "pubring.kbx",
-            "trustdb.gpg",
-            "gpg.conf",
-            "common.conf",
-        ] {
-            let source = host_gpg.join(name);
-            if source.is_file() {
-                fs::copy(&source, target_gpg.join(name))
-                    .with_context(|| format!("failed to copy keyring file {}", source.display()))?;
-            }
-        }
-    }
+    copy_public_keyring(&host_gpg, &root.join("etc/xpm/gnupg"))?;
 
     // Make the new root self-contained for xpm itself: tools inside the
     // chroot (including the makepkg pacman shim) must not fall back to a
@@ -632,7 +641,6 @@ fn cmd_bootstrap(config: &XpmConfig, args: &cli::BootstrapArgs) -> Result<()> {
     conf.push_str("log_file = \"/var/log/xpm.log\"\n");
     conf.push_str("gpg_dir = \"/etc/xpm/gnupg\"\n");
     conf.push_str("shell_integration = false\n");
-    conf.push_str("mirror_pacman = false\n");
     conf.push_str(&format!(
         "parallel_downloads = {}\n",
         boot.options.parallel_downloads.max(1)
@@ -1176,7 +1184,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         .context("failed to create transaction")?;
 
     // Setup hooks chain
-    let hooks = transaction_hooks(config);
+    let hooks = HookChain::default();
     tx.set_hooks(hooks);
     tx.set_shell_integration(
         config.options.shell_integration && config.options.root_dir != Path::new("/"),
@@ -1184,6 +1192,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
     tx.set_scriptlet_mode(config.options.scriptlet_mode);
 
     let mut journal_pkgs = Vec::new();
+    let mut removed_names: Vec<String> = Vec::new();
     let mut installed: Vec<InstalledRecord> = Vec::new();
     let overwrite = conflict::OverwritePatterns::parse(&args.overwrite);
     let mut target_manifests: Vec<conflict::TargetManifest> = Vec::new();
@@ -1265,6 +1274,7 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
 
         if is_upgrade {
             let old_version = installed_version.unwrap().clone();
+            removed_names.push(pkg_name.clone());
             journal_pkgs.push(JournalPackage::upgrade(&pkg_name, &old_version, &version));
             tx.add_upgrade(
                 pkg_name.clone(),
@@ -1280,14 +1290,11 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         }
         installed.push(InstalledRecord {
             name: pkg_name.clone(),
-            version: version.clone(),
             repo: "local".to_string(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
             groups: metadata.meta.groups.clone(),
             reason: pkg_reason,
-            pkg_file: path.to_path_buf(),
-            metadata: Some(metadata.clone()),
         });
     }
 
@@ -1361,18 +1368,16 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         journal_pkgs.push(journal_pkg);
         installed.push(InstalledRecord {
             name: entry.name.clone(),
-            version: entry.version.clone(),
             repo: repo.name.clone(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
             groups: metadata.meta.groups.clone(),
             reason: pkg_reason,
-            pkg_file: dest.clone(),
-            metadata: Some(metadata.clone()),
         });
 
         // Add to transaction
         if is_upgrade {
+            removed_names.push(entry.name.clone());
             tx.add_upgrade(
                 entry.name.clone(),
                 installed_version.unwrap().clone(),
@@ -1405,11 +1410,23 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         no_confirm,
     )?;
 
+    let transaction_paths: HashSet<String> = target_manifests
+        .iter()
+        .flat_map(|manifest| manifest.files.iter().cloned())
+        .collect();
+    tx.set_transaction_paths(Arc::new(transaction_paths));
+
     let mut installed_pkgs = load_installed_pkgs(&local_db_dir)?;
     installed_pkgs.extend(assume_installed_pkgs(&assumed));
     depcheck::check_install(&installed_pkgs, &target_pkgs)
         .context("installation dependency check failed")?;
-    check_transaction_file_conflicts(config, &local_db_dir, &target_manifests, &[], &overwrite)?;
+    check_transaction_file_conflicts(
+        config,
+        &local_db_dir,
+        &target_manifests,
+        &removed_names,
+        &overwrite,
+    )?;
 
     // Phase 2/3: prepare, commit, hooks and journal.
     commit_transaction(
@@ -1434,8 +1451,6 @@ fn cmd_install(config: &XpmConfig, args: &cli::InstallArgs, no_confirm: bool) ->
         local_db::write_groups(&local_db_dir, &record.name, &record.groups)
             .with_context(|| format!("failed to record groups for '{}'", record.name))?;
     }
-
-    mirror_pacman_records(config, &installed)?;
 
     println!(":: {} package(s) installed successfully.", installed.len());
     if config.options.shell_integration && config.options.root_dir != Path::new("/") {
@@ -1506,7 +1521,7 @@ fn cmd_remove(config: &XpmConfig, args: &cli::RemoveArgs, no_confirm: bool) -> R
         .context("failed to create transaction")?;
 
     // Setup hooks chain
-    let hooks = transaction_hooks(config);
+    let hooks = HookChain::default();
     tx.set_hooks(hooks);
     tx.set_shell_integration(
         config.options.shell_integration && config.options.root_dir != Path::new("/"),
@@ -1883,7 +1898,7 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
 
     let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
         .context("failed to create transaction")?;
-    let hooks = transaction_hooks(config);
+    let hooks = HookChain::default();
     tx.set_hooks(hooks);
     tx.set_shell_integration(
         config.options.shell_integration && config.options.root_dir != Path::new("/"),
@@ -1969,14 +1984,11 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
 
         installed_records.push(InstalledRecord {
             name: entry.name.clone(),
-            version: entry.version.clone(),
             repo: repo.name.clone(),
             depends: metadata.meta.depends.clone(),
             provides: metadata.meta.provides.clone(),
             groups: metadata.meta.groups.clone(),
             reason: record_reason,
-            pkg_file: dest.clone(),
-            metadata: Some(metadata.clone()),
         });
     }
 
@@ -1997,6 +2009,12 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
             reason: InstallReason::Explicit,
         })
         .collect();
+    let transaction_paths: HashSet<String> = target_manifests
+        .iter()
+        .flat_map(|manifest| manifest.files.iter().cloned())
+        .collect();
+    tx.set_transaction_paths(Arc::new(transaction_paths));
+
     depcheck::check_installed_closure(&installed_pkgs, &removed_upgrade_names, &added_pkgs)
         .context("upgrade reverse-dependency check failed")?;
     depcheck::check_install(&installed_pkgs, &target_pkgs)
@@ -2031,8 +2049,6 @@ fn cmd_upgrade(config: &XpmConfig, args: &cli::UpgradeArgs, no_confirm: bool) ->
         local_db::write_groups(&local_db_dir, &record.name, &record.groups)
             .with_context(|| format!("failed to record groups for '{}'", record.name))?;
     }
-
-    mirror_pacman_records(config, &installed_records)?;
 
     println!(":: Upgrade complete.");
     Ok(())
@@ -2324,6 +2340,7 @@ fn run_alpm_hooks(
         when,
         &transaction,
         &config.options.root_dir,
+        &config.options.db_path,
         |name| installed.contains(name),
     )?;
     let warnings = alpm_hooks::enforce_failures(when, &failures)?;
@@ -2558,7 +2575,7 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
 
     let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
         .context("failed to create transaction")?;
-    let hooks = transaction_hooks(config);
+    let hooks = HookChain::default();
     tx.set_hooks(hooks);
     tx.set_shell_integration(
         config.options.shell_integration && config.options.root_dir != Path::new("/"),
@@ -2567,6 +2584,8 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
 
     let mut journal_pkgs = Vec::new();
     let mut reinstall_records: Vec<InstalledRecord> = Vec::new();
+
+    let mut transaction_paths: HashSet<String> = HashSet::new();
 
     for op in &plan.ops {
         match op {
@@ -2585,6 +2604,7 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
             } => {
                 let metadata = read_metadata(file)
                     .with_context(|| format!("failed to read metadata from {}", file.display()))?;
+                transaction_paths.extend(metadata.files.iter().cloned());
                 let current = local_db::read_version(&local_db_dir, name);
 
                 match current.as_deref().filter(|current| *current != version) {
@@ -2619,19 +2639,17 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
                 };
                 reinstall_records.push(InstalledRecord {
                     name: name.clone(),
-                    version: version.clone(),
                     repo: "cache".to_string(),
                     depends: metadata.meta.depends.clone(),
                     provides: metadata.meta.provides.clone(),
                     groups: metadata.meta.groups.clone(),
                     reason,
-                    pkg_file: file.clone(),
-                    metadata: None,
                 });
             }
         }
     }
 
+    tx.set_transaction_paths(Arc::new(transaction_paths));
     commit_transaction(config, "rollback", journal_pkgs, Vec::new(), &mut tx)?;
 
     for record in &reinstall_records {
@@ -2648,8 +2666,6 @@ fn cmd_rollback(config: &XpmConfig, args: &cli::RollbackArgs, no_confirm: bool) 
         local_db::write_groups(&local_db_dir, &record.name, &record.groups)
             .with_context(|| format!("failed to record groups for '{}'", record.name))?;
     }
-
-    mirror_pacman_records(config, &reinstall_records)?;
 
     println!(":: Rollback complete ({} operation(s)).", plan.ops.len());
     Ok(())
@@ -2739,7 +2755,11 @@ fn cmd_query(config: &XpmConfig, args: &cli::QueryArgs) -> Result<()> {
             exit_with(1);
         }
         for owner in owners {
-            println!("{owner_path} is owned by {} {}", owner.name, owner.version);
+            if args.quiet {
+                println!("{}", owner.name);
+            } else {
+                println!("{owner_path} is owned by {} {}", owner.name, owner.version);
+            }
         }
         return Ok(());
     }
@@ -2880,6 +2900,34 @@ fn cmd_check(config: &XpmConfig, args: &cli::CheckArgs) -> Result<()> {
         }
         names
     };
+
+    if args.repair {
+        let mut failed = false;
+        for name in &targets {
+            match check::repair_package_manifest(&local_db_dir, name) {
+                Ok(report) if report.skipped => {
+                    println!("warning: {name}: no stored .MTREE; manifest left untouched");
+                }
+                Ok(report) if report.repaired => {
+                    println!(
+                        "repaired {name}: {} -> {} manifest entries",
+                        report.old_entries, report.new_entries
+                    );
+                }
+                Ok(_) => {
+                    println!("{name}: file manifest already matches .MTREE");
+                }
+                Err(err) => {
+                    eprintln!("error: {name}: {err:#}");
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            exit_with(1);
+        }
+        return Ok(());
+    }
 
     let mut failed = false;
     for name in &targets {
@@ -3222,14 +3270,16 @@ fn check_transaction_file_conflicts(
     if targets.is_empty() {
         return Ok(());
     }
-    let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
-    let installed: Vec<conflict::InstalledManifest> = load_installed_manifests(local_db_dir)?
-        .into_iter()
-        .filter(|manifest| !removed.contains(manifest.name.as_str()))
-        .collect();
-    let conflicts =
-        conflict::check_file_conflicts(&config.options.root_dir, &installed, targets, overwrite)
-            .context("failed to check file conflicts")?;
+    let removed: std::collections::HashSet<String> = removed.iter().cloned().collect();
+    let installed = load_installed_manifests(local_db_dir)?;
+    let conflicts = conflict::check_file_conflicts_with_removals(
+        &config.options.root_dir,
+        &installed,
+        targets,
+        &removed,
+        overwrite,
+    )
+    .context("failed to check file conflicts")?;
 
     if conflicts.is_empty() {
         return Ok(());
@@ -3264,72 +3314,6 @@ fn check_transaction_file_conflicts(
         }
     }
     anyhow::bail!("failed to commit transaction (conflicting files)");
-}
-
-fn transaction_hooks(config: &XpmConfig) -> HookChain {
-    let mut hooks = HookChain::default();
-    if let Some(pacman_local) = auto_pacman_local(config) {
-        hooks.add_hook(Box::new(xpm_core::hooks::PacmanDbHook::new(
-            pacman_local,
-            config.options.root_dir.clone(),
-        )));
-    }
-    hooks
-}
-
-fn auto_pacman_local(config: &XpmConfig) -> Option<PathBuf> {
-    if !config.options.mirror_pacman {
-        return None;
-    }
-    detect_pacman_local(config)
-}
-
-/// Find a pacman local database for explicit compatibility commands.
-///
-/// This does not enable the automatic mirror; `sync-pacman-db` is the explicit
-/// opt-in path and must keep working with `mirror_pacman = false`.
-fn detect_pacman_local(config: &XpmConfig) -> Option<PathBuf> {
-    if let Some(db) = &config.options.pacman_db {
-        return Some(db.join("local"));
-    }
-    if config.options.root_dir == Path::new("/") {
-        let candidate = PathBuf::from("/var/lib/pacman/local");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn mirror_pacman_records(config: &XpmConfig, records: &[InstalledRecord]) -> Result<()> {
-    let Some(pacman_local) = auto_pacman_local(config) else {
-        return Ok(());
-    };
-    let xpm_local = config.options.db_path.join("local");
-    let mut failures = Vec::new();
-
-    for record in records {
-        if let Err(err) = xpm_core::pacman_db::mirror_entry_with_metadata(
-            &pacman_local,
-            &xpm_local,
-            &record.name,
-            &record.version,
-            record.reason,
-            Some(&record.pkg_file),
-            &config.options.root_dir,
-            record.metadata.as_deref(),
-        ) {
-            failures.push(format!("{}: {err:#}", record.name));
-        }
-    }
-
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "the xpm transaction succeeded but mirroring into pacman's database failed: {}\nRun `xpm sync-pacman-db` to repair it.",
-            failures.join("; ")
-        );
-    }
-    Ok(())
 }
 
 fn cmd_groups(config: &XpmConfig, args: &cli::GroupsArgs) -> Result<()> {
@@ -3586,42 +3570,6 @@ fn cmd_file_db(config: &XpmConfig, args: &cli::FilesDbArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sync_pacman_db(config: &XpmConfig, args: &cli::SyncPacmanDbArgs) -> Result<()> {
-    let pacman_local = args
-        .pacman_db
-        .as_ref()
-        .map(|db| db.join("local"))
-        .or_else(|| detect_pacman_local(config))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "pacman database not found; pass --pacman-db or set `pacman_db` in the config"
-            )
-        })?;
-    let xpm_local = config.options.db_path.join("local");
-
-    let report = xpm_core::pacman_db::sync_all(
-        &pacman_local,
-        &xpm_local,
-        &config.options.cache_dir,
-        &config.options.root_dir,
-    )
-    .context("failed to mirror the xpm database into pacman's")?;
-
-    println!(
-        ":: Mirrored {} package(s) into {}, skipped {}.",
-        report.written,
-        pacman_local.display(),
-        report.skipped
-    );
-    for (package, error) in &report.failed {
-        eprintln!("   {package}: {error}");
-    }
-    if !report.failed.is_empty() {
-        anyhow::bail!("{} package(s) could not be mirrored", report.failed.len());
-    }
-    Ok(())
-}
-
 fn cmd_import_pacman(config: &XpmConfig, args: &cli::ImportArgs) -> Result<()> {
     let dest = config.options.db_path.join("local");
     println!(
@@ -3686,7 +3634,6 @@ GLOBAL FLAGS:
     --dbpath <PATH>         Alternative database directory
     --cachedir <PATH>       Alternative cache directory
     --no-color              Disable colored output
-    --no-pacman-mirror      Disable the opt-in pacman DB mirror
     --no-alpm-hooks         Skip pacman-style .hook files
 
 PACMAN ALIASES:
@@ -3761,8 +3708,6 @@ GENERAL OPTIONS:
     color = true                      # Colored output
     architecture = "x86_64"           # System architecture
     alpm_hooks = true                 # false skips pacman-style .hook files
-    # mirror_pacman = false           # opt-in pacman local DB mirror
-    # pacman_db = "/var/lib/pacman"
 
 PACKAGE LISTS:
     hold_pkg = ["linux"]              # Never upgrade these
@@ -4165,5 +4110,67 @@ EXAMPLES:
              Use `xpm help commands` to see all available commands.\n\
              Use `xpm help` for general help."
         ),
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_keyring_tests {
+    use super::*;
+
+    #[test]
+    fn copies_public_keyring_material_only() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let host = tmp.path().join("host-gnupg");
+        let target = tmp.path().join("root/etc/xpm/gnupg");
+        fs::create_dir_all(&host).expect("host");
+        for name in [
+            "pubring.gpg",
+            "pubring.kbx",
+            "trustdb.gpg",
+            "trustedkeys.gpg",
+            "gpg.conf",
+            "common.conf",
+        ] {
+            fs::write(host.join(name), name.as_bytes()).expect("keyring file");
+        }
+        fs::create_dir_all(host.join("private-keys-v1.d")).expect("private dir");
+        fs::write(host.join("private-keys-v1.d/secret.key"), b"secret").expect("private key");
+
+        copy_public_keyring(&host, &target).expect("copy");
+
+        for name in [
+            "pubring.gpg",
+            "pubring.kbx",
+            "trustdb.gpg",
+            "trustedkeys.gpg",
+            "gpg.conf",
+            "common.conf",
+        ] {
+            assert!(target.join(name).is_file(), "missing {name}");
+        }
+        assert!(!target.join("private-keys-v1.d").exists());
+        assert!(!target.join("secret.key").exists());
+    }
+
+    #[test]
+    fn bootstrap_uses_the_host_keyring_and_target_paths() {
+        let mut config = XpmConfig::default();
+        config.options.gpg_dir = PathBuf::from("/tmp/target/etc/pacman.d/gnupg");
+        let host_gpg = Path::new("/etc/pacman.d/gnupg");
+        let root = Path::new("/tmp/target-root");
+        let boot = bootstrap_config(&config, root, host_gpg);
+        assert_eq!(boot.options.gpg_dir, host_gpg);
+        assert_eq!(boot.options.root_dir, root);
+        assert_eq!(boot.options.db_path, root.join("var/lib/xpm"));
+        assert_eq!(boot.options.cache_dir, root.join("var/cache/xpm/pkg"));
+        assert!(!boot.options.alpm_hooks);
+    }
+
+    #[test]
+    fn missing_host_keyring_is_a_noop() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let target = tmp.path().join("root/etc/xpm/gnupg");
+        copy_public_keyring(&tmp.path().join("missing"), &target).expect("noop");
+        assert!(!target.exists());
     }
 }

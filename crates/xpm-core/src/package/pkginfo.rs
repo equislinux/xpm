@@ -10,11 +10,10 @@ use crate::package::types::PackageMeta;
 // ── Helpers ───────────────────────────────────────────────────
 
 /// Normalizes a `backup` entry to the same relative form used by manifests:
-/// no leading `./` or `/`, forward slashes.
+/// no leading `./` or `/`. Backslashes are ordinary filename characters on
+/// Unix and must be preserved.
 fn normalize_backup_path(raw: &str) -> String {
-    let cleaned = raw.replace('\\', "/");
-    cleaned
-        .trim_start_matches("./")
+    raw.trim_start_matches("./")
         .trim_start_matches('/')
         .to_string()
 }
@@ -170,6 +169,13 @@ mod tests {
     fn empty_input_returns_error() {
         let result = parse_pkginfo(b"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn backup_paths_preserve_backslashes() {
+        let data = "pkgname = test\nbackup = etc/systemd\\x2dfoo.conf\n";
+        let meta = parse_pkginfo(data.as_bytes()).expect("parse");
+        assert_eq!(meta.backup, vec!["etc/systemd\\x2dfoo.conf".to_string()]);
     }
 
     #[test]

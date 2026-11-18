@@ -34,7 +34,6 @@ const NATIVE_TOKENS: &[&str] = &[
     "rollback",
     "diff",
     "import-pacman",
-    "sync-pacman-db",
     "check",
     "mark",
     "deptest",
@@ -337,7 +336,27 @@ fn try_rewrite(args: &[OsString]) -> Option<Vec<OsString>> {
     let operation = operation?;
     modifiers.extend(pending_modifiers);
 
-    let command = build_command(operation, &modifiers, &flags)?;
+    let mut command = build_command(operation, &modifiers, &flags)?;
+
+    // `--owner` and `--file` take a value in xpm's CLI, while pacman takes the
+    // path as a positional operand. When pacman callers use `--` to protect a
+    // path, fold the value into the option instead of leaving `--owner -- path`
+    // (which clap rejects).
+    if saw_double_dash && positionals.len() == 1 {
+        if let Some(index) = command
+            .iter()
+            .rposition(|arg| arg == "--owner" || arg == "--file")
+        {
+            if index + 1 == command.len() {
+                let mut combined = command[index].clone();
+                combined.push("=");
+                combined.push(&positionals[0]);
+                command[index] = combined;
+                positionals.clear();
+                saw_double_dash = false;
+            }
+        }
+    }
 
     let mut output = Vec::with_capacity(args.len() + command.len() + 2);
     output.push(args[0].clone());
@@ -462,11 +481,7 @@ fn parse_long_option(args: &[OsString], index: usize, flags: &mut Flags) -> Opti
             flags.nodeps = true;
             Some(index + 1)
         }
-        "--verbose"
-        | "--no-pacman-mirror"
-        | "--no-alpm-hooks"
-        | "--shell-integration"
-        | "--no-shell-integration" => {
+        "--verbose" | "--no-alpm-hooks" | "--shell-integration" | "--no-shell-integration" => {
             require_no_inline_value(inline_value)?;
             flags.globals.push(args[index].clone());
             Some(index + 1)
@@ -880,10 +895,15 @@ fn build_query_command(modifiers: &[char], flags: &Flags) -> Option<Vec<OsString
     }
 
     if o > 0 {
-        if o > 1 || e + d + l + i + q + u + t + k + g + m + n > 0 {
+        if o > 1 || e + d + l + i + u + t + k + g + m + n > 0 {
             return None;
         }
-        return Some(vec![OsString::from("query"), OsString::from("--owner")]);
+        let mut command = vec![OsString::from("query")];
+        if q > 0 {
+            command.push(OsString::from("--quiet"));
+        }
+        command.push(OsString::from("--owner"));
+        return Some(command);
     }
 
     if k > 0 {
@@ -1110,6 +1130,10 @@ mod tests {
         assert_rewrite(
             &["xpm", "-Qo", "/usr/bin/foo"],
             &["xpm", "query", "--owner", "/usr/bin/foo"],
+        );
+        assert_rewrite(
+            &["xpm", "-Qoq", "--", "/usr/bin/foo"],
+            &["xpm", "query", "--quiet", "--owner=/usr/bin/foo"],
         );
         assert_rewrite(&["xpm", "-Qm"], &["xpm", "query", "--foreign"]);
         assert_rewrite(&["xpm", "-Qmq"], &["xpm", "query", "--foreign", "--quiet"]);

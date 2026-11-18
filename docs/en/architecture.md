@@ -183,7 +183,10 @@ Scriptlets are sourced through `bash` with `XPM_ROOT_DIR`, `XPM_PKG_NAME`, and
 Around the transaction, `alpm_hooks.rs` runs pacman-style `.hook` files
 (`/usr/share/libalpm/hooks`, `/etc/pacman.d/hooks`, override with
 `XPM_ALPM_HOOKS_DIRS`): `Operation`/`Type=Package` glob triggers, `Depends`,
-`AbortOnFail` and `NeedsTargets`; pre-hook failures abort when flagged.
+`AbortOnFail` and `NeedsTargets`; pre-hook failures abort when flagged. Hooks that
+query installed packages through `pacman -Q...` (for example mkinitcpio) run with a
+temporary `pacman` query shim backed by xpm's local database; xpm never writes
+pacman's local database. `import-pacman` is a read-only, one-way migration.
 
 The generation integration lives in `journal.rs`/`generations.rs`/`rollback.rs`:
 journals link the generation current after the post hooks, `diff` reads a
@@ -206,8 +209,6 @@ sig_level = "optional"               # optional | required | never
 color = true
 parallel_downloads = 5
 check_space = true
-# mirror_pacman = false              # opt-in pacman local DB mirror
-# pacman_db = "/var/lib/pacman"
 alpm_hooks = true                    # false skips pacman-style .hook files
 # architecture = "x86_64"            # auto-detected if unset
 # hold_pkg = ["linux"]
