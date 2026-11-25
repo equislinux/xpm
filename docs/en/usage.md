@@ -210,6 +210,240 @@ xpm repo add local file:///srv/packages/$arch
 `repo add` refuses to overwrite an existing entry of the same name. After adding a repository,
 run `xpm sync` to fetch its database.
 
+### Configuration file and mirrors
+
+Predefined repositories are defined in `/etc/xpm.conf` (TOML). Each `[[repo]]` block is one
+logical repository, and its `server` key is an ordered list of mirrors for that same
+repository:
+
+```toml
+[[repo]]
+name = "core"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+    "https://mirror.osbeck.com/archlinux/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+```
+
+`$repo` and `$arch` are expanded at fetch time. xpm tries the mirrors in the listed order and
+uses the first one that serves the database; package downloads use the same list. The order is
+a preference and failover order, not a latency measurement, so put the mirror that is most
+reliable for your network first.
+
+Rules to keep in mind:
+
+- Declare each repository once. Two `[[repo]]` blocks with the same `name` write the same
+  `<name>.db` file and conflict; to add mirrors, extend the existing `server` list.
+- `xpm repo add <NAME> <URL>` adds a different repository (stored in `/etc/xpm.d/<name>.toml`),
+  it does not add a mirror to an existing one, and it refuses to overwrite an existing name.
+- Repository order is package priority: the first repository that provides a package wins.
+  Testing and unstable repositories must be listed before their stable counterparts to take
+  effect; staging repositories are for packaging work.
+- `/etc/xpm.conf` is a plain configuration file and is not owned by a package. Edits persist
+  across reboots and package upgrades. Reinstalling X regenerates the file with the installer
+  default (`X_XPM_ARCH_MIRROR`, which defaults to `geo.mirror.pkgbuild.com`).
+- After editing the file, run `sudo xpm sync --force`. `xpm clean` removes cached package files
+  only; it does not reset sync databases. If a sync fails and an old database remains, packages
+  from it can return 404 until the next successful sync.
+
+Mirror coverage for the official Arch repositories:
+
+| Mirror | Repositories | Notes |
+|--------|--------------|-------|
+| `https://mirror.rackspace.com/archlinux/$repo/os/$arch` | all 14 | Includes `*-debug` |
+| `https://geo.mirror.pkgbuild.com/$repo/os/$arch` | all 14 | Official GeoDNS; speed varies |
+| `https://mirror.osbeck.com/archlinux/$repo/os/$arch` | all except `*-debug` | Debug requests return 404 |
+
+#### Copy-paste: X plus every official Arch repository
+
+The file below is a complete `/etc/xpm.conf`. It keeps the signed `[x]` repository first and
+adds every official Arch repository: stable, testing, staging, debug, and unstable. Testing,
+staging, and unstable repositories move quickly, so enable only the blocks you need. The
+example follows the x86_64 repository layout; other architectures use the repositories
+published for that architecture.
+
+```toml
+[options]
+root_dir = "/"
+db_path = "/var/lib/xpm"
+cache_dir = "/var/cache/xpm/pkg"
+log_file = "/var/log/xpm.log"
+gpg_dir = "/etc/xpm/gnupg"
+sig_level = "required"
+database_sig_level = "optional"
+parallel_downloads = 5
+
+[[repo]]
+name = "x"
+server = ["https://equislinux.github.io/x-repo/x/$arch"]
+sig_level = "required"
+database_sig_level = "required"
+
+# Testing and unstable repositories must come before their stable counterparts
+# to take effect: the first repository that provides a package wins.
+[[repo]]
+name = "core-testing"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "extra-testing"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "multilib-testing"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "kde-unstable"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "gnome-unstable"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "core"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "extra"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "multilib"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+# Staging repositories are placed after stable on purpose. They are for
+# packaging work; move them before stable only if you are preparing packages.
+[[repo]]
+name = "core-staging"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "extra-staging"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "multilib-staging"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+# Debug repositories contain packages with the -debug suffix; their order
+# relative to the other repositories does not matter.
+[[repo]]
+name = "core-debug"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "extra-debug"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "multilib-debug"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+```
+
+#### Variant: prefer osbeck (not available for `*-debug`)
+
+`mirror.osbeck.com` is fast from many networks but does not mirror the debug repositories. To
+prefer it, put it first in every block except `core-debug`, `extra-debug`, and
+`multilib-debug`:
+
+```toml
+[[repo]]
+name = "core"
+server = [
+    "https://mirror.osbeck.com/archlinux/$repo/os/$arch",
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+
+[[repo]]
+name = "core-debug"
+server = [
+    "https://mirror.rackspace.com/archlinux/$repo/os/$arch",
+    "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+]
+sig_level = "required"
+database_sig_level = "optional"
+```
+
+Repeat the same pattern for the remaining repositories.
+
 ### `usage` — Built-in help
 
 Shows detailed usage help for the whole tool or for a topic/command.
