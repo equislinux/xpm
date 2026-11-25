@@ -1,8 +1,8 @@
 name: XPM dependency audit
 
 on:
-  pull_request:
-  push:
+  schedule:
+    - cron: "0 6 1 * *"
 
 permissions:
   contents: read
@@ -18,11 +18,6 @@ jobs:
 
       - name: Audit Cargo.lock
         run: |
-          cd "$RUNNER_TEMP"
-          rustup toolchain install stable --profile minimal
-          cargo +stable install cargo-audit --version 0.23.0 --locked
-          cargo +stable audit --file "$GITHUB_WORKSPACE/Cargo.lock"
-          
           cd "$RUNNER_TEMP"
           rustup toolchain install stable --profile minimal
           cargo +stable install cargo-audit --version 0.23.0 --locked
