@@ -1,0 +1,24 @@
+name: XPM dependency audit
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  rustsec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get repository files
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Audit Cargo.lock
+        run: |
+          cd "$RUNNER_TEMP"
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-audit --version 0.23.0 --locked
+          cargo +stable audit --file "$GITHUB_WORKSPACE/Cargo.lock"
