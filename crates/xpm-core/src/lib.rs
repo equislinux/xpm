@@ -29,6 +29,7 @@ pub mod repo_db;
 pub mod repo_sync;
 pub mod resolver;
 pub mod rollback;
+mod shell;
 pub mod signing;
 pub mod transaction;
 pub mod txhooks;

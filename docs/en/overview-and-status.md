@@ -89,7 +89,7 @@ The `Cargo.toml` currently reports version `0.1.0`.
 
 ## About the command state
 
-Not every subcommand is fully wired to engine logic yet. From `crates/xpm/src/main.rs`:
+Not every subcommand is fully wired to engine logic yet. From `crates/xpm/src/commands/`:
 
 - `sync`, `install`, `remove`, `upgrade`, and `repo` dispatch to real transaction/download logic.
 - `install` runs the SAT resolver over the sync databases: dependency closure, dependency order,
