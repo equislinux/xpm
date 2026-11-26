@@ -1,7 +1,7 @@
 # xpm — Usage
 
 Complete usage reference for the `xpm` binary, based on `crates/xpm/src/cli.rs`,
-`crates/xpm/src/main.rs`, and the project README.
+`crates/xpm/src/commands/`, and the project README.
 
 ---
 
@@ -38,7 +38,7 @@ xpm Sy [OPTIONS]
 |------|-------|-------------|
 | `--force` | `-f` | Force a full database refresh even if databases look up to date |
 
-Implementation note: `cmd_sync` in `main.rs` runs per-repository sync workers in parallel chunks,
+Implementation note: `cmd_sync` in `commands/sync.rs` runs per-repository sync workers in parallel chunks,
 tries each configured mirror with retries, reports which mirror answered, and then parses the
 downloaded `.db` / `.files` so the local package count can be shown. Remote sync failures are
 warned and do not abort the whole run.
@@ -61,7 +61,7 @@ xpm S <PACKAGES>... [OPTIONS]
 | `--as-explicit` | | Mark the package as explicitly installed |
 | `--no-optional` | | Skip optional dependencies |
 
-Behavior (from `main.rs`): every configured sync database is loaded and the requested
+Behavior (from `commands/install/`): every configured sync database is loaded and the requested
 requirements (`name` or `name=version`) are solved with the SAT resolver, which picks candidates,
 honors `depends`/`conflicts` and unversioned `provides`, and returns the closure in dependency
 order. Each package is downloaded to the cache directory, checked against a remote `.sig` per the
@@ -501,7 +501,7 @@ installation root is not `/`, xpm enables shell integration and creates command 
 `docs/CLI.md` documents an exit-code matrix (0 success, 1 general error, 2 usage error, up to 7
 database locked). Note that this matrix is documented intent rather than an enforced contract in
 the current code: in practice clap reports usage errors, `anyhow` reports runtime failures, and
-other documented codes are not yet emitted by `main.rs`. Verify against the code before relying
+other documented codes are not yet emitted by the command handlers. Verify against the code before relying
 on a specific code.
 
 ## References
@@ -511,4 +511,4 @@ on a specific code.
 - Install/upgrade quick guide: [`../INSTALL_AND_UPGRADE.md`](../INSTALL_AND_UPGRADE.md)
 - Example configuration: [`../../etc/xpm.conf.example`](../../etc/xpm.conf.example)
 - Command definition: [`../../crates/xpm/src/cli.rs`](../../crates/xpm/src/cli.rs),
-  dispatch: [`../../crates/xpm/src/main.rs`](../../crates/xpm/src/main.rs)
+  dispatch: [`../../crates/xpm/src/commands/mod.rs`](../../crates/xpm/src/commands/mod.rs)

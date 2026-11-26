@@ -45,7 +45,7 @@ renders them as ISO-8601 (`summary()`). Each package entry also carries
 `repo`/`sha256`/`source` provenance (from the sync database's `FILENAME`/
 `SHA256SUM` and the mirror URL) and the journal as a whole carries `generation`
 when it could be linked. The transaction engine already has a `rollback()`
-primitive and a state machine (`crates/xpm-core/src/transaction.rs`); the
+primitive and a state machine (`crates/xpm-core/src/transaction/`); the
 journal is the persistent record of it. `install`, `remove`, `upgrade` and
 `rollback` write it via `commit_transaction`, and finish it as `ok`/`failed`.
 
@@ -76,7 +76,7 @@ already wired around prepare/commit; only the hook scripts are pending.
 changes to the payload. Trigger matching supports `Operation`/`Type=Package`
 globs, `Depends`, `AbortOnFail` and `NeedsTargets`; `Type=Path` triggers match
 only when the caller provides the transaction's file paths (package-level
-operations do not always expose them). See `crates/xpm-core/src/alpm_hooks.rs`.
+operations do not always expose them). See `crates/xpm-core/src/alpm_hooks/`.
 
 ### 3. History and rollback — **implemented**
 

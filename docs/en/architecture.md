@@ -7,7 +7,7 @@ Technical architecture of `xpm`, based on the workspace layout, the crate source
 
 ## Workspace and crates
 
-The repository is a Cargo workspace with two members:
+The repository is a Cargo workspace with four members:
 
 ```
 xpm/
@@ -15,50 +15,58 @@ xpm/
 ├── crates/
 │   ├── xpm/                    # binary crate — CLI frontend
 │   │   └── src/
-│   │       ├── main.rs         # entry point, logging, config load, subcommand dispatch
-│   │       └── cli.rs          # clap CLI definitions (commands, aliases, flags)
-│   └── xpm-core/               # library crate — core logic
-│       └── src/
-│           ├── lib.rs          # module root and re-exports
-│           ├── config.rs       # TOML configuration parser
-│           ├── error.rs        # ConfigError / XpmError types
-│           ├── repo.rs         # repository manager (user repos in /etc/xpm.d/)
-│           ├── repo_db.rs      # ALPM-style .db / .files parsing
-│           ├── repo_sync.rs    # remote database download / sync
-│           ├── signing.rs      # OpenPGP detached signature verification
-│           ├── hooks.rs        # Hook trait + built-in transaction hooks
-│           ├── transaction.rs  # transaction engine (plan/prepare/commit)
-│           ├── package/        # .xp / .pkg.tar.zst readers and parsers
-│           │   ├── reader.rs, pkginfo.rs, buildinfo.rs, mtree.rs,
-│           │   ├── types.rs, validate.rs
-│           └── resolver/       # SAT-based dependency resolution
-│               ├── version.rs, dependency.rs, types.rs, provider.rs
+│   │       ├── main.rs         # process entry: SIGPIPE, clap, logging, dispatch
+│   │       ├── cli.rs          # clap CLI definitions (commands, aliases, flags)
+│   │       ├── app/            # config discovery/overrides and tracing setup
+│   │       ├── commands/       # one module per command family
+│   │       └── pacman_compat/  # pacman argv translation
+│   ├── xpm-core/               # library crate — core logic
+│   │   └── src/
+│   │       ├── lib.rs          # module root and re-exports
+│   │       ├── hooks/          # transaction hooks (extraction, scriptlets, removal)
+│   │       ├── transaction/    # plan / prepare / commit engine
+│   │       ├── alpm_hooks/     # pacman .hook compatibility
+│   │       ├── pacman_conf/    # pacman.conf reader
+│   │       ├── resolver/       # SAT-based dependency resolution (resolver/plan/)
+│   │       ├── depcheck/       # removal/install-time checks
+│   │       ├── conflict/       # file-conflict detection
+│   │       ├── repo_sync/      # remote database/package sync
+│   │       ├── package/        # .xp / .pkg.tar.zst readers and parsers
+│   │       └── config.rs, error.rs, repo.rs, repo_db.rs, signing.rs, ...
+│   ├── xpm-makepkg/            # clean source-build orchestration (chroot/)
+│   └── xpm-progress/           # terminal progress rendering
 ├── etc/xpm.conf.example        # example configuration
 ├── tests/                      # repo database integration tests
 ├── ROADMAP.md                  # internal development roadmap
 └── docs/                       # documentation (this folder)
 ```
 
-The binary crate (`xpm`) depends only on `clap`, `anyhow`, `tracing`, `tracing-subscriber`, and
-`xpm-core`. All domain logic lives in `xpm-core`.
+The binary crate (`xpm`) depends on `clap`, `anyhow`, `tracing`, `tracing-subscriber`,
+`xpm-core`, and `xpm-makepkg`. All domain logic lives in `xpm-core`; `main.rs` only wires the
+process together.
+
+See [`module-map.md`](module-map.md) for the per-file index and the
+"where do I find…" table.
 
 ## CLI dispatch flow
 
 `main.rs` follows a straight-line pipeline:
 
-1. Parse the CLI with clap (`Cli::parse`).
-2. Initialize `tracing` logging; verbosity `-v`/`-vv`/`-vvv` maps to INFO/DEBUG/TRACE
-   (default WARN). `RUST_LOG` overrides via `EnvFilter`.
-3. Load the configuration from `--config` (default `/etc/xpm.conf`); if the file is missing the
-   parser falls back to built-in defaults (`load_or_default`).
-4. Apply CLI overrides for `--root`, `--dbpath`, `--cachedir`, and `--no-color`.
-5. Dispatch to the handler of the parsed subcommand.
+1. Parse the CLI with clap (`Cli::parse_from`, after `pacman_compat::rewrite_args`).
+2. Initialize `tracing` logging (`app::logging`); verbosity `-v`/`-vv`/`-vvv` maps to
+   INFO/DEBUG/TRACE (default WARN). `RUST_LOG` overrides via `EnvFilter`.
+3. Load the configuration (`app::config::load`) from `--config` (default `/etc/xpm.conf`); if the
+   file is missing the parser falls back to built-in defaults (`load_or_default`).
+4. Apply CLI overrides for `--root`/`--sysroot`, `--dbpath`, `--cachedir`, `--no-color`,
+   hooks, scriptlets and progress, and relocate default paths into the target root.
+5. Dispatch to the handler via `commands::dispatch`, which routes to one module under
+   `commands/`.
 
 ## Dependency resolution
 
 The resolver lives in `crates/xpm-core/src/resolver/` and delegates all SAT mechanics to the
 `resolvo` crate (CDCL, watched literals, unit propagation). xpm supplies the data model and the
-`DependencyProvider` implementation. Four modules:
+`DependencyProvider` implementation. Modules:
 
 | Module | File | Purpose |
 |--------|------|---------|
@@ -66,6 +74,9 @@ The resolver lives in `crates/xpm-core/src/resolver/` and delegates all SAT mech
 | `dependency` | `dependency.rs` | Dependency constraint parsing and matching |
 | `types` | `types.rs` | Package pool and interning bridge to resolvo |
 | `provider` | `provider.rs` | `XpmProvider` implementing resolvo `Interner` + `DependencyProvider` |
+| `plan/closure` | `plan/closure.rs` | Requirement resolution and dependency ordering |
+| `plan/conflicts` | `plan/conflicts.rs` | Solution conflicts against installed packages |
+| `plan/sat` | `plan/sat.rs` | Pool interning helpers for solver constraints |
 
 Key types:
 
@@ -91,10 +102,10 @@ The README expresses the model as CNF clauses:
 | Root requirement | `foo` | Target package is mandatory |
 | Conflict | `!bar_v1 OR !bar_v2` | Mutually exclusive versions |
 
-Honest note: the resolver is implemented and tested at the library level (see
-`docs/RESOLVER.md`), but the current CLI `install`/`upgrade` handlers in `main.rs` do not invoke
-it — `install` selects a package by exact name from the synced database, and `upgrade` compares
-versions with `Version::cmp_versions`. Using the solver from the CLI is future work.
+The CLI uses the resolver: `commands/install` builds `PackageCandidate` values from the sync
+databases and calls `resolve_closure_with_installed`, while `commands/upgrade` builds the upgrade
+plan from `read_latest_remote_entries`/`Version::cmp_versions` and resolves replacements with
+`resolve_closure`. Library-level details and test coverage are in `docs/RESOLVER.md`.
 
 ## Package format
 
@@ -125,7 +136,9 @@ sizes, and file types.
 - `parse_sync_db`, `merge_files_db` — parse the `.db` archive and merge the optional `.files`
   listing.
 
-`repo_sync.rs` handles remote operations:
+`repo_sync/` handles remote operations (`db.rs` syncs, `verify.rs` checks signatures/SHA-256,
+`download.rs` builds URLs and retries, `transfer.rs` performs a single transfer, `progress.rs`
+renders the bar):
 
 - `expand_repo_url` — substitutes `$repo` and `$arch` in mirror URLs.
 - `sync_repo_databases` — downloads `<repo>.db` (mandatory) and `<repo>.files` (best effort)
@@ -151,7 +164,8 @@ Enforcement is controlled by `sig_level` from the config (per-repository overrid
 
 ## Transactions and hooks
 
-`transaction.rs` implements the transaction engine with a plan/prepare/commit lifecycle:
+`transaction/` implements the transaction engine with a plan/prepare/commit lifecycle
+(`plan.rs`, `prepare.rs`, `commit.rs`, `execute.rs`, `fast_install.rs`, `lock.rs`, `op.rs`):
 
 - `FileLock` — filesystem lock (under the local DB) preventing concurrent xpm operations.
 - `TransactionOp` — `Install { pkg_name, pkg_version, pkg_file }`, `Remove { pkg_name }`,
@@ -161,7 +175,8 @@ Enforcement is controlled by `sig_level` from the config (per-repository overrid
   failures trigger rollback logic; operations are appended to the log file (default
   `/var/log/xpm.log` under the root).
 
-`hooks.rs` provides the `Hook` trait and a `HookChain`. The default chain runs, per operation:
+`hooks/` provides the `Hook` trait and a `HookChain` (`extraction.rs`, `scriptlet.rs`,
+`removal.rs`, `local_db.rs`, `metadata.rs`, `fsutil.rs`). The default chain runs, per operation:
 
 1. `MetadataLoadHook` — validate/load package metadata for the operation.
 2. `PreScriptletHook` — run `.INSTALL` pre-scriptlets (`pre_install`, `pre_upgrade`,
@@ -180,7 +195,7 @@ Enforcement is controlled by `sig_level` from the config (per-repository overrid
 Scriptlets are sourced through `bash` with `XPM_ROOT_DIR`, `XPM_PKG_NAME`, and
 `XPM_PKG_VERSION` exported.
 
-Around the transaction, `alpm_hooks.rs` runs pacman-style `.hook` files
+Around the transaction, `alpm_hooks/` runs pacman-style `.hook` files
 (`/usr/share/libalpm/hooks`, `/etc/pacman.d/hooks`, override with
 `XPM_ALPM_HOOKS_DIRS`): `Operation`/`Type=Package` glob triggers, `Depends`,
 `AbortOnFail` and `NeedsTargets`; pre-hook failures abort when flagged. Hooks that
@@ -257,6 +272,7 @@ provides a package wins); within a repository, mirrors are tried in order until 
 
 ## References
 
+- Source tree index and "where do I find…": [`module-map.md`](module-map.md)
 - Resolver details and test coverage: [`../RESOLVER.md`](../RESOLVER.md)
 - Fetch targets and endpoints: [`../FETCH_TARGETS.md`](../FETCH_TARGETS.md)
 - Integration with xpkg: [`../INTEGRATION.md`](../INTEGRATION.md)
