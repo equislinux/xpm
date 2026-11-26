@@ -67,10 +67,16 @@ src/
 │   └── help/
 │       ├── mod.rs              Help entry point
 │       ├── topics.rs           overview, command list, config, repositories
-│       └── command.rs          Per-command long help
+│       └── command/            Per-command long help
+│           ├── mod.rs          Dispatcher
+│           ├── sync.rs         sync/install/remove/upgrade
+│           ├── query.rs        query/check/mark/deptest
+│           ├── inspect.rs      search/info/files
+│           └── repo.rs         repo/history/rollback/diff
 └── pacman_compat/
     ├── mod.rs                  argv entry, native-token detection, try_rewrite
     ├── flags.rs                Flags/Bundle models and long-option parsing
+    ├── rewrite.rs              try_rewrite orchestration
     ├── build/                  pacman operation -> xpm command builders
     │   ├── mod.rs              build_command dispatch
     │   ├── sync.rs             `-S`
@@ -138,7 +144,10 @@ src/
 │       └── tests.rs            Reader tests
 ├── hooks/                      Transaction hooks (filesystem lifecycle)
 │   ├── mod.rs                  Hook trait, HookContext, ScriptletMode, HookChain
-│   ├── extraction.rs           FileExtractionHook, .pacnew/.pacsave, MTREE handling
+│   ├── extraction/             File extraction and config-file handling
+│   │   ├── mod.rs              FileExtractionHook
+│   │   ├── backup.rs           .pacnew/.pacsave and stale-file cleanup
+│   │   └── mtree.rs            Installed/packaged MTREE hash maps
 │   ├── fsutil.rs               Archive opening, entry attrs, path/hash helpers
 │   ├── scriptlet.rs            Pre/PostScriptletHook, shell shims/integration
 │   ├── local_db.rs             LocalDbHook
@@ -167,7 +176,10 @@ src/
 │   ├── mod.rs                  Shared errors/values, re-exports
 │   ├── types.rs                Usage, SigLevel*, PacmanRepo/Options/Config
 │   ├── builders.rs             Repo/Options builders
-│   ├── parser.rs               Line parser, Include loop, $arch validation
+│   ├── parser/                 Line-oriented parser
+│   │   ├── mod.rs              Entry point, file loop and sections
+│   │   ├── directives.rs       [options] directive handlers
+│   │   └── repo.rs             Repository and Include handlers
 │   ├── include.rs              Glob include expansion
 │   ├── siglevel.rs             SigLevel/Usage/ParallelDownloads value parsers
 │   └── tests.rs                Config-parser tests
@@ -288,6 +300,20 @@ It is intentionally dependency-light (`xpm-core` imports it as
 | Change repository sync/download | `crates/xpm-core/src/repo_sync/` |
 | Change chroot template or mounts | `crates/xpm-makepkg/src/chroot/` |
 | Add a unit test | The `tests.rs` (or `tests/`) next to the module |
+
+## Known duplication (deferred)
+
+The following duplicates are known and intentionally left unchanged; merging
+them is a dedicated change with its own tests, not a mechanical split:
+
+- Archive/compression openers exist in `package/reader/compression.rs`,
+  `repo_db/parse.rs` and `hooks/fsutil.rs`.
+- `sha256_file` exists in `check/mtree.rs`, `hooks/fsutil.rs` and
+  `package/validate.rs`.
+- Local-database readers in `crates/xpm/src/commands/installed.rs` overlap with
+  `xpm-core::local_db` / `xpm-core::query`.
+- `install` and `upgrade` share the download → verify → hooks → commit flow;
+  see `commands/transaction.rs` before changing either.
 
 ## Conventions
 
