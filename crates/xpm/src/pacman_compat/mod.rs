@@ -19,14 +19,14 @@
 
 use std::ffi::{OsStr, OsString};
 
+mod build;
 mod flags;
-mod rewrite;
 
 #[cfg(test)]
 mod tests;
 
+use build::build_command;
 use flags::*;
-use rewrite::build_command;
 
 /// Native xpm subcommands and the aliases clap already understands.
 const NATIVE_TOKENS: &[&str] = &[

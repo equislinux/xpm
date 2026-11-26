@@ -1,6 +1,6 @@
 # xpm — Usage
 
-Complete usage reference for the `xpm` binary, based on `crates/xpm/src/cli.rs`,
+Complete usage reference for the `xpm` binary, based on `crates/xpm/src/cli/`,
 `crates/xpm/src/commands/`, and the project README.
 
 ---
@@ -510,5 +510,5 @@ on a specific code.
 - Fetch targets and mirror layout: [`../FETCH_TARGETS.md`](../FETCH_TARGETS.md)
 - Install/upgrade quick guide: [`../INSTALL_AND_UPGRADE.md`](../INSTALL_AND_UPGRADE.md)
 - Example configuration: [`../../etc/xpm.conf.example`](../../etc/xpm.conf.example)
-- Command definition: [`../../crates/xpm/src/cli.rs`](../../crates/xpm/src/cli.rs),
+- Command definition: [`../../crates/xpm/src/cli/`](../../crates/xpm/src/cli/),
   dispatch: [`../../crates/xpm/src/commands/mod.rs`](../../crates/xpm/src/commands/mod.rs)

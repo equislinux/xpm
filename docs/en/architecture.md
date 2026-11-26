@@ -31,8 +31,15 @@ xpm/
 │   │       ├── depcheck/       # removal/install-time checks
 │   │       ├── conflict/       # file-conflict detection
 │   │       ├── repo_sync/      # remote database/package sync
+│   │       ├── repo_db/        # sync/.files database parsing
+│   │       ├── local_db/       # per-package local database files
+│   │       ├── config/         # TOML configuration
+│   │       ├── check/          # installed-file verification
+│   │       ├── query/          # owner/foreign/unrequired queries
+│   │       ├── journal/        # transaction journal
+│   │       ├── replace/        # sysupgrade replacements
 │   │       ├── package/        # .xp / .pkg.tar.zst readers and parsers
-│   │       └── config.rs, error.rs, repo.rs, repo_db.rs, signing.rs, ...
+│   │       └── error.rs, repo.rs, signing.rs, ...
 │   ├── xpm-makepkg/            # clean source-build orchestration (chroot/)
 │   └── xpm-progress/           # terminal progress rendering
 ├── etc/xpm.conf.example        # example configuration
@@ -120,7 +127,7 @@ containing metadata entries:
 | `.MTREE` | File manifest with modes, sizes, and SHA-256 digests (`sha256digest=`) |
 | `.INSTALL` | Optional bash scriptlets (`pre_install`, `post_install`, `pre_upgrade`, `post_upgrade`, `pre_remove`, `post_remove`) |
 
-`crates/xpm-core/src/package/reader.rs` provides `read_metadata`, `list_files`,
+`crates/xpm-core/src/package/reader/` provides `read_metadata`, `list_files`,
 `extract_to`, and `read_raw_entry`; the parsers live in `pkginfo.rs`, `buildinfo.rs`, and
 `mtree.rs`; shared structs in `types.rs`. `validate.rs` implements post-extraction integrity
 validation: extracted files are checked against the `.MTREE` manifest for SHA-256 checksums,

@@ -34,7 +34,9 @@ For the higher-level package-manager architecture, see
 ```
 src/
 ├── main.rs                     Process entry: SIGPIPE, clap, logging, dispatch
-├── cli.rs                      clap command/args definitions and aliases
+├── cli/                        clap definitions
+│   ├── mod.rs                  Cli, Command, aliases
+│   └── args/                   Per-command argument structs
 ├── app/
 │   ├── config.rs               Config discovery, pacman.conf bridging, CLI overrides
 │   └── logging.rs              tracing setup from -v flags / RUST_LOG
@@ -47,10 +49,15 @@ src/
 │   ├── bootstrap.rs            Bootstrap an empty root (and its tests)
 │   ├── build.rs                `xpm build` via xpm-makepkg
 │   ├── install/
-│   │   ├── mod.rs              `xpm install` flow
+│   │   ├── mod.rs              `xpm install` entry + InstallPlan
+│   │   ├── plan.rs             Local files, dependency resolution, --print
+│   │   ├── execute.rs          Prefetch, verify, transact and record
 │   │   └── download.rs         Parallel prefetch and signature verification
 │   ├── remove.rs               `xpm remove`
-│   ├── upgrade.rs              `xpm upgrade` planning and execution
+│   ├── upgrade/
+│   │   ├── mod.rs              `xpm upgrade` entry
+│   │   ├── plan.rs             Replacement/upgrade plan and reporting
+│   │   └── execute.rs          Download, verify, transact and record
 │   ├── query.rs                query / search / info / files
 │   ├── file_db.rs              `xpm file-db`
 │   ├── check.rs                `xpm check` (-Qk/-Qkk)
@@ -64,7 +71,15 @@ src/
 └── pacman_compat/
     ├── mod.rs                  argv entry, native-token detection, try_rewrite
     ├── flags.rs                Flags/Bundle models and long-option parsing
-    ├── rewrite.rs              pacman operation -> xpm command builders
+    ├── build/                  pacman operation -> xpm command builders
+    │   ├── mod.rs              build_command dispatch
+    │   ├── sync.rs             `-S`
+    │   ├── query.rs            `-Q`
+    │   ├── remove.rs           `-R`
+    │   ├── install.rs          `-U`
+    │   ├── files_db.rs         `-F`
+    │   ├── mark.rs             `-D`
+    │   └── deptest.rs          `-T`
     └── tests.rs                argv translation tests
 ```
 
@@ -82,11 +97,45 @@ Key boundaries:
 src/
 ├── lib.rs                      Public module list and re-exports
 ├── shell.rs                    Shell quoting shared by scriptlets/hooks
-├── config.rs                   TOML configuration
+├── config/                     TOML configuration
+│   ├── mod.rs                  Defaults and public re-exports
+│   ├── types.rs                SigLevel / Repository / GeneralOptions / XpmConfig
+│   ├── load.rs                 Loading, validation and CLI overrides
+│   ├── pacman.rs               pacman.conf -> XpmConfig lowering
+│   └── tests.rs                Config tests
 ├── error.rs                    XpmError / ConfigError
+├── check/                      Installed-file verification (`-Qk` / `-Qkk`)
+│   ├── mod.rs                  Shared normalization and re-exports
+│   ├── package.rs              PackageCheck and check_package
+│   ├── manifest.rs             Fast manifest checks and manifest repair
+│   ├── mtree.rs                Full .MTREE verification
+│   └── tests.rs                Check tests
+├── local_db/                   Per-package local database files
+│   ├── mod.rs                  Constants, list IO, re-exports
+│   ├── mtree.rs                .MTREE path/hash conversion
+│   ├── backup.rs               Backup lists and stored .MTREE
+│   ├── files.rs                `files` manifest IO
+│   ├── meta.rs                 Origin, version, changelog, deps/provides/groups
+│   └── tests.rs                Local DB tests
+├── repo_db/                    Sync/.files database parsing
+│   ├── mod.rs                  Public re-exports
+│   ├── types.rs                RepoEntry / SyncDb / LocalDb
+│   ├── parse.rs                ALPM archive and section parsing
+│   ├── sync_db.rs              .db parsing and JSON cache
+│   ├── files_db.rs             .files merging
+│   ├── query.rs                Search matching
+│   └── tests.rs                Repo DB tests
 ├── package/                    .xp / .pkg.tar.zst readers and metadata
-│   ├── mod.rs, reader.rs, pkginfo.rs, buildinfo.rs, mtree.rs,
-│   ├── types.rs, validate.rs
+│   ├── mod.rs, pkginfo.rs, buildinfo.rs, mtree.rs,
+│   ├── types.rs, validate.rs,
+│   └── reader/                 Package archive reader
+│       ├── mod.rs              Re-exports
+│       ├── compression.rs      Magic-byte detection and archive opening
+│       ├── raw.rs              Raw metadata entries
+│       ├── metadata.rs         PackageMetadata / read_metadata
+│       ├── files.rs            File listings
+│       ├── extract.rs          Payload extraction
+│       └── tests.rs            Reader tests
 ├── hooks/                      Transaction hooks (filesystem lifecycle)
 │   ├── mod.rs                  Hook trait, HookContext, ScriptletMode, HookChain
 │   ├── extraction.rs           FileExtractionHook, .pacnew/.pacsave, MTREE handling
@@ -157,10 +206,25 @@ src/
 │   ├── transfer.rs             HTTP/file transfer, atomic writes
 │   ├── progress.rs             Single-line download progress
 │   └── tests.rs                Sync/download tests
-├── cache.rs, check.rs, config.rs, deptest.rs, generations.rs,
-├── groups.rs, install_reason.rs, journal.rs, local_db.rs, migrate.rs,
-├── orphans.rs, query.rs, replace.rs, repo.rs, repo_db.rs, rollback.rs,
-├── signing.rs, txhooks.rs
+├── query/                      Pacman-compatible query helpers
+│   ├── mod.rs                  Re-exports
+│   ├── local.rs                LocalPackage and loading
+│   ├── owners.rs               -Qo owner lookup and path normalization
+│   ├── filters.rs              -Qm/-Qt filters
+│   └── tests.rs                Query tests
+├── journal/                    Transaction journal
+│   ├── mod.rs                  Schema and re-exports
+│   ├── entry.rs                JournalPackage
+│   ├── store.rs                Journal records and persistence
+│   ├── time.rs                 Epoch / ISO-8601 helpers
+│   └── tests.rs                Journal tests
+├── replace/                    Sysupgrade replacement planning
+│   ├── mod.rs                  Re-exports
+│   ├── patterns.rs             IgnorePkg/IgnoreGroup patterns
+│   ├── resolution.rs           Replacement selection
+│   └── tests.rs                Replacement tests
+├── cache.rs, deptest.rs, generations.rs, groups.rs, install_reason.rs,
+├── migrate.rs, orphans.rs, repo.rs, rollback.rs, signing.rs, txhooks.rs
 ```
 
 ## `crates/xpm-makepkg` — clean source builds
@@ -183,8 +247,18 @@ src/
 
 ## `crates/xpm-progress`
 
-`src/lib.rs` renders phase bars, per-package progress and parallel download
-aggregates. It is intentionally dependency-light (`xpm-core` imports it as
+```
+src/
+├── lib.rs                      Public re-exports
+├── render.rs                   Percentage, bar layout and line rendering
+├── settings.rs                 Process-wide enable/tty/verbose settings
+├── parallel.rs                 Aggregate concurrent-download progress
+├── operation.rs                Standalone per-operation count bar
+├── phase.rs                    Per-phase progress bars
+└── tests.rs                    Progress tests
+```
+
+It is intentionally dependency-light (`xpm-core` imports it as
 `xpm_core::progress`).
 
 ---
@@ -193,8 +267,8 @@ aggregates. It is intentionally dependency-light (`xpm-core` imports it as
 
 | Task | Start here |
 |------|------------|
-| Add or rename a CLI flag | `crates/xpm/src/cli.rs`, then the command module |
-| Change how a pacman flag maps to xpm | `crates/xpm/src/pacman_compat/flags.rs` and `rewrite.rs` |
+| Add or rename a CLI flag | `crates/xpm/src/cli/args/`, then the command module |
+| Change how a pacman flag maps to xpm | `crates/xpm/src/pacman_compat/flags.rs` and `build/` |
 | Change installation planning/order | `crates/xpm/src/commands/install/`, `commands/installed.rs` |
 | Change package extraction, `.pacnew`/`.pacsave` | `crates/xpm-core/src/hooks/extraction.rs`, `fsutil.rs` |
 | Change `.INSTALL` scriptlet execution | `crates/xpm-core/src/hooks/scriptlet.rs` |
@@ -202,6 +276,13 @@ aggregates. It is intentionally dependency-light (`xpm-core` imports it as
 | Change pacman `.hook` compatibility | `crates/xpm-core/src/alpm_hooks/` |
 | Change `pacman.conf` parsing | `crates/xpm-core/src/pacman_conf/` |
 | Change dependency solving | `crates/xpm-core/src/resolver/plan/` |
+| Change configuration loading/validation | `crates/xpm-core/src/config/` |
+| Change sync `.db`/`.files` parsing | `crates/xpm-core/src/repo_db/` |
+| Change local database files | `crates/xpm-core/src/local_db/` |
+| Change installed-file checks | `crates/xpm-core/src/check/` |
+| Change owner/foreign/unrequired queries | `crates/xpm-core/src/query/` |
+| Change the transaction journal | `crates/xpm-core/src/journal/` |
+| Change sysupgrade replacements | `crates/xpm-core/src/replace/` |
 | Change removal/install checks | `crates/xpm-core/src/depcheck/` |
 | Change file-conflict behavior | `crates/xpm-core/src/conflict/` |
 | Change repository sync/download | `crates/xpm-core/src/repo_sync/` |
