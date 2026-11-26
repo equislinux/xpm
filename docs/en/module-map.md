@@ -198,7 +198,10 @@ src/
 │   └── tests.rs                Cross-module resolver tests
 ├── depcheck/                   Removal and install-time checks
 │   ├── mod.rs                  InstalledPkg / RemoveOptions, re-exports
-│   ├── removal.rs              -R planning, recursive/cascade, ordering
+│   ├── removal/                -R planning and ordering
+│   │   ├── mod.rs              Plan entry, set helpers, satisfies
+│   │   ├── recursive.rs        Reverse-dependency discovery/selection
+│   │   └── order.rs            Dependency ordering
 │   ├── install.rs              InstallTarget, check_install, closure checks
 │   ├── install_checks.rs       Install-check tests
 │   └── tests.rs                Removal tests
@@ -314,6 +317,16 @@ them is a dedicated change with its own tests, not a mechanical split:
   `xpm-core::local_db` / `xpm-core::query`.
 - `install` and `upgrade` share the download → verify → hooks → commit flow;
   see `commands/transaction.rs` before changing either.
+
+## Tests
+
+- Unit tests live next to the module as `tests.rs` (or a `tests/` folder).
+- Integration tests live in `crates/xpm/tests/`. Single-file suites stay as
+  `*.rs`; grouped suites use `<name>/main.rs` plus feature modules, so the
+  test target name and the shared fixture stay stable:
+  - `cli_journey/{rollback,hooks,diff_history}.rs`
+  - `cli_pacman_compat_flags/{sync_query,files_cache,upgrade}.rs`
+  - `cli_query_repair/{query,check,mark}.rs`
 
 ## Conventions
 
