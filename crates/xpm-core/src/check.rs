@@ -404,6 +404,13 @@ mod tests {
         let binary = b"#!/bin/sh\necho hello\n";
         write_file(&root, "usr/bin/hello", binary, 0o755);
         fs::create_dir_all(root.join("usr/bin")).expect("bin dir");
+        for dir in ["usr", "usr/bin"] {
+            fs::set_permissions(
+                root.join(dir),
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .expect("fixture directory permissions");
+        }
         let target = root.join("usr/bin/hello-real");
         std::os::unix::fs::symlink("hello", &target).expect("symlink");
 
