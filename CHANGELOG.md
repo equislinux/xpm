@@ -2,10 +2,6 @@
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-This project does not follow a released versioning scheme yet; changes are
-grouped under `Unreleased` until the first tagged release.
-
 ## [Unreleased] - 2026-11-26
 
 ### Changed
