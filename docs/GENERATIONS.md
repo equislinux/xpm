@@ -48,6 +48,11 @@ when it could be linked. The transaction engine already has a `rollback()`
 primitive and a state machine (`crates/xpm-core/src/transaction/`); the
 journal is the persistent record of it. `install`, `remove`, `upgrade` and
 `rollback` write it via `commit_transaction`, and finish it as `ok`/`failed`.
+The local database record (version, dependencies, provides, groups, reason and
+origin) is written inside the transaction before the post hooks, so a
+generation snapshotted by `95-x-gen-post.hook` always carries consistent
+package metadata. Interrupted (`running`) journals are reconciled at the start
+of the next transaction.
 
 ### 2. Hook directories (contract) — **implemented** (`xpm-core::txhooks`)
 

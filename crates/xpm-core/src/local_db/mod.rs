@@ -52,6 +52,7 @@ mod backup;
 mod files;
 mod meta;
 mod mtree;
+mod record;
 
 pub use backup::{read_backup_list, read_mtree, write_backup_list, write_mtree};
 pub use files::{read_files, render_files, write_file_list, write_files};
@@ -60,6 +61,7 @@ pub use meta::{
     write_depends, write_groups, write_origin, write_provides,
 };
 pub use mtree::{mtree_hash_map, mtree_paths};
+pub use record::{write_record, Record};
 
 fn write_list(local_db_dir: &Path, pkg: &str, file: &str, entries: &[String]) -> XpmResult<()> {
     let pkg_dir = local_db_dir.join(pkg);

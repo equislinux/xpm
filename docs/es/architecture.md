@@ -160,8 +160,8 @@ plan/prepare/commit:
 
 - `FileLock` — lock de filesystem (bajo la base de datos local) que impide operaciones xpm
   concurrentes.
-- `TransactionOp` — `Install { pkg_name, pkg_version, pkg_file }`, `Remove { pkg_name }`,
-  `Upgrade { ... }`.
+- `TransactionOp` — `Install { pkg_name, pkg_version, pkg_file, reason, origin }`,
+  `Remove { pkg_name }`, `Upgrade { ... }`.
 - `TransactionState` — `Planning`, `Prepared`, `Committed`, `RolledBack`.
 - `Transaction` — recoge operaciones durante el planning, ejecuta el pre-flight de prepare y
   luego commitea; los fallos disparan lógica de rollback; las operaciones se añaden al log
@@ -182,7 +182,10 @@ plan/prepare/commit:
    fuera de la raíz del sistema); los `backup` modificados pasan a `.pacsave` salvo `--nosave`.
 5. `PostScriptletHook` — ejecuta los post-scriptlets de `.INSTALL` (`post_install`,
    `post_upgrade`, `post_remove`).
-6. `LocalDbHook` — registra/elimina el paquete en la base de datos local.
+6. `LocalDbHook` — registra/elimina el paquete en la base de datos local. En
+   install/upgrade escribe el registro completo (dependencias, provides, grupos, razón,
+   origen y por último la versión) antes de los post-hooks y de finalizar el journal, así
+   una generación snapshot-eada por un post-hook siempre captura una base consistente.
 
 Los scriptlets se ejecutan vía `bash` con las variables `XPM_ROOT_DIR`, `XPM_PKG_NAME` y
 `XPM_PKG_VERSION` exportadas.
@@ -199,6 +202,12 @@ solo lectura y en un único sentido.
 La integración con generaciones vive en `journal.rs`/`generations.rs`/`rollback.rs`: el journal
 enlaza la generación vigente tras los post-hooks, `diff` lee el `packages.tsv` de una generación
 y `rollback` invierte un journal exitoso usando la caché de paquetes (`cache.rs`).
+
+`journal/recovery.rs` reconcilia los journals que quedaron en estado `running` por un crash:
+al inicio de la siguiente transacción (bajo el lock) repara la metadata de los paquetes cuya
+versión instalada ya coincide con la del journal, usando el paquete cacheado y su checksum.
+Esos journals se finalizan como `recovered`; si el paquete ya no está en caché se reporta y
+se finaliza como `failed` sin tocar los registros existentes.
 
 ## Configuración
 

@@ -18,10 +18,12 @@ use crate::error::{XpmError, XpmResult};
 pub const JOURNAL_SCHEMA: u32 = 1;
 
 mod entry;
+mod recovery;
 mod store;
 mod time;
 
 pub use entry::JournalPackage;
+pub use recovery::{reconcile_running, RecoveryReport};
 pub use store::Journal;
 pub use time::{iso8601, now_epoch};
 

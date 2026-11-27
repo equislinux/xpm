@@ -22,6 +22,8 @@ impl Transaction {
         pkg_name: &str,
         pkg_version: &str,
         pkg_file: &Path,
+        reason: InstallReason,
+        origin: Option<&str>,
     ) -> XpmResult<()> {
         // Run hooks to extract files and perform pre/post-install actions
         if let Some(hooks) = &self.hooks_chain {
@@ -38,6 +40,8 @@ impl Transaction {
                 scriptlet_mode: self.scriptlet_mode,
                 metadata: self.metadata_cache.get(pkg_file).cloned(),
                 transaction_paths: self.transaction_paths.clone(),
+                reason,
+                origin: origin.map(str::to_string),
             };
             hooks.run(&context)?;
         }
@@ -72,6 +76,8 @@ impl Transaction {
                 scriptlet_mode: self.scriptlet_mode,
                 metadata: None,
                 transaction_paths: self.transaction_paths.clone(),
+                reason: InstallReason::Explicit,
+                origin: None,
             };
             hooks.run(&context)?;
         }
@@ -99,6 +105,8 @@ impl Transaction {
         old_version: &str,
         new_version: &str,
         new_pkg_file: &Path,
+        reason: InstallReason,
+        origin: Option<&str>,
     ) -> XpmResult<()> {
         if let Some(hooks) = &self.hooks_chain {
             let context = HookContext {
@@ -114,6 +122,8 @@ impl Transaction {
                 scriptlet_mode: self.scriptlet_mode,
                 metadata: self.metadata_cache.get(new_pkg_file).cloned(),
                 transaction_paths: self.transaction_paths.clone(),
+                reason,
+                origin: origin.map(str::to_string),
             };
             hooks.run(&context)?;
         } else {

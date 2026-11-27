@@ -64,6 +64,10 @@ pub struct HookContext {
     /// hooks avoid reopening the package archive just to read .PKGINFO,
     /// .MTREE or .INSTALL.
     pub metadata: Option<Arc<crate::package::PackageMetadata>>,
+    /// Install reason persisted with the package record.
+    pub reason: crate::install_reason::InstallReason,
+    /// Repository the package came from, persisted with the record.
+    pub origin: Option<String>,
     /// File paths shipped by every target in the transaction. Upgrade cleanup
     /// must not delete a file that another target is taking over (for example
     /// a library moving from `openssl` to `openssl-3`).

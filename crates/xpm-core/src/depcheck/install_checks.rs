@@ -107,6 +107,33 @@ fn upgrade_that_breaks_reverse_dependency_is_reported() {
 }
 
 #[test]
+fn unrelated_stale_dependency_does_not_block_upgrade() {
+    // Reproduces the libjxl/hyprgraphics incident: the installed libjxl
+    // version is 0.13 but its metadata still advertises the 0.12 sonames.
+    // Upgrading an unrelated package must not fail because of it.
+    let mut hyprgraphics = installed("hyprgraphics", "0.7.0-1", &[]);
+    hyprgraphics.depends = vec![
+        DepConstraint::parse("libjxl.so=0.13-64"),
+        DepConstraint::parse("libjxl_threads.so=0.13-64"),
+    ];
+    let stale_libjxl = installed("libjxl", "0.13.0-1", &["libjxl.so=0.12-64"]);
+    let new_kernel = InstalledPkg {
+        name: "linux".to_string(),
+        version: Version::parse("7.3.6-1"),
+        depends: vec![],
+        provides: vec![],
+        reason: InstallReason::Explicit,
+    };
+
+    check_installed_closure(
+        &[hyprgraphics, stale_libjxl],
+        &["linux".to_string()],
+        &[new_kernel],
+    )
+    .expect("an unrelated package must not block the upgrade");
+}
+
+#[test]
 fn replacement_providing_old_name_satisfies_reverse_dependency() {
     let mut app = installed("app", "1-1", &[]);
     app.depends = vec![DepConstraint::parse("old")];

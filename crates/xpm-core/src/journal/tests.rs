@@ -155,3 +155,136 @@ fn package_describe() {
         "kitty 1.0-1 (removed)"
     );
 }
+
+use crate::local_db;
+
+fn write_test_package(
+    cache: &Path,
+    name: &str,
+    version: &str,
+    depends: &[&str],
+    provides: &[&str],
+) -> PathBuf {
+    let path = cache.join(format!("{name}-{version}-x86_64.pkg.tar.zst"));
+    let file = fs::File::create(&path).expect("create package");
+    let mut encoder = zstd::stream::Encoder::new(file, 3).expect("encoder");
+    {
+        let mut tar = tar::Builder::new(&mut encoder);
+        let mut pkginfo = format!("pkgname = {name}\npkgver = {version}\n");
+        for dependency in depends {
+            pkginfo.push_str(&format!("depend = {dependency}\n"));
+        }
+        for provide in provides {
+            pkginfo.push_str(&format!("provides = {provide}\n"));
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(pkginfo.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, ".PKGINFO", pkginfo.as_bytes())
+            .expect("append .PKGINFO");
+        tar.finish().expect("finish tar");
+    }
+    encoder.finish().expect("finish zstd");
+    path
+}
+
+#[test]
+fn reconcile_running_rewrites_stale_metadata_from_cache() {
+    let tmp = TempDir::new().expect("tmp");
+    let db = tmp.path().join("db");
+    let cache = tmp.path().join("cache");
+    fs::create_dir_all(db.join("local/stale")).expect("local db");
+    fs::create_dir_all(&cache).expect("cache");
+    fs::write(db.join("local/stale/version"), "2.0-1").expect("version");
+    fs::write(db.join("local/stale/provides"), "libstale.so=1-64\n").expect("provides");
+    fs::write(db.join("local/stale/depends"), "glibc\n").expect("depends");
+
+    write_test_package(&cache, "stale", "2.0-1", &["glibc"], &["libstale.so=2-64"]);
+    let journal = Journal::start(
+        &db.join("journal"),
+        "upgrade",
+        Path::new("/"),
+        vec![JournalPackage::upgrade("stale", "1.0-1", "2.0-1")],
+    )
+    .expect("journal");
+
+    let report = reconcile_running(&db, &cache).expect("reconcile");
+    assert_eq!(report.reconciled, vec!["stale 2.0-1"]);
+    assert!(report.unresolved.is_empty());
+    assert_eq!(
+        local_db::read_provides(&db.join("local"), "stale").expect("read provides"),
+        vec!["libstale.so=2-64".to_string()]
+    );
+    assert_eq!(
+        local_db::read_depends(&db.join("local"), "stale").expect("read depends"),
+        Some(vec!["glibc".to_string()])
+    );
+
+    let loaded = Journal::load(&journal.path).expect("load journal");
+    assert_eq!(loaded.result, "recovered");
+}
+
+#[test]
+fn reconcile_running_reports_missing_cached_package() {
+    let tmp = TempDir::new().expect("tmp");
+    let db = tmp.path().join("db");
+    let cache = tmp.path().join("cache");
+    fs::create_dir_all(db.join("local/stale")).expect("local db");
+    fs::create_dir_all(&cache).expect("cache");
+    fs::write(db.join("local/stale/version"), "2.0-1").expect("version");
+    fs::write(db.join("local/stale/provides"), "libstale.so=1-64\n").expect("provides");
+
+    let journal = Journal::start(
+        &db.join("journal"),
+        "upgrade",
+        Path::new("/"),
+        vec![JournalPackage::upgrade("stale", "1.0-1", "2.0-1")],
+    )
+    .expect("journal");
+
+    let report = reconcile_running(&db, &cache).expect("reconcile");
+    assert!(report.reconciled.is_empty());
+    assert_eq!(report.unresolved.len(), 1);
+    assert!(report.unresolved[0].contains("package not in cache"));
+    assert_eq!(
+        local_db::read_provides(&db.join("local"), "stale").expect("read provides"),
+        vec!["libstale.so=1-64".to_string()],
+        "the stale record must be left untouched"
+    );
+
+    let loaded = Journal::load(&journal.path).expect("load journal");
+    assert_eq!(loaded.result, "failed");
+    assert!(loaded.error.is_some());
+}
+
+#[test]
+fn reconcile_running_skips_uncommitted_versions() {
+    let tmp = TempDir::new().expect("tmp");
+    let db = tmp.path().join("db");
+    let cache = tmp.path().join("cache");
+    fs::create_dir_all(db.join("local/stale")).expect("local db");
+    fs::create_dir_all(&cache).expect("cache");
+    fs::write(db.join("local/stale/version"), "1.0-1").expect("version");
+    fs::write(db.join("local/stale/provides"), "libstale.so=1-64\n").expect("provides");
+
+    write_test_package(&cache, "stale", "2.0-1", &[], &["libstale.so=2-64"]);
+    let journal = Journal::start(
+        &db.join("journal"),
+        "upgrade",
+        Path::new("/"),
+        vec![JournalPackage::upgrade("stale", "1.0-1", "2.0-1")],
+    )
+    .expect("journal");
+
+    let report = reconcile_running(&db, &cache).expect("reconcile");
+    assert!(report.reconciled.is_empty());
+    assert_eq!(
+        local_db::read_provides(&db.join("local"), "stale").expect("read provides"),
+        vec!["libstale.so=1-64".to_string()],
+        "untouched record because the new version was never recorded"
+    );
+
+    let loaded = Journal::load(&journal.path).expect("load journal");
+    assert_eq!(loaded.result, "recovered");
+}

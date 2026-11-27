@@ -1,6 +1,7 @@
 //! Transaction operation and state types.
 
 use super::*;
+use crate::install_reason::InstallReason;
 
 /// Single operation within a transaction.
 #[derive(Debug, Clone)]
@@ -11,6 +12,8 @@ pub enum TransactionOp {
         pkg_version: String,
         pkg_file: PathBuf,
         metadata: Box<Option<PackageMeta>>,
+        reason: InstallReason,
+        origin: Option<String>,
     },
     /// Remove an installed package.
     Remove { pkg_name: String },
@@ -20,6 +23,8 @@ pub enum TransactionOp {
         old_version: String,
         new_version: String,
         new_pkg_file: PathBuf,
+        reason: InstallReason,
+        origin: Option<String>,
     },
 }
 

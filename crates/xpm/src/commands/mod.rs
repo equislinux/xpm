@@ -76,7 +76,7 @@ use install::cmd_install;
 use installed::{
     assume_installed_pkgs, check_transaction_file_conflicts, install_target,
     load_installed_candidates, load_installed_pkgs, read_installed_versions,
-    read_latest_remote_entries, resolver_candidate, target_manifest, InstalledRecord,
+    read_latest_remote_entries, resolver_candidate, target_manifest,
 };
 use misc::{cmd_deptest, cmd_mark};
 use query::{cmd_files, cmd_info, cmd_query, cmd_search};
@@ -85,6 +85,7 @@ use repo::{cmd_clean, cmd_groups, cmd_import_pacman, cmd_list, cmd_repo};
 use sync::{cmd_sync, read_all_sync_entries, sync_repositories};
 use transaction::{
     commit_transaction, hook_paths_for_removals, hook_paths_from_targets, journal_dir,
+    open_transaction, reconcile_transactions,
 };
 use upgrade::cmd_upgrade;
 

@@ -86,11 +86,13 @@ pub fn check_install(installed: &[InstalledPkg], targets: &[InstallTarget]) -> X
     Err(XpmError::DependencyConflict(problems.join("\n")))
 }
 
-/// Verify that every package remaining after `removed` (plus `added`) has all
-/// of its dependencies satisfied by the resulting set.
+/// Verify that upgrading or removing `removed` (and installing `added`) does
+/// not break a reverse dependency.
 ///
-/// This catches reverse-dependency breakage during upgrades and replacements,
-/// not just the dependencies of the transaction targets.
+/// Only dependencies that a package leaving the installed set satisfied
+/// *before* the transaction are checked, so an unrelated package with stale or
+/// already-broken metadata cannot block an otherwise valid transaction. The
+/// dependencies of `added` packages are covered by [`check_install`].
 pub fn check_installed_closure(
     installed: &[InstalledPkg],
     removed: &[String],
@@ -104,8 +106,15 @@ pub fn check_installed_closure(
     let candidates: Vec<&InstalledPkg> = live.iter().copied().chain(added.iter()).collect();
 
     let mut problems = Vec::new();
-    for package in &candidates {
+    for package in &live {
         for dependency in &package.depends {
+            let causing = installed.iter().find(|candidate| {
+                removed.contains(candidate.name.as_str()) && satisfies(candidate, dependency, false)
+            });
+            let Some(causing) = causing else {
+                continue;
+            };
+
             if candidates
                 .iter()
                 .any(|candidate| satisfies(candidate, dependency, false))
@@ -113,20 +122,10 @@ pub fn check_installed_closure(
                 continue;
             }
 
-            let causing = installed.iter().find(|candidate| {
-                removed.contains(candidate.name.as_str()) && satisfies(candidate, dependency, false)
-            });
-
-            match causing {
-                Some(causing) => problems.push(format!(
-                    "removing {} breaks dependency '{}' required by {}",
-                    causing.name, dependency, package.name
-                )),
-                None => problems.push(format!(
-                    "unable to satisfy dependency '{}' required by {}",
-                    dependency, package.name
-                )),
-            }
+            problems.push(format!(
+                "removing {} breaks dependency '{}' required by {}",
+                causing.name, dependency, package.name
+            ));
         }
     }
 

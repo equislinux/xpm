@@ -201,8 +201,11 @@ xpm history --json         # One JSON line per transaction
 ```
 
 Transactions left in `running` state (for example after a crash) stay in the
-journal as evidence; `rollback` handles the package-level recovery and the
-generation layer (`x gen rollback`) the whole-system one.
+journal as evidence. The next `install`/`upgrade`/`remove`/`rollback` reconciles
+them before doing anything else: package metadata is rebuilt from the cached
+package file and the journal is finalized as `recovered` (or `failed` when the
+package is no longer cached). `rollback` still handles the package-level revert
+and the generation layer (`x gen rollback`) the whole-system one.
 
 ---
 

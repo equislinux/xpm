@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [2026-11-27]
+
+### Fixed
+
+- Package metadata is now written atomically inside the transaction and
+  interrupted (`running`) journals are reconciled from the package cache on
+  the next run; upgrade reverse-dependency checks only cover packages affected
+  by the transaction.
+
 ## [Unreleased] - 2026-11-26
 
 ### Changed
@@ -52,6 +61,6 @@ All notable changes to this project are documented in this file.
 ### Validation
 
 - `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test --workspace` (479 tests) and `scripts/ci-local.sh` pass.
+  `cargo test --workspace` (486 tests) and `scripts/ci-local.sh` pass.
 - No functional changes are intended; this branch is a structural
   modularization only.
