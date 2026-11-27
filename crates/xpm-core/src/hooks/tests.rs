@@ -1,4 +1,5 @@
 use super::*;
+use crate::install_reason::InstallReason;
 use tempfile::TempDir;
 
 fn test_context(op_type: OperationType) -> (TempDir, TempDir, HookContext) {
@@ -18,6 +19,8 @@ fn test_context(op_type: OperationType) -> (TempDir, TempDir, HookContext) {
         scriptlet_mode: ScriptletMode::Auto,
         metadata: None,
         transaction_paths: None,
+        reason: InstallReason::Explicit,
+        origin: None,
     };
 
     (root_tmp, db_tmp, ctx)
@@ -148,6 +151,55 @@ fn local_db_hook_creates_version_file() {
 
     let content = fs::read_to_string(&version_file).expect("read version file");
     assert_eq!(content, "1.0-1");
+}
+
+#[test]
+fn local_db_hook_writes_full_record_from_package_metadata() {
+    let (_root, db_tmp, mut ctx) = test_context(OperationType::Install);
+    ctx.pkg_name = "hello".to_string();
+    ctx.pkg_version = "2.0-1".to_string();
+
+    let pkg = db_tmp.path().join("hello-2.0-1-x86_64.pkg.tar.zst");
+    let pkginfo = "pkgname = hello\n\
+                   pkgver = 2.0-1\n\
+                   arch = x86_64\n\
+                   depend = glibc\n\
+                   provides = libhello.so=2-64\n\
+                   group = tools\n";
+    let mut raw_tar = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut raw_tar);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(pkginfo.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, ".PKGINFO", pkginfo.as_bytes())
+            .expect("append .PKGINFO");
+        builder.finish().expect("finish tar");
+    }
+    fs::write(&pkg, zstd::encode_all(&raw_tar[..], 1).expect("compress")).expect("write package");
+    ctx.pkg_file = Some(pkg);
+
+    LocalDbHook.run(&ctx).expect("run hook");
+
+    let db = &ctx.local_db_dir;
+    assert_eq!(
+        crate::local_db::read_version(db, "hello").as_deref(),
+        Some("2.0-1")
+    );
+    assert_eq!(
+        crate::local_db::read_depends(db, "hello").expect("read depends"),
+        Some(vec!["glibc".to_string()])
+    );
+    assert_eq!(
+        crate::local_db::read_provides(db, "hello").expect("read provides"),
+        vec!["libhello.so=2-64".to_string()]
+    );
+    assert_eq!(
+        crate::local_db::read_groups(db, "hello").expect("read groups"),
+        vec!["tools".to_string()]
+    );
 }
 
 #[test]
@@ -414,6 +466,8 @@ fn install_v1(root: &Path, db: &Path, version: &str, files: &[(&str, &[u8])], ba
         scriptlet_mode: ScriptletMode::Auto,
         metadata: None,
         transaction_paths: None,
+        reason: InstallReason::Explicit,
+        origin: None,
     };
     FileExtractionHook.run(&ctx).expect("install v1");
 }
@@ -432,6 +486,8 @@ fn upgrade_context(root: &Path, db: &Path, pkg: PathBuf, from: &str, to: &str) -
         scriptlet_mode: ScriptletMode::Auto,
         metadata: None,
         transaction_paths: None,
+        reason: InstallReason::Explicit,
+        origin: None,
     }
 }
 
@@ -589,6 +645,8 @@ fn remove_keeps_modified_config_as_pacsave() {
         scriptlet_mode: ScriptletMode::Auto,
         metadata: None,
         transaction_paths: None,
+        reason: InstallReason::Explicit,
+        origin: None,
     };
     FileRemovalHook.run(&ctx).expect("remove");
 
@@ -626,6 +684,8 @@ fn remove_nosave_deletes_modified_config() {
         scriptlet_mode: ScriptletMode::Auto,
         metadata: None,
         transaction_paths: None,
+        reason: InstallReason::Explicit,
+        origin: None,
     };
     FileRemovalHook.run(&ctx).expect("remove");
 
@@ -662,6 +722,8 @@ fn remove_unmodified_config_deletes_it() {
         scriptlet_mode: ScriptletMode::Auto,
         metadata: None,
         transaction_paths: None,
+        reason: InstallReason::Explicit,
+        origin: None,
     };
     FileRemovalHook.run(&ctx).expect("remove");
 

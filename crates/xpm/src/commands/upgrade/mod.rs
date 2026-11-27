@@ -25,6 +25,7 @@ pub(super) fn cmd_upgrade(
     args: &cli::UpgradeArgs,
     no_confirm: bool,
 ) -> Result<()> {
+    reconcile_transactions(config)?;
     println!(":: Starting full system upgrade...");
     if !args.ignore.is_empty() {
         println!("   ignoring: {}", args.ignore.join(", "));

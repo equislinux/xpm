@@ -12,9 +12,8 @@ pub(super) fn run(
     let cache_dir = &config.options.cache_dir;
     let arch = plan.arch.clone();
 
-    // Create transaction
-    let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
-        .context("failed to create transaction")?;
+    // Create transaction (reconciles an interrupted journal first).
+    let mut tx = open_transaction(config)?;
 
     // Setup hooks chain
     let hooks = HookChain::default();
@@ -26,7 +25,6 @@ pub(super) fn run(
 
     let mut journal_pkgs = Vec::new();
     let mut removed_names: Vec<String> = Vec::new();
-    let mut installed: Vec<InstalledRecord> = Vec::new();
     let overwrite = conflict::OverwritePatterns::parse(&args.overwrite);
     let mut target_manifests: Vec<conflict::TargetManifest> = Vec::new();
     let mut target_pkgs: Vec<depcheck::InstallTarget> = Vec::new();
@@ -109,26 +107,26 @@ pub(super) fn run(
             let old_version = installed_version.unwrap().clone();
             removed_names.push(pkg_name.clone());
             journal_pkgs.push(JournalPackage::upgrade(&pkg_name, &old_version, &version));
-            tx.add_upgrade(
+            tx.add_upgrade_with_record(
                 pkg_name.clone(),
                 old_version,
                 version.clone(),
                 path.to_path_buf(),
+                pkg_reason,
+                Some("local".to_string()),
             )
             .context("failed to add local upgrade to transaction")?;
         } else {
             journal_pkgs.push(JournalPackage::install(&pkg_name, &version));
-            tx.add_install(pkg_name.clone(), version.clone(), path.to_path_buf())
-                .context("failed to add local install to transaction")?;
+            tx.add_install_with_record(
+                pkg_name.clone(),
+                version.clone(),
+                path.to_path_buf(),
+                pkg_reason,
+                Some("local".to_string()),
+            )
+            .context("failed to add local install to transaction")?;
         }
-        installed.push(InstalledRecord {
-            name: pkg_name.clone(),
-            repo: "local".to_string(),
-            depends: metadata.meta.depends.clone(),
-            provides: metadata.meta.provides.clone(),
-            groups: metadata.meta.groups.clone(),
-            reason: pkg_reason,
-        });
     }
 
     // Phase 1b: Download and validate the resolved plan (dependencies first)
@@ -199,28 +197,28 @@ pub(super) fn run(
             journal_pkg = journal_pkg.with_sha256(sum);
         }
         journal_pkgs.push(journal_pkg);
-        installed.push(InstalledRecord {
-            name: entry.name.clone(),
-            repo: repo.name.clone(),
-            depends: metadata.meta.depends.clone(),
-            provides: metadata.meta.provides.clone(),
-            groups: metadata.meta.groups.clone(),
-            reason: pkg_reason,
-        });
 
         // Add to transaction
         if is_upgrade {
             removed_names.push(entry.name.clone());
-            tx.add_upgrade(
+            tx.add_upgrade_with_record(
                 entry.name.clone(),
                 installed_version.unwrap().clone(),
                 entry.version.clone(),
                 dest,
+                pkg_reason,
+                Some(repo.name.clone()),
             )
             .context("failed to add upgrade to transaction")?;
         } else {
-            tx.add_install(entry.name.clone(), entry.version.clone(), dest)
-                .context("failed to add install to transaction")?;
+            tx.add_install_with_record(
+                entry.name.clone(),
+                entry.version.clone(),
+                dest,
+                pkg_reason,
+                Some(repo.name.clone()),
+            )
+            .context("failed to add install to transaction")?;
         }
     }
 
@@ -262,6 +260,7 @@ pub(super) fn run(
     )?;
 
     // Phase 2/3: prepare, commit, hooks and journal.
+    let installed_count = journal_pkgs.len();
     commit_transaction(
         config,
         "install",
@@ -270,22 +269,7 @@ pub(super) fn run(
         &mut tx,
     )?;
 
-    for record in &installed {
-        record
-            .reason
-            .write(&local_db_dir, &record.name)
-            .with_context(|| format!("failed to record install reason for '{}'", record.name))?;
-        local_db::write_origin(&local_db_dir, &record.name, &record.repo)
-            .with_context(|| format!("failed to record origin for '{}'", record.name))?;
-        local_db::write_depends(&local_db_dir, &record.name, &record.depends)
-            .with_context(|| format!("failed to record dependencies for '{}'", record.name))?;
-        local_db::write_provides(&local_db_dir, &record.name, &record.provides)
-            .with_context(|| format!("failed to record provides for '{}'", record.name))?;
-        local_db::write_groups(&local_db_dir, &record.name, &record.groups)
-            .with_context(|| format!("failed to record groups for '{}'", record.name))?;
-    }
-
-    println!(":: {} package(s) installed successfully.", installed.len());
+    println!(":: {installed_count} package(s) installed successfully.");
     if config.options.shell_integration && config.options.root_dir != Path::new("/") {
         println!(":: Shell integration enabled via ~/.local/bin shims.");
         println!(":: If this shell does not find new commands yet, run: hash -r");

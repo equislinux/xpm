@@ -79,9 +79,17 @@ impl Transaction {
                     pkg_name,
                     pkg_version,
                     pkg_file,
+                    reason,
+                    origin,
                     ..
                 } => {
-                    self.execute_install(&pkg_name, &pkg_version, &pkg_file)?;
+                    self.execute_install(
+                        &pkg_name,
+                        &pkg_version,
+                        &pkg_file,
+                        reason,
+                        origin.as_deref(),
+                    )?;
                 }
                 TransactionOp::Remove { pkg_name } => {
                     self.execute_remove(&pkg_name)?;
@@ -91,9 +99,18 @@ impl Transaction {
                     old_version,
                     new_version,
                     new_pkg_file,
+                    reason,
+                    origin,
                     ..
                 } => {
-                    self.execute_upgrade(&pkg_name, &old_version, &new_version, &new_pkg_file)?;
+                    self.execute_upgrade(
+                        &pkg_name,
+                        &old_version,
+                        &new_version,
+                        &new_pkg_file,
+                        reason,
+                        origin.as_deref(),
+                    )?;
                 }
             }
             if let Some(progress) = &operation_progress {

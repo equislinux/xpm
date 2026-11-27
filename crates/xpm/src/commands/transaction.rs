@@ -6,6 +6,58 @@ pub(super) fn journal_dir(config: &XpmConfig) -> PathBuf {
     config.options.db_path.join("journal")
 }
 
+/// Reconciles interrupted journals before a command reads the local database.
+///
+/// The transaction lock is held only for the duration of the recovery pass so
+/// planning still happens through the normal database readers.
+pub(super) fn reconcile_transactions(config: &XpmConfig) -> Result<()> {
+    let lock = FileLock::acquire(&config.options.db_path.join("transaction.lock"))
+        .context("failed to lock the database for recovery")?;
+    let outcome =
+        xpm_core::journal::reconcile_running(&config.options.db_path, &config.options.cache_dir);
+    drop(lock);
+    report_recovery(outcome);
+    Ok(())
+}
+
+/// Creates a transaction and reconciles any interrupted journal first.
+///
+/// The transaction lock is held while the recovery pass runs, so no other xpm
+/// process can observe or modify the local database in between.
+pub(super) fn open_transaction(config: &XpmConfig) -> Result<Transaction> {
+    let local_db_dir = config.options.db_path.join("local");
+    let tx = Transaction::new(config.options.root_dir.clone(), local_db_dir)
+        .context("failed to create transaction")?;
+
+    let outcome =
+        xpm_core::journal::reconcile_running(&config.options.db_path, &config.options.cache_dir);
+    report_recovery(outcome);
+
+    Ok(tx)
+}
+
+fn report_recovery(outcome: xpm_core::XpmResult<xpm_core::journal::RecoveryReport>) {
+    match outcome {
+        Ok(report) => {
+            if !report.reconciled.is_empty() {
+                println!(
+                    ":: Reconciled interrupted transaction metadata: {}",
+                    report.reconciled.join(", ")
+                );
+            }
+            if !report.unresolved.is_empty() {
+                eprintln!(
+                    "xpm: warning: interrupted transaction metadata could not be reconciled for: {}",
+                    report.unresolved.join(", ")
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("xpm: warning: failed to reconcile interrupted transactions: {err:#}");
+        }
+    }
+}
+
 pub(super) fn hooks_dir() -> PathBuf {
     std::env::var_os("XPM_HOOKS_DIR")
         .map(PathBuf::from)

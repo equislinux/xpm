@@ -7,6 +7,7 @@ pub(super) fn cmd_remove(
     args: &cli::RemoveArgs,
     no_confirm: bool,
 ) -> Result<()> {
+    reconcile_transactions(config)?;
     let local_db_dir = config.options.db_path.join("local");
     let installed = load_installed_pkgs(&local_db_dir)?;
     let options = depcheck::RemoveOptions {
@@ -61,9 +62,8 @@ pub(super) fn cmd_remove(
         println!("   (including unneeded dependencies)");
     }
 
-    // Create transaction
-    let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
-        .context("failed to create transaction")?;
+    // Create transaction (reconciles an interrupted journal first).
+    let mut tx = open_transaction(config)?;
 
     // Setup hooks chain
     let hooks = HookChain::default();

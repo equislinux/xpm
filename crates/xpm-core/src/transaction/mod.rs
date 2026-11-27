@@ -15,6 +15,7 @@ use std::time::SystemTime;
 
 use crate::error::{XpmError, XpmResult};
 use crate::hooks::{HookChain, HookContext, OperationType, ScriptletMode};
+use crate::install_reason::InstallReason;
 use crate::package::{PackageMeta, PackageMetadata};
 use crate::progress::{self, BarFill, OperationProgress};
 

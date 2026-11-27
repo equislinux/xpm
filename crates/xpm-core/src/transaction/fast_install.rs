@@ -46,6 +46,8 @@ pub(super) fn run_fast_install_parts(
         pkg_name,
         pkg_version,
         pkg_file,
+        reason,
+        origin,
         ..
     } = op
     else {
@@ -66,6 +68,8 @@ pub(super) fn run_fast_install_parts(
         scriptlet_mode,
         metadata: Some(metadata.clone()),
         transaction_paths: None,
+        reason: *reason,
+        origin: origin.clone(),
     };
     hooks.run(&context)
 }

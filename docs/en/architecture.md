@@ -155,8 +155,11 @@ renders the bar):
   package and download from the first reachable mirror.
 
 Sync databases land under `<db_path>/sync/` (e.g. `/var/lib/xpm/sync/<repo>.db`). The local
-database of installed packages lives under `<db_path>/local/<pkg>/` and stores at least a
-`version` file and a `files` manifest.
+database of installed packages lives under `<db_path>/local/<pkg>/` and stores the
+`version`, `files`, `depends`, `provides`, `groups`, `reason` and `origin` records.
+`local_db::record::write_record` persists the metadata files through temporary files plus
+renames and writes `version` last, so a reader that sees the new version also sees the
+matching dependencies and provides.
 
 ## Signing
 
@@ -175,8 +178,8 @@ Enforcement is controlled by `sig_level` from the config (per-repository overrid
 (`plan.rs`, `prepare.rs`, `commit.rs`, `execute.rs`, `fast_install.rs`, `lock.rs`, `op.rs`):
 
 - `FileLock` — filesystem lock (under the local DB) preventing concurrent xpm operations.
-- `TransactionOp` — `Install { pkg_name, pkg_version, pkg_file }`, `Remove { pkg_name }`,
-  `Upgrade { ... }`.
+- `TransactionOp` — `Install { pkg_name, pkg_version, pkg_file, reason, origin }`,
+  `Remove { pkg_name }`, `Upgrade { ... }`.
 - `TransactionState` — `Planning`, `Prepared`, `Committed`, `RolledBack`.
 - `Transaction` — collect operations during planning, run pre-flight preparation, then commit;
   failures trigger rollback logic; operations are appended to the log file (default
@@ -197,7 +200,11 @@ Enforcement is controlled by `sig_level` from the config (per-repository overrid
    system root); modified `backup` files become `.pacsave` unless `--nosave`.
 5. `PostScriptletHook` — run `.INSTALL` post-scriptlets (`post_install`, `post_upgrade`,
    `post_remove`).
-6. `LocalDbHook` — register/remove the package in the local database.
+6. `LocalDbHook` — register/remove the package in the local database. On
+   install/upgrade it writes the whole metadata record (dependencies, provides, groups,
+   reason, origin and finally the version) before the post hooks and journal finalization
+   run, so a generation snapshot taken by a post hook always captures a consistent
+   database.
 
 Scriptlets are sourced through `bash` with `XPM_ROOT_DIR`, `XPM_PKG_NAME`, and
 `XPM_PKG_VERSION` exported.
@@ -214,6 +221,13 @@ The generation integration lives in `journal.rs`/`generations.rs`/`rollback.rs`:
 journals link the generation current after the post hooks, `diff` reads a
 generation's `packages.tsv`, and `rollback` inverts a successful journal using
 the package cache (`cache.rs`).
+
+`journal/recovery.rs` reconciles journals left in `running` state by a crash: at the
+start of the next transaction (under the transaction lock) it repairs the metadata of
+packages whose installed version already matches the journal target, using the cached
+package file and its checksum. Those journals are finalized as `recovered`; entries whose
+package is no longer cached are reported and finalized as `failed` without touching the
+existing records.
 
 ## Configuration
 

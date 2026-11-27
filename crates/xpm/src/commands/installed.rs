@@ -2,16 +2,6 @@
 
 use super::*;
 
-/// A package installed or reinstalled during a transaction.
-pub(super) struct InstalledRecord {
-    pub(super) name: String,
-    pub(super) repo: String,
-    pub(super) depends: Vec<String>,
-    pub(super) provides: Vec<String>,
-    pub(super) groups: Vec<String>,
-    pub(super) reason: InstallReason,
-}
-
 /// Build a resolver candidate from a sync database entry.
 pub(super) fn resolver_candidate(repo: &str, entry: &RepoEntry) -> PackageCandidate {
     PackageCandidate {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::install_reason::InstallReason;
 use tempfile::TempDir;
 
 fn entry(path: &str, file_type: MtreeFileType) -> MtreeEntry {
@@ -243,4 +244,64 @@ fn version_roundtrip_and_missing_are_none() {
         read_version(&local_db, "kitty").as_deref(),
         Some("0.44.0-1")
     );
+}
+
+#[test]
+fn write_record_persists_complete_metadata() {
+    let tmp = TempDir::new().expect("tmp");
+    let local_db = tmp.path().join("local");
+    let record = Record {
+        name: "hello".to_string(),
+        version: "2.0-1".to_string(),
+        reason: InstallReason::Dep,
+        origin: Some("extra".to_string()),
+        depends: vec!["glibc".to_string()],
+        provides: vec!["libhello.so=2-64".to_string()],
+        groups: vec!["tools".to_string()],
+    };
+
+    write_record(&local_db, &record).expect("write record");
+
+    assert_eq!(read_version(&local_db, "hello").as_deref(), Some("2.0-1"));
+    assert_eq!(
+        read_depends(&local_db, "hello").expect("deps"),
+        Some(vec!["glibc".to_string()])
+    );
+    assert_eq!(
+        read_provides(&local_db, "hello").expect("provides"),
+        vec!["libhello.so=2-64".to_string()]
+    );
+    assert_eq!(
+        read_groups(&local_db, "hello").expect("groups"),
+        vec!["tools".to_string()]
+    );
+    assert_eq!(InstallReason::read(&local_db, "hello"), InstallReason::Dep);
+    assert_eq!(read_origin(&local_db, "hello").as_deref(), Some("extra"));
+
+    let leftovers = fs::read_dir(local_db.join("hello"))
+        .expect("read entry")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .count();
+    assert_eq!(leftovers, 0, "atomic writes must not leave temporary files");
+}
+
+#[test]
+fn record_without_origin_keeps_the_existing_one() {
+    let tmp = TempDir::new().expect("tmp");
+    let local_db = tmp.path().join("local");
+    write_origin(&local_db, "hello", "core").expect("origin");
+
+    let record = Record {
+        name: "hello".to_string(),
+        version: "2.0-1".to_string(),
+        reason: InstallReason::Explicit,
+        origin: None,
+        depends: Vec::new(),
+        provides: Vec::new(),
+        groups: Vec::new(),
+    };
+    write_record(&local_db, &record).expect("write record");
+
+    assert_eq!(read_origin(&local_db, "hello").as_deref(), Some("core"));
 }

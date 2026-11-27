@@ -43,8 +43,8 @@ src/
 ├── commands/
 │   ├── mod.rs                  Module list, shared imports and dispatch()
 │   ├── common.rs               confirm_action/confirm_replace, path display, exit_with
-│   ├── installed.rs            Installed/sync readers, manifests, InstalledRecord
-│   ├── transaction.rs          Hook/journal/commit orchestration shared by commands
+│   ├── installed.rs            Installed/sync readers and transaction manifests
+│   ├── transaction.rs          Hook/journal/commit orchestration and crash recovery entry
 │   ├── sync.rs                 Database sync (+ parallel sync workers)
 │   ├── bootstrap.rs            Bootstrap an empty root (and its tests)
 │   ├── build.rs                `xpm build` via xpm-makepkg
@@ -122,6 +122,7 @@ src/
 │   ├── backup.rs               Backup lists and stored .MTREE
 │   ├── files.rs                `files` manifest IO
 │   ├── meta.rs                 Origin, version, changelog, deps/provides/groups
+│   ├── record.rs               Atomic whole-package metadata records
 │   └── tests.rs                Local DB tests
 ├── repo_db/                    Sync/.files database parsing
 │   ├── mod.rs                  Public re-exports
@@ -231,6 +232,7 @@ src/
 │   ├── mod.rs                  Schema and re-exports
 │   ├── entry.rs                JournalPackage
 │   ├── store.rs                Journal records and persistence
+│   ├── recovery.rs             Reconciliation of interrupted (`running`) journals
 │   ├── time.rs                 Epoch / ISO-8601 helpers
 │   └── tests.rs                Journal tests
 ├── replace/                    Sysupgrade replacement planning

@@ -20,6 +20,7 @@ pub(super) fn cmd_install(
     args: &cli::InstallArgs,
     no_confirm: bool,
 ) -> Result<()> {
+    reconcile_transactions(config)?;
     let Some(plan) = plan::build(config, args)? else {
         return Ok(());
     };

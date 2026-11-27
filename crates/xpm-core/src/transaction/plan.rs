@@ -10,6 +10,25 @@ impl Transaction {
         pkg_version: String,
         pkg_file: PathBuf,
     ) -> XpmResult<()> {
+        self.add_install_with_record(
+            pkg_name,
+            pkg_version,
+            pkg_file,
+            InstallReason::Explicit,
+            None,
+        )
+    }
+
+    /// Add an install operation together with the metadata recorded in the
+    /// local database during commit.
+    pub fn add_install_with_record(
+        &mut self,
+        pkg_name: String,
+        pkg_version: String,
+        pkg_file: PathBuf,
+        reason: InstallReason,
+        origin: Option<String>,
+    ) -> XpmResult<()> {
         if self.state != TransactionState::Planning {
             return Err(XpmError::Package(
                 "can only add operations during planning phase".to_string(),
@@ -21,6 +40,8 @@ impl Transaction {
             pkg_version,
             pkg_file,
             metadata: Box::new(None),
+            reason,
+            origin,
         });
 
         Ok(())
@@ -37,6 +58,27 @@ impl Transaction {
         new_version: String,
         new_pkg_file: PathBuf,
     ) -> XpmResult<()> {
+        self.add_upgrade_with_record(
+            pkg_name,
+            old_version,
+            new_version,
+            new_pkg_file,
+            InstallReason::Explicit,
+            None,
+        )
+    }
+
+    /// Add an upgrade operation together with the metadata recorded in the
+    /// local database during commit.
+    pub fn add_upgrade_with_record(
+        &mut self,
+        pkg_name: String,
+        old_version: String,
+        new_version: String,
+        new_pkg_file: PathBuf,
+        reason: InstallReason,
+        origin: Option<String>,
+    ) -> XpmResult<()> {
         if self.state != TransactionState::Planning {
             return Err(XpmError::Package(
                 "can only add operations during planning phase".to_string(),
@@ -48,6 +90,8 @@ impl Transaction {
             old_version,
             new_version,
             new_pkg_file,
+            reason,
+            origin,
         });
 
         Ok(())

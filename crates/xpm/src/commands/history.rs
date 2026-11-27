@@ -103,6 +103,7 @@ pub(super) fn cmd_rollback(
     args: &cli::RollbackArgs,
     no_confirm: bool,
 ) -> Result<()> {
+    reconcile_transactions(config)?;
     let local_db_dir = config.options.db_path.join("local");
     let entries =
         Journal::list(&journal_dir(config)).context("failed to read the transaction journal")?;
@@ -170,8 +171,7 @@ pub(super) fn cmd_rollback(
 
     confirm_action(":: Proceed with rollback? [y/N] ", no_confirm)?;
 
-    let mut tx = Transaction::new(config.options.root_dir.clone(), local_db_dir.clone())
-        .context("failed to create transaction")?;
+    let mut tx = open_transaction(config)?;
     let hooks = HookChain::default();
     tx.set_hooks(hooks);
     tx.set_shell_integration(
@@ -180,7 +180,6 @@ pub(super) fn cmd_rollback(
     tx.set_scriptlet_mode(config.options.scriptlet_mode);
 
     let mut journal_pkgs = Vec::new();
-    let mut reinstall_records: Vec<InstalledRecord> = Vec::new();
 
     let mut transaction_paths: HashSet<String> = HashSet::new();
 
@@ -199,19 +198,31 @@ pub(super) fn cmd_rollback(
                 version,
                 file,
             } => {
-                let metadata = read_metadata(file)
-                    .with_context(|| format!("failed to read metadata from {}", file.display()))?;
+                let metadata =
+                    Arc::new(read_metadata(file).with_context(|| {
+                        format!("failed to read metadata from {}", file.display())
+                    })?);
+                tx.cache_package_metadata(file.clone(), metadata.clone());
                 transaction_paths.extend(metadata.files.iter().cloned());
                 let current = local_db::read_version(&local_db_dir, name);
+                let reason = if current.is_some() {
+                    InstallReason::read_optional(&local_db_dir, name)
+                        .unwrap_or(InstallReason::Explicit)
+                } else {
+                    InstallReason::Explicit
+                };
+                let origin = Some("cache".to_string());
 
                 match current.as_deref().filter(|current| *current != version) {
                     // Downgrade of an installed package: config-safe upgrade op.
                     Some(current_version) => {
-                        tx.add_upgrade(
+                        tx.add_upgrade_with_record(
                             name.clone(),
                             current_version.to_string(),
                             version.clone(),
                             file.clone(),
+                            reason,
+                            origin,
                         )
                         .context("failed to add downgrade op to rollback transaction")?;
                         journal_pkgs.push(JournalPackage::upgrade(
@@ -222,47 +233,23 @@ pub(super) fn cmd_rollback(
                     }
                     // Undo of a remove: plain install from the cache.
                     None => {
-                        tx.add_install(name.clone(), version.clone(), file.clone())
-                            .context("failed to add install op to rollback transaction")?;
+                        tx.add_install_with_record(
+                            name.clone(),
+                            version.clone(),
+                            file.clone(),
+                            reason,
+                            origin,
+                        )
+                        .context("failed to add install op to rollback transaction")?;
                         journal_pkgs.push(JournalPackage::install(name.clone(), version.clone()));
                     }
                 }
-
-                let reason = if current.is_some() {
-                    InstallReason::read_optional(&local_db_dir, name)
-                        .unwrap_or(InstallReason::Explicit)
-                } else {
-                    InstallReason::Explicit
-                };
-                reinstall_records.push(InstalledRecord {
-                    name: name.clone(),
-                    repo: "cache".to_string(),
-                    depends: metadata.meta.depends.clone(),
-                    provides: metadata.meta.provides.clone(),
-                    groups: metadata.meta.groups.clone(),
-                    reason,
-                });
             }
         }
     }
 
     tx.set_transaction_paths(Arc::new(transaction_paths));
     commit_transaction(config, "rollback", journal_pkgs, Vec::new(), &mut tx)?;
-
-    for record in &reinstall_records {
-        record
-            .reason
-            .write(&local_db_dir, &record.name)
-            .with_context(|| format!("failed to record install reason for '{}'", record.name))?;
-        local_db::write_origin(&local_db_dir, &record.name, &record.repo)
-            .with_context(|| format!("failed to record origin for '{}'", record.name))?;
-        local_db::write_depends(&local_db_dir, &record.name, &record.depends)
-            .with_context(|| format!("failed to record dependencies for '{}'", record.name))?;
-        local_db::write_provides(&local_db_dir, &record.name, &record.provides)
-            .with_context(|| format!("failed to record provides for '{}'", record.name))?;
-        local_db::write_groups(&local_db_dir, &record.name, &record.groups)
-            .with_context(|| format!("failed to record groups for '{}'", record.name))?;
-    }
 
     println!(":: Rollback complete ({} operation(s)).", plan.ops.len());
     Ok(())
